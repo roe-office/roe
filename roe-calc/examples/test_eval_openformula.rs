@@ -30,6 +30,8 @@ fn main() {
         floating_charts: vec![],
         floating_stat_charts: vec![],
         floating_images: vec![],
+        floating_shapes: vec![],
+        next_object_id: 0,
         default_col_width: 0.0,
         default_row_height: 0.0,
         data_validations: vec![],

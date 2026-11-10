@@ -38,6 +38,10 @@ pub struct PivotWriteSpec {
     /// xlsx 属性 rowGrandTotals / colGrandTotals 的值(调用方负责从 PivotMeta 映射)
     pub row_grand_totals: bool,
     pub col_grand_totals: bool,
+    /// 布局形态(大纲/紧凑/表格),决定根属性与 pivotField 的 compact/outline 写法
+    pub layout: roe_model::calc::PivotLayoutMode,
+    /// 大纲/紧凑下小计在组底:pivotField 写 subtotalTop="0"(表格形式不写)
+    pub subtotals_bottom: bool,
 }
 
 fn esc(s: &str) -> String {
@@ -118,7 +122,17 @@ pub fn pivot_table_xml(sp: &PivotWriteSpec) -> Option<String> {
         if is_data {
             attrs.push_str(r#" dataField="1""#);
         }
-        attrs.push_str(r#" compact="0" showAll="0""#);
+        {
+            use roe_model::calc::PivotLayoutMode as M;
+            attrs.push_str(match sp.layout {
+                M::Compact => r#" outline="1" showAll="0""#,
+                M::Outline => r#" compact="0" outline="1" showAll="0""#,
+                M::Tabular => r#" compact="0" showAll="0""#,
+            });
+            if sp.subtotals_bottom && !matches!(sp.layout, M::Tabular) && axis.is_some() {
+                attrs.push_str(r#" subtotalTop="0""#);
+            }
+        }
         if axis.is_some() && !f.items.is_empty() {
             let mut items = format!(r#"<items count="{}">"#, f.items.len() + 1);
             for i in 0..f.items.len() {
@@ -168,6 +182,14 @@ pub fn pivot_table_xml(sp: &PivotWriteSpec) -> Option<String> {
     let first_data_row = if levels == 0 { 1 } else { levels + 1 };
     let first_data_col = sp.row_fields.len().max(1);
     let mut totals = String::new();
+    {
+        use roe_model::calc::PivotLayoutMode as M;
+        totals.push_str(match sp.layout {
+            M::Compact => r#" outline="1" outlineData="1""#,
+            M::Outline => r#" compact="0" compactData="0" outline="1" outlineData="1""#,
+            M::Tabular => r#" compact="0" compactData="0""#,
+        });
+    }
     if !sp.row_grand_totals {
         totals.push_str(r#" rowGrandTotals="0""#);
     }
@@ -176,7 +198,7 @@ pub fn pivot_table_xml(sp: &PivotWriteSpec) -> Option<String> {
     }
     let on_rows = if sp.data_on_rows && multi_val { r#" dataOnRows="1""# } else { "" };
     Some(format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<pivotTableDefinition xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\" name=\"{}\" cacheId=\"{}\" applyNumberFormats=\"0\" applyBorderFormats=\"0\" applyFontFormats=\"0\" applyPatternFormats=\"0\" applyAlignmentFormats=\"0\" applyWidthHeightFormats=\"1\" dataCaption=\"值\" updatedVersion=\"4\" minRefreshableVersion=\"3\" useAutoFormatting=\"1\" itemPrintTitles=\"1\" createdVersion=\"4\" indent=\"0\" compact=\"0\" outline=\"1\" outlineData=\"1\" compactData=\"0\" multipleFieldFilters=\"0\"{}{}><location ref=\"{}\" firstHeaderRow=\"1\" firstDataRow=\"{}\" firstDataCol=\"{}\"/><pivotFields count=\"{}\">{}</pivotFields>{}{}{}{}<pivotTableStyleInfo name=\"{}\" showRowHeaders=\"1\" showColHeaders=\"1\" showRowStripes=\"0\" showColStripes=\"0\" showLastColumn=\"1\"/></pivotTableDefinition>",
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<pivotTableDefinition xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\" name=\"{}\" cacheId=\"{}\" applyNumberFormats=\"0\" applyBorderFormats=\"0\" applyFontFormats=\"0\" applyPatternFormats=\"0\" applyAlignmentFormats=\"0\" applyWidthHeightFormats=\"1\" dataCaption=\"值\" updatedVersion=\"4\" minRefreshableVersion=\"3\" useAutoFormatting=\"1\" itemPrintTitles=\"1\" createdVersion=\"4\" indent=\"0\" multipleFieldFilters=\"0\"{}{}><location ref=\"{}\" firstHeaderRow=\"1\" firstDataRow=\"{}\" firstDataCol=\"{}\"/><pivotFields count=\"{}\">{}</pivotFields>{}{}{}{}<pivotTableStyleInfo name=\"{}\" showRowHeaders=\"1\" showColHeaders=\"1\" showRowStripes=\"0\" showColStripes=\"0\" showLastColumn=\"1\"/></pivotTableDefinition>",
         esc(&sp.name), sp.cache_id, totals, on_rows, esc(&sp.location_ref), first_data_row, first_data_col,
         sp.fields.len(), pf, fields_xml("rowFields", &row_f), fields_xml("colFields", &col_f), page_xml, df,
         esc(&sp.style_name)
@@ -421,6 +443,8 @@ pub fn build_spec(sheets: &[Sheet], sheet_idx: usize, ordinal: u32) -> Option<Pi
         // PivotMeta 注释:row_grand_totals 对应 xlsx colGrandTotals,反之亦然,此处交叉映射
         row_grand_totals: meta.col_grand_totals,
         col_grand_totals: meta.row_grand_totals,
+        layout: meta.layout_mode.clone(),
+        subtotals_bottom: meta.subtotals_bottom,
     })
 }
 
@@ -453,6 +477,8 @@ mod tests {
             location_ref: "A3:E8".into(),
             style_name: "PivotStyleLight20".into(),
             row_grand_totals: true,
+            layout: Default::default(),
+            subtotals_bottom: false,
             col_grand_totals: true,
         }
     }
@@ -480,8 +506,8 @@ mod tests {
         let sp = sample();
         let pt = pivot_table_xml(&sp).unwrap();
         assert!(pt.contains(r#"<location ref="A3:E8" firstHeaderRow="1" firstDataRow="2" firstDataCol="1"/>"#));
-        assert!(pt.contains(r#"<pivotField axis="axisRow" compact="0" showAll="0"><items count="4"><item x="0"/><item x="1"/><item x="2"/><item t="default"/></items></pivotField>"#));
-        assert!(pt.contains(r#"<pivotField dataField="1" compact="0" showAll="0"/>"#));
+        assert!(pt.contains(r#"<pivotField axis="axisRow" compact="0" outline="1" showAll="0"><items count="4"><item x="0"/><item x="1"/><item x="2"/><item t="default"/></items></pivotField>"#));
+        assert!(pt.contains(r#"<pivotField dataField="1" compact="0" outline="1" showAll="0"/>"#));
         assert!(pt.contains(r#"<rowFields count="1"><field x="1"/></rowFields>"#));
         assert!(pt.contains(r#"<colFields count="1"><field x="2"/></colFields>"#));
         assert!(pt.contains(r#"<dataField name="Sales的Sum" fld="3" baseField="0" baseItem="0"/>"#));
@@ -644,5 +670,103 @@ mod build_spec_tests {
         assert_eq!(parse_range("A1"), None);
         assert_eq!(parse_range("C3:A1"), None);
         assert_eq!(parse_range("A0:B2"), None);
+    }
+}
+
+#[cfg(test)]
+mod layout_roundtrip_tests {
+    use super::*;
+    use roe_model::calc::PivotLayoutMode as M;
+
+    fn spec(layout: M) -> PivotWriteSpec {
+        let f = |n: &str, items: &[&str], numeric: bool| PivotFieldSpec {
+            name: n.to_string(),
+            items: items.iter().map(|s| s.to_string()).collect(),
+            numeric,
+        };
+        PivotWriteSpec {
+            name: "数据透视表1".into(),
+            cache_id: 1,
+            source_sheet: "pivot_test".into(),
+            source_ref: "A1:D201".into(),
+            fields: vec![
+                f("Region", &[], false),
+                f("Category", &["食品", "电子", "服装"], false),
+                f("Color", &["红", "蓝"], false),
+                f("Sales", &[], true),
+            ],
+            row_fields: vec![1],
+            col_fields: vec![2],
+            page_fields: vec![],
+            data_fields: vec![PivotDataSpec { name: "Sales的Sum".into(), fld: 3, agg: "sum".into() }],
+            data_on_rows: false,
+            location_ref: "A3:E8".into(),
+            style_name: "PivotStyleLight20".into(),
+            row_grand_totals: true,
+            col_grand_totals: true,
+            layout,
+            subtotals_bottom: false,
+        }
+    }
+
+    fn roundtrip(layout: M) -> (String, roe_model::calc::PivotMeta) {
+        let xml = pivot_table_xml(&spec(layout)).expect("xml");
+        let names: Vec<String> = ["Region", "Category", "Color", "Sales"].iter().map(|s| s.to_string()).collect();
+        let cache: Vec<Vec<String>> = vec![
+            vec![],
+            vec!["食品".into(), "电子".into(), "服装".into()],
+            vec!["红".into(), "蓝".into()],
+            vec![],
+        ];
+        let meta = crate::ooxml::pivot::parse_pivot_table(&xml, &names, &cache).expect("parse");
+        (xml, meta)
+    }
+
+    #[test]
+    fn layout_roundtrip_outline() {
+        let (xml, meta) = roundtrip(M::Outline);
+        assert!(xml.contains(r#"compact="0""#) && xml.contains(r#"outline="1""#));
+        assert_eq!(meta.layout_mode, M::Outline);
+    }
+
+    #[test]
+    fn layout_roundtrip_compact() {
+        let (xml, meta) = roundtrip(M::Compact);
+        assert!(!xml.contains(r#"compact="0""#), "紧凑不应写 compact=0");
+        assert!(xml.contains(r#"outline="1""#));
+        assert_eq!(meta.layout_mode, M::Compact);
+        assert_eq!(meta.data_col_start, 1);
+    }
+
+    #[test]
+    fn layout_roundtrip_tabular() {
+        let (xml, meta) = roundtrip(M::Tabular);
+        assert!(xml.contains(r#"compact="0""#));
+        assert!(!xml.contains(r#"outline="1""#), "表格不应写 outline=1");
+        assert_eq!(meta.layout_mode, M::Tabular);
+    }
+
+    #[test]
+    fn subtotals_bottom_written_and_read_back() {
+        for layout in [M::Outline, M::Compact] {
+            let mut sp = spec(layout);
+            sp.subtotals_bottom = true;
+            let xml = pivot_table_xml(&sp).expect("xml");
+            assert!(xml.contains(r#"subtotalTop="0""#), "{layout:?} 应写 subtotalTop=0");
+            assert!(crate::ooxml::pivot::parse_pivot_subtotals_bottom(&xml));
+        }
+    }
+
+    #[test]
+    fn subtotals_top_default_and_tabular_not_written() {
+        for layout in [M::Outline, M::Compact] {
+            let xml = pivot_table_xml(&spec(layout)).expect("xml");
+            assert!(!xml.contains("subtotalTop"), "默认在上不写属性");
+            assert!(!crate::ooxml::pivot::parse_pivot_subtotals_bottom(&xml));
+        }
+        let mut sp = spec(M::Tabular);
+        sp.subtotals_bottom = true;
+        let xml = pivot_table_xml(&sp).expect("xml");
+        assert!(!xml.contains("subtotalTop"), "表格形式恒在组末,不写");
     }
 }

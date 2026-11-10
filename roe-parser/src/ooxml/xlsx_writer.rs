@@ -2,8 +2,9 @@
 //!
 //! 与 xlsx.rs parser 对称设计，第一版范围对齐 parser 现状：
 //! - 只写出 parser 已读取的字段：sheet name、cell 值（含公式/布尔/错误）
-//! - col_widths/row_heights/cell_formats/merged_cells/frozen_rows/frozen_cols
+//! - col_widths/row_heights/cell_formats/merged_cells
 //!   parser 暂不读取，本版本 writer 也不写出（避免无法 roundtrip 验证的内容）
+//! - 注：本段为早期范围说明，已部分过时；冻结窗格(frozen_rows/frozen_cols)已写出 <pane>
 //! - OOXML 是 zip 容器，接口返回 Vec<u8>，不同于 ODF Flat 的 String
 //!
 //! 生成的最小合法 OPC 包文件清单：
@@ -553,6 +554,12 @@ fn write_sheet_xml(
             rows.entry(idx as u32).or_default();
         }
     }
+    // 手动行高(customHeight)的行即使没有单元格也要写出 <row>,否则行高丢失。
+    for (idx, rh) in sheet.row_heights.iter().enumerate() {
+        if matches!(rh, roe_model::calc::RowHeight::Manual(h) if *h > 0.0) {
+            rows.entry(idx as u32).or_default();
+        }
+    }
 
     let mut sheet_data = String::new();
     for (row, mut cells) in rows {
@@ -568,6 +575,11 @@ fn write_sheet_xml(
         let mut row_attrs = String::new();
         if sheet.row_hidden.get(row as usize).copied().unwrap_or(false) {
             row_attrs.push_str(r#" hidden="1""#);
+        }
+        if let Some(roe_model::calc::RowHeight::Manual(h)) = sheet.row_heights.get(row as usize) {
+            if *h > 0.0 {
+                row_attrs.push_str(&format!(r#" ht="{h}" customHeight="1""#));
+            }
         }
         let outline = sheet.row_outline_level.get(row as usize).copied().unwrap_or(0);
         if outline > 0 {
@@ -795,7 +807,37 @@ fn write_sheet_view_xml(sheet: &Sheet) -> String {
     if let Some(zoom) = sheet.zoom_scale {
         attrs.push_str(&format!(r#" zoomScale="{zoom}""#));
     }
-    format!(r#"<sheetViews><sheetView{attrs}/></sheetViews>"#)
+    let fr = sheet.frozen_rows;
+    let fc = sheet.frozen_cols;
+    if fr == 0 && fc == 0 {
+        return format!(r#"<sheetViews><sheetView{attrs}/></sheetViews>"#);
+    }
+    // 冻结窗格：xSplit/ySplit 为冻结线左侧列数/上方行数；topLeftCell 为
+    // 右下（滚动）窗格的首格；activePane 取右下优先。
+    let top_left = format!("{}{}", col_to_letters(fc + 1), fr + 1);
+    let active = if fr > 0 && fc > 0 {
+        "bottomRight"
+    } else if fr > 0 {
+        "bottomLeft"
+    } else {
+        "topRight"
+    };
+    let mut pane = String::from("<pane");
+    if fc > 0 {
+        pane.push_str(&format!(r#" xSplit="{fc}""#));
+    }
+    if fr > 0 {
+        pane.push_str(&format!(r#" ySplit="{fr}""#));
+    }
+    pane.push_str(&format!(
+        r#" topLeftCell="{top_left}" activePane="{active}" state="frozen"/>"#
+    ));
+    let mut sel = String::new();
+    if fr > 0 && fc > 0 {
+        sel.push_str(r#"<selection pane="topRight"/><selection pane="bottomLeft"/>"#);
+    }
+    sel.push_str(&format!(r#"<selection pane="{active}"/>"#));
+    format!(r#"<sheetViews><sheetView{attrs}>{pane}{sel}</sheetView></sheetViews>"#)
 }
 
 /// 生成 sheet.merged_cells 对应的 <mergeCells> XML 片段。
@@ -1279,7 +1321,7 @@ mod tests {
                 data: vec![1.0, 2.0, 3.0],
                 color: None,
                 as_line: false,
-                trendline: false,
+                trendline: false, x_values: None, sizes: None,
             }],
             x_pt: x,
             y_pt: y,
@@ -1296,8 +1338,30 @@ mod tests {
             grouping: roe_model::impress::ChartGrouping::Standard,
             hole_size_pct: None,
             data_labels: Default::default(),
-            slice_border_color: None,
+            slice_border_color: None, legend_pos: None,
         }
+    }
+
+    #[test]
+    fn test_roundtrip_manual_row_height() {
+        use roe_model::calc::RowHeight;
+        let mut sheet = empty_sheet("Sheet1");
+        set_value(&mut sheet, 0, 0, CellValue::Number(1.0));
+        // 第 2 行有数据且手动行高 40;第 5 行是空白行但手动行高 22;第 3 行 Auto 不应变成 Manual
+        set_value(&mut sheet, 1, 0, CellValue::Number(2.0));
+        sheet.row_heights = vec![
+            RowHeight::Auto { current: 15.0, is_dirty: true },
+            RowHeight::Manual(40.0),
+            RowHeight::Auto { current: 18.0, is_dirty: true },
+            RowHeight::Auto { current: 15.0, is_dirty: true },
+            RowHeight::Manual(22.0),
+        ];
+        let bytes = XlsxWriter::write(&make_workbook(sheet)).expect("write failed");
+        let parsed = XlsxParser::parse(&bytes).expect("parse failed");
+        let rh = &parsed.sheets[0].row_heights;
+        assert!(matches!(rh.get(1), Some(RowHeight::Manual(h)) if (*h - 40.0).abs() < 0.01), "第2行手动行高丢失: {:?}", rh.get(1));
+        assert!(matches!(rh.get(4), Some(RowHeight::Manual(h)) if (*h - 22.0).abs() < 0.01), "空白行手动行高丢失: {:?}", rh.get(4));
+        assert!(!matches!(rh.get(2), Some(RowHeight::Manual(_))), "Auto 行不应被写成 Manual");
     }
 
     #[test]
@@ -2539,6 +2603,72 @@ mod tests {
     }
 
     #[test]
+    fn test_roundtrip_frozen_both_with_view_attrs() {
+        // 冻结 1 行 2 列，同时带 zoom/网格线：验证 <sheetView> 由自闭合
+        // 改为带子元素后，属性仍能被 parser 读回，且冻结行列还原。
+        let mut sheet1 = empty_sheet("Sheet1");
+        sheet1.frozen_rows = 1;
+        sheet1.frozen_cols = 2;
+        sheet1.zoom_scale = Some(150);
+        sheet1.show_grid_lines = Some(false);
+        set_value(&mut sheet1, 0, 0, CellValue::Text("fz".to_string()));
+
+        let wb = make_workbook(sheet1);
+        let bytes = XlsxWriter::write(&wb).expect("write failed");
+        let parsed = XlsxParser::parse(&bytes).expect("roundtrip parse failed");
+        let s = &parsed.sheets[0];
+
+        assert_eq!(s.frozen_rows, 1, "frozen_rows 应还原为 1");
+        assert_eq!(s.frozen_cols, 2, "frozen_cols 应还原为 2");
+        assert_eq!(s.zoom_scale, Some(150), "带 pane 时 zoomScale 不应丢");
+        assert_eq!(s.show_grid_lines, Some(false), "带 pane 时 showGridLines 不应丢");
+    }
+
+    #[test]
+    fn test_roundtrip_frozen_rows_only() {
+        let mut sheet1 = empty_sheet("Sheet1");
+        sheet1.frozen_rows = 3;
+        set_value(&mut sheet1, 0, 0, CellValue::Text("r".to_string()));
+
+        let wb = make_workbook(sheet1);
+        let bytes = XlsxWriter::write(&wb).expect("write failed");
+        let parsed = XlsxParser::parse(&bytes).expect("roundtrip parse failed");
+        let s = &parsed.sheets[0];
+
+        assert_eq!(s.frozen_rows, 3, "只冻结行：frozen_rows 应还原为 3");
+        assert_eq!(s.frozen_cols, 0, "只冻结行：frozen_cols 应为 0");
+    }
+
+    #[test]
+    fn test_roundtrip_frozen_cols_only() {
+        let mut sheet1 = empty_sheet("Sheet1");
+        sheet1.frozen_cols = 2;
+        set_value(&mut sheet1, 0, 0, CellValue::Text("c".to_string()));
+
+        let wb = make_workbook(sheet1);
+        let bytes = XlsxWriter::write(&wb).expect("write failed");
+        let parsed = XlsxParser::parse(&bytes).expect("roundtrip parse failed");
+        let s = &parsed.sheets[0];
+
+        assert_eq!(s.frozen_rows, 0, "只冻结列：frozen_rows 应为 0");
+        assert_eq!(s.frozen_cols, 2, "只冻结列：frozen_cols 应还原为 2");
+    }
+
+    #[test]
+    fn test_roundtrip_frozen_none() {
+        // 守卫：未冻结时不写 pane，读回仍为 0（不无中生有）。
+        let mut sheet1 = empty_sheet("Sheet1");
+        set_value(&mut sheet1, 0, 0, CellValue::Text("n".to_string()));
+
+        let wb = make_workbook(sheet1);
+        let bytes = XlsxWriter::write(&wb).expect("write failed");
+        let parsed = XlsxParser::parse(&bytes).expect("roundtrip parse failed");
+        let s = &parsed.sheets[0];
+
+        assert_eq!((s.frozen_rows, s.frozen_cols), (0, 0), "未冻结应保持 0/0");
+    }
+
+    #[test]
     fn test_roundtrip_col_row_hidden_outline() {
         // 验证本次新增：col/row 的 hidden + outlineLevel 导出，导出后能被
         // xlsx.rs parser 正确读回。覆盖三种场景：
@@ -2588,11 +2718,11 @@ mod tests {
     // 声称的"只写cell值"。核实代码确认真实支持范围：cell值(Number/Text/
     // Formula/Bool/Error/RichText) + merged_cells + cell_formats/
     // conditional_formatting + sheet_view + col/row hidden+outline_level。
-    // 真正不支持（无写出路径）：col_widths/row_heights/frozen_rows/
-    // frozen_cols。比较函数据此跳过这四个字段，其余全部纳入断言范围。
+    // 真正不支持（无写出路径）：col_widths/row_heights。frozen_rows/
+    // frozen_cols 已支持写出（<pane>），比较函数断言其一致。
 
     /// 比较两个 Workbook 在 writer 支持范围内的字段。
-    /// 跳过 col_widths/row_heights/frozen_rows/frozen_cols（确认无写出
+    /// 跳过 col_widths/row_heights（确认无写出
     /// 路径，非本次任务遗漏）；cell 值按坐标枚举比较（稀疏存储，直接用
     /// SparseGrid::get 逐格读取，不关心内部 block 切分方式是否一致，
     /// 只关心"同一坐标读到的值是否一致"这个语义层面的正确性）。
@@ -2631,6 +2761,12 @@ mod tests {
                     "{s_path}: cell({row},{col}) 值不一致 exp={exp_v:?} act={act_v:?}"
                 );
             }
+
+            assert_eq!(
+                (exp_sheet.frozen_rows, exp_sheet.frozen_cols),
+                (act_sheet.frozen_rows, act_sheet.frozen_cols),
+                "{s_path}: 冻结行列不一致"
+            );
 
             // merged_cells：忽略顺序，比较集合是否一致
             let mut exp_mc: Vec<_> = exp_sheet.merged_cells.iter()

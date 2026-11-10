@@ -252,6 +252,7 @@ fn register_read_fns(engine: &mut Engine) {
                     FillStyle::Gradient { .. } => "gradient",
                     FillStyle::Picture(_) => "picture",
                     FillStyle::PictureTiled { .. } => "picture_tiled",
+                    FillStyle::Pattern { .. } => "pattern",
                     FillStyle::None => "none",
                 });
 
@@ -772,12 +773,37 @@ fn parse_background_json(background_json: &str) -> Result<FillStyle, String> {
                     let angle = parsed.get("angle").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
                     GradientKind::Linear { angle }
                 }
-                "radial" => GradientKind::Radial,
-                "rect" => GradientKind::Rect,
+                "radial" | "rect" => {
+                    let cx = parsed.get("cx").and_then(|v| v.as_f64()).unwrap_or(0.5).clamp(0.0, 1.0) as f32;
+                    let cy = parsed.get("cy").and_then(|v| v.as_f64()).unwrap_or(0.5).clamp(0.0, 1.0) as f32;
+                    if kind_str == "radial" { GradientKind::Radial { cx, cy } } else { GradientKind::Rect { cx, cy } }
+                }
                 other => return Err(format!("未知 gradient kind: {other}")),
             };
             let rotate_with_shape = parsed.get("rotate_with_shape").and_then(|v| v.as_bool()).unwrap_or(true);
             Ok(FillStyle::Gradient { stops, kind, rotate_with_shape })
+        }
+        "pattern" => {
+            let preset = parsed.get("preset").and_then(|v| v.as_str())
+                .ok_or("pattern 类型缺少 preset 字段（ECMA-376 预设名，如 pct50、dkDnDiag、smCheck）")?;
+            if !roe_model::pattern::TILES.iter().any(|(n, _)| *n == preset) {
+                return Err(format!("未知图案预设: {preset}（须为 ECMA-376 预设名，如 pct50、dkDnDiag、smCheck、zigZag）"));
+            }
+            let color_of = |key: &str, default: Color| -> Result<Color, String> {
+                match parsed.get(key) {
+                    None => Ok(default),
+                    Some(c) => {
+                        let r = c.get("r").and_then(|v| v.as_u64()).ok_or(format!("{key}.r 缺失或非法"))? as u8;
+                        let g = c.get("g").and_then(|v| v.as_u64()).ok_or(format!("{key}.g 缺失或非法"))? as u8;
+                        let b = c.get("b").and_then(|v| v.as_u64()).ok_or(format!("{key}.b 缺失或非法"))? as u8;
+                        let a = c.get("a").and_then(|v| v.as_u64()).unwrap_or(255) as u8;
+                        Ok(Color { r, g, b, a })
+                    }
+                }
+            };
+            let fg = color_of("fg", Color { r: 0, g: 0, b: 0, a: 255 })?;
+            let bg = color_of("bg", Color { r: 255, g: 255, b: 255, a: 255 })?;
+            Ok(FillStyle::Pattern { preset: preset.to_string(), fg, bg })
         }
         "picture" => {
             let virtual_path = parsed.get("path").and_then(|v| v.as_str())
@@ -825,6 +851,33 @@ fn parse_background_json(background_json: &str) -> Result<FillStyle, String> {
                 tile_scale_x,
                 tile_scale_y,
                 tile_align,
+            })
+        }
+        "texture" => {
+            let name = parsed.get("name").and_then(|v| v.as_str())
+                .ok_or("texture 类型缺少 name 字段")?;
+            let data = roe_model::textures::texture_bytes(name).ok_or_else(|| format!(
+                "未知纹理名: {name}。可用纹理: {}",
+                roe_model::textures::texture_names().join(", ")
+            ))?;
+            let s = parsed.get("tile_scale").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
+            if !(s > 0.0 && s <= 10.0) {
+                return Err("tile_scale 需在 (0, 10] 内".to_string());
+            }
+            Ok(FillStyle::PictureTiled {
+                image: ImageData {
+                    data: data.to_vec().into(),
+                    mime: "image/png".to_string(),
+                    crop_l: 0.0,
+                    crop_t: 0.0,
+                    crop_r: 0.0,
+                    crop_b: 0.0,
+                },
+                tile_offset_x: 0.0,
+                tile_offset_y: 0.0,
+                tile_scale_x: s,
+                tile_scale_y: s,
+                tile_align: "tl".to_string(),
             })
         }
         other => Err(format!("未知背景类型: {other}")),
@@ -1739,5 +1792,42 @@ mod tests {
         });
         assert!(!result.is_empty());
         assert!(result.contains("越界"));
+    }
+}
+
+#[cfg(test)]
+mod texture_bg_tests {
+    use super::*;
+
+    #[test]
+    fn texture_background_known_name() {
+        let f = parse_background_json(r#"{"type":"texture","name":"walnut"}"#).unwrap();
+        match f {
+            FillStyle::PictureTiled { image, tile_scale_x, tile_scale_y, tile_align, .. } => {
+                assert_eq!(tile_scale_x, 1.0);
+                assert_eq!(tile_scale_y, 1.0);
+                assert_eq!(tile_align, "tl");
+                assert_eq!(image.mime, "image/png");
+                assert!(!image.data.is_empty());
+            }
+            _ => panic!("不是 PictureTiled"),
+        }
+    }
+
+    #[test]
+    fn texture_background_unknown_name_lists_names() {
+        let e = parse_background_json(r#"{"type":"texture","name":"nope"}"#).err().unwrap();
+        assert!(e.contains("未知纹理名"));
+        assert!(e.contains("walnut"));
+    }
+
+    #[test]
+    fn texture_background_tile_scale() {
+        let f = parse_background_json(r#"{"type":"texture","name":"sand","tile_scale":0.5}"#).unwrap();
+        match f {
+            FillStyle::PictureTiled { tile_scale_x, .. } => assert_eq!(tile_scale_x, 0.5),
+            _ => panic!("不是 PictureTiled"),
+        }
+        assert!(parse_background_json(r#"{"type":"texture","name":"sand","tile_scale":0}"#).is_err());
     }
 }

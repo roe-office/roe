@@ -101,7 +101,7 @@ def main():
     L.append("- **DataFrame 系列(`df_*`)出错返回以 `err:` 开头的字符串,不抛异常**,调用方需检查前缀。")
     L.append("- **只读引擎(`roe_query_script`、AI agent 只读路径)里,DF 表标「不可用(桩)」的函数被同名桩覆盖**:文件加载/写数据集/写工作簿类只返回 `err:只读环境不可用...`(sheet 类返回 -1)。文件由前台经 C-ABI `roe_df_open_parquet` 加载为命名数据集,脚本再用 `df_use` / `df_page` 操作。")
     L.append("- Calc 函数通过宏 `register_calc_apis!` 注册,带只读标记:只读环境(Query 工具)只能调用标记为「只读」的函数。")
-    L.append("- 写出范围有限:`save_docx` 不含表格/图片/页眉页脚;`save_xlsx` 不含列宽/行高/冻结窗格。")
+    L.append("- 写出范围有限:`save_docx` 不含表格/图片/页眉页脚;`save_xlsx` 不含列宽/行高(冻结窗格已支持)。")
     L.append('''- **两条保存路径签名不同**:Rhai `save_*` 返回 base64;C-ABI `roe_save_document_to_*_bytes` 通过回调 `extern "C" fn(*const u8, usize, *mut c_void)` 交出字节。roe-agent 是同进程 Rust 消费者,不应走 C-ABI 回调版,应走 Rhai `save_*` 或直接调 `roe_parser::ooxml::*_writer::write`。''')
     L.append("- 新建空白文档(Rust 内部): `roe_api::document::new_document_impl(doc_type: i32) -> u64`,1=Writer 2=Calc 3=Impress,返回 0 表示非法。\n")
     L.append(f"## 一、Calc Rhai 接口({len(calc)} 个)\n来源: `roe-script/src/calc_api.rs`\n")

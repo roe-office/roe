@@ -26,7 +26,38 @@
 /// 已覆盖 11 种有专属文案的类型：title/ctrTitle/subTitle/pic/tbl/
 /// chart/clipArt/media/dt/ftr/hdr/sldNum。
 /// 其余（body/obj/sldImg/dgm 及 None）统一返回兜底"幻灯片文本"。
+/// 提示文案语言：false=中文(默认)，true=英文。由前台按界面语言设置。
+static LANG_EN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_lang_en(en: bool) {
+    LANG_EN.store(en, std::sync::atomic::Ordering::Relaxed);
+}
+
 pub fn hint_text_for_ph_type(ph_type: Option<&str>) -> &'static str {
+    if LANG_EN.load(std::sync::atomic::Ordering::Relaxed) {
+        return hint_text_en(ph_type);
+    }
+    hint_text_zh(ph_type)
+}
+
+fn hint_text_en(ph_type: Option<&str>) -> &'static str {
+    match ph_type {
+        Some("title") | Some("ctrTitle") => "Click to add title",
+        Some("subTitle") => "Click to add subtitle",
+        Some("pic") => "Picture",
+        Some("tbl") => "Table",
+        Some("chart") => "Chart",
+        Some("clipArt") => "Clip art",
+        Some("media") => "Media",
+        Some("dt") => "Date and time",
+        Some("ftr") => "Footer",
+        Some("hdr") => "Header",
+        Some("sldNum") => "Slide number",
+        _ => "Click to add text",
+    }
+}
+
+fn hint_text_zh(ph_type: Option<&str>) -> &'static str {
     match ph_type {
         Some("title") | Some("ctrTitle") => "幻灯片标题",
         Some("subTitle") => "幻灯片副标题",

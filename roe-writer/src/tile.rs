@@ -1167,6 +1167,7 @@ impl WriterTileRenderer {
                                 list_label_color: l.list_label_color,
                                 list_label_font_scale: l.list_label_font_scale,
                                 list_label_superscript: l.list_label_superscript,
+                                list_label_bold: l.list_label_bold,
                             };
                             (shaped, line_top_pt)
                         }).collect()
@@ -1212,6 +1213,7 @@ impl WriterTileRenderer {
                                 list_label_color: None,
                                 list_label_font_scale: None,
                                 list_label_superscript: false,
+                                list_label_bold: false,
                             };
                             out.push((border_only, frame.y_on_page));
 
@@ -1233,6 +1235,7 @@ impl WriterTileRenderer {
                                     list_label_color: l.list_label_color,
                                     list_label_font_scale: l.list_label_font_scale,
                                     list_label_superscript: l.list_label_superscript,
+                                list_label_bold: l.list_label_bold,
                                 };
                                 let line_top_pt = frame.y_on_page + l.y_offset;
                                 out.push((shaped, line_top_pt));
@@ -1449,14 +1452,31 @@ impl WriterTileRenderer {
                         .unwrap_or(12.0_f32);
 
                     let default_brush = RunBrush { color: [30, 30, 30, 255], run_idx: None };
+                    // U+FFFC 专项：公式占位符换成同为 3 字节的零宽空格再交给 Parley，字节偏移不变
+                    let parley_text: String = shaped_line.text.replace('\u{FFFC}', "\u{200B}");
                     let mut builder = self.layout_context.ranged_builder(
-                        &mut self.font_context, &shaped_line.text, scale.max(1.0), true,
+                        &mut self.font_context, &parley_text, scale.max(1.0), true,
                     );
                     builder.push_default(StyleProperty::Brush(default_brush));
                     builder.push_default(GenericFamily::SystemUi);
                     builder.push_default(LineHeight::Absolute(shaped_line.line_height));
                     builder.push_default(StyleProperty::FontSize(primary_font_size));
                     for (run_idx, span) in shaped_line.runs.iter().enumerate() {
+                        // U+FFFC 专项：公式 span 用 InlineBox 占宽，把后面的文字推开；公式本体仍按 formula_box 画
+                        if let Some(fb) = span.formula_box {
+                            let fstart = span.start.min(shaped_line.text.len());
+                            if span.end > span.start {
+                                builder.push_inline_box(parley::InlineBox {
+                                    id: run_idx as u64,
+                                    kind: parley::InlineBoxKind::InFlow,
+                                    index: fstart,
+                                    width: fb.width * scale.max(1.0),
+                                    height: 0.0,
+                                    baseline: None,
+                                });
+                            }
+                            continue;
+                        }
                         // STEP6-STAGE-A（Gemini方案A：透明画刷占位法，经与用户
                         // 三方讨论后采纳）：脚注/尾注编号占位符run（field为
                         // EndnoteRef/FootnoteRef）的script字段已被resolve_run_style
@@ -1546,12 +1566,10 @@ impl WriterTileRenderer {
                         // 这里按 run_idx 反查 para.runs，用与 layout.rs 完全相同的
                         // resolve_run_font_family 取字体名，保证两阶段选中同一字体。
                         // run_idx 对应不上真实 run 的合成 span（如 note 标签）保持 SystemUi。
-                        if let Some(roe_model::writer::BodyElement::Paragraph(wp)) = para {
-                            if let Some(wr) = wp.runs.get(run_idx) {
-                                if let Some(fam) = crate::layout::resolve_run_font_family(doc, wp, wr) {
-                                    builder.push(StyleProperty::FontFamily(parley::FontFamily::named(fam.as_str())), range.clone());
-                                }
-                            }
+                        // 按 span 自带的字体标记推字体（与 line_shape 量宽同一规则），
+                        // 不再用行内序号 run_idx 反查 para.runs（两者下标不是一套）。
+                        if span.style.font_family_is_set {
+                            builder.push(StyleProperty::FontFamily(parley::FontFamily::named("Carlito")), range.clone());
                         }
                         // v317g：单元格行的 para 是整个表格元素，按 cell_ref 反查单元格段落的 run
                         if let (Some(roe_model::writer::BodyElement::Table(v317g_tb)), Some((_, v317g_ri, v317g_ci, v317g_pi))) = (para, shaped_line.cell_ref) {
@@ -1571,7 +1589,7 @@ impl WriterTileRenderer {
                         if span.style.underline    { builder.push(StyleProperty::Underline(true), range.clone()); }
                         if span.style.strikethrough { builder.push(StyleProperty::Strikethrough(true), range.clone()); }
                     }
-                    let mut layout: parley::Layout<RunBrush> = builder.build(&shaped_line.text);
+                    let mut layout: parley::Layout<RunBrush> = builder.build(&parley_text);
                     layout.break_all_lines(None);
                     layout.align(Alignment::Start, AlignmentOptions::default());
 
@@ -1593,6 +1611,19 @@ impl WriterTileRenderer {
                         lbuilder.push_default(GenericFamily::SystemUi);
                         lbuilder.push_default(LineHeight::Absolute(shaped_line.line_height));
                         lbuilder.push_default(StyleProperty::FontSize(label_font_size));
+                        if shaped_line.list_label_bold { lbuilder.push_default(StyleProperty::FontWeight(FontWeight::BOLD)); }
+                        // 项目符号/编号标签一律用半角字形：Carlito 有的用 Carlito，
+                        // Carlito 没有的方块、对勾用 DejaVu Sans，避免回退到 CJK 全角大符号。
+                        for (bi, ch) in label.char_indices() {
+                            let fam = match ch {
+                                '\u{25A0}' | '\u{25AA}' | '\u{25FC}' | '\u{2713}' | '\u{25CF}' | '\u{25CB}' | '\u{2013}' | '\u{2022}' => Some("OpenSymbol"),
+                                c if c.is_ascii() => Some("Carlito"),
+                                _ => None,
+                            };
+                            if let Some(f) = fam {
+                                lbuilder.push(StyleProperty::FontFamily(parley::FontFamily::named(f)), bi..bi + ch.len_utf8());
+                            }
+                        }
                         let mut label_layout: parley::Layout<RunBrush> = lbuilder.build(label);
                         label_layout.break_all_lines(None);
                         label_layout.align(Alignment::Start, AlignmentOptions::default());
@@ -2105,7 +2136,7 @@ impl WriterTileRenderer {
             }
             // Radial/Rect 均用径向渐变近似，中心固定为形状几何中心，
             // 半径取对角线一半，与 slide_renderer.rs 的第一期简化一致。
-            roe_model::common::GradientKind::Radial | roe_model::common::GradientKind::Rect => {
+            roe_model::common::GradientKind::Radial { .. } | roe_model::common::GradientKind::Rect { .. } => {
                 let radius = ((w * w + h * h).sqrt()) / 2.0;
                 let center = Point::from_xy(cx, cy);
                 RadialGradient::new(center, 0.0, center, radius, sk_stops, SpreadMode::Pad, Transform::identity())
@@ -2282,6 +2313,7 @@ impl WriterTileRenderer {
                 }
                 roe_model::common::FillStyle::Picture(_) => None,
                 roe_model::common::FillStyle::PictureTiled { .. } => None,
+                roe_model::common::FillStyle::Pattern { .. } => None,
                 roe_model::common::FillStyle::None => None,
             };
             if let Some(paint) = paint {

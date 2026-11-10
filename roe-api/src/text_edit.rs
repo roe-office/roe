@@ -127,6 +127,9 @@ fn insert_char_in_entry(
     char_offset: usize,
     ch: char,
 ) -> Result<String, String> {
+    if entry.writer_options.track_changes {
+        return tracked_insert_in_entry(entry, para_index, char_offset, &ch.to_string());
+    }
     let RoeDocument::Writer(doc) = &entry.doc else {
         return Err("非 Writer 文档".to_string());
     };
@@ -170,8 +173,42 @@ fn insert_char_in_entry(
     let Some(BodyElement::Paragraph(para)) = doc.body.get_mut(para_index) else {
         unreachable!("上面已确认 para_index 有效");
     };
-    let run = &mut para.runs[run_index];
-    run.text.insert(offset_in_run, ch);
+    let in_rev = {
+        let r = &para.runs[run_index];
+        r.revision.is_some() && r.formula.is_none() && r.field.is_none()
+    };
+    if in_rev {
+        // v309: 修订关闭时，挨着修订文字输入不并入修订，另起普通 run
+        let len = para.runs[run_index].text.len();
+        let mut newrun = para.runs[run_index].clone();
+        newrun.text = ch.to_string();
+        newrun.revision = None;
+        newrun.comment_range_start.clear();
+        newrun.comment_range_end.clear();
+        newrun.comment_ref = None;
+        newrun.footnote_ref = None;
+        newrun.endnote_ref = None;
+        if offset_in_run == 0 {
+            para.runs.insert(run_index, newrun);
+        } else if offset_in_run >= len {
+            para.runs.insert(run_index + 1, newrun);
+        } else {
+            let mut right = para.runs[run_index].clone();
+            right.text = right.text[offset_in_run..].to_string();
+            right.comment_range_start.clear();
+            right.comment_ref = None;
+            right.footnote_ref = None;
+            right.endnote_ref = None;
+            para.runs[run_index].text.truncate(offset_in_run);
+            para.runs[run_index].comment_range_end.clear();
+            para.runs.insert(run_index + 1, newrun);
+            para.runs.insert(run_index + 2, right);
+        }
+    } else {
+        let run = &mut para.runs[run_index];
+        run.text.insert(offset_in_run, ch);
+    }
+    crate::formula_edit::normalize_formula_runs(para);
 
     let ch_len = ch.len_utf8();
     let new_char_offset = char_offset + ch_len;
@@ -290,6 +327,9 @@ fn insert_text_in_entry(
     char_offset: usize,
     text: &str,
 ) -> Result<String, String> {
+    if entry.writer_options.track_changes {
+        return tracked_insert_in_entry(entry, para_index, char_offset, text);
+    }
     let RoeDocument::Writer(doc) = &entry.doc else {
         return Err("非 Writer 文档".to_string());
     };
@@ -372,8 +412,42 @@ fn insert_text_in_entry(
     let Some(BodyElement::Paragraph(para)) = doc.body.get_mut(para_index) else {
         unreachable!("上面已确认 para_index 有效");
     };
-    let run = &mut para.runs[run_index];
-    run.text.insert_str(offset_in_run, text);
+    let in_rev = {
+        let r = &para.runs[run_index];
+        r.revision.is_some() && r.formula.is_none() && r.field.is_none()
+    };
+    if in_rev {
+        // v309: 修订关闭时，挨着修订文字输入不并入修订，另起普通 run
+        let len = para.runs[run_index].text.len();
+        let mut newrun = para.runs[run_index].clone();
+        newrun.text = text.to_string();
+        newrun.revision = None;
+        newrun.comment_range_start.clear();
+        newrun.comment_range_end.clear();
+        newrun.comment_ref = None;
+        newrun.footnote_ref = None;
+        newrun.endnote_ref = None;
+        if offset_in_run == 0 {
+            para.runs.insert(run_index, newrun);
+        } else if offset_in_run >= len {
+            para.runs.insert(run_index + 1, newrun);
+        } else {
+            let mut right = para.runs[run_index].clone();
+            right.text = right.text[offset_in_run..].to_string();
+            right.comment_range_start.clear();
+            right.comment_ref = None;
+            right.footnote_ref = None;
+            right.endnote_ref = None;
+            para.runs[run_index].text.truncate(offset_in_run);
+            para.runs[run_index].comment_range_end.clear();
+            para.runs.insert(run_index + 1, newrun);
+            para.runs.insert(run_index + 2, right);
+        }
+    } else {
+        let run = &mut para.runs[run_index];
+        run.text.insert_str(offset_in_run, text);
+    }
+    crate::formula_edit::normalize_formula_runs(para);
 
     let text_len = text.len();
     let new_char_offset = char_offset + text_len;
@@ -387,6 +461,156 @@ fn insert_text_in_entry(
         "{{\"container_type\":0,\"container_id\":0,\"local_para_index\":{},\"char_offset\":{}}}",
         para_index, new_char_offset
     ))
+}
+
+/// v308: 修订模式下的插入。新文字记成 Insert 修订（作者取 writer_options.track_author）。
+fn tracked_insert_in_entry(
+    entry: &mut handle::DocumentEntry,
+    para_index: usize,
+    char_offset: usize,
+    text: &str,
+) -> Result<String, String> {
+    use roe_model::writer::{Revision, RevisionKind, Run};
+    let author = if entry.writer_options.track_author.is_empty() {
+        "用户".to_string()
+    } else {
+        entry.writer_options.track_author.clone()
+    };
+    let RoeDocument::Writer(doc) = &entry.doc else {
+        return Err("非 Writer 文档".to_string());
+    };
+    let new_id = crate::revisions::next_revision_id(doc);
+    let para = match doc.body.get(para_index) {
+        Some(BodyElement::Paragraph(p)) => p,
+        _ => return Err(format!("para_index={para_index} 越界或不存在")),
+    };
+    let mut target: Option<(usize, usize)> = None;
+    if para.runs.is_empty() {
+        if char_offset != 0 {
+            return Err(format!("char_offset={char_offset} 超出段落范围（空段落）"));
+        }
+    } else {
+        let mut consumed = 0usize;
+        for (i, run) in para.runs.iter().enumerate() {
+            let run_len = run.text.len();
+            if char_offset <= consumed + run_len {
+                let off = char_offset - consumed;
+                if !run.text.is_char_boundary(off) {
+                    return Err(format!("char_offset={char_offset} 不在 run[{i}] 的字符边界上"));
+                }
+                target = Some((i, off));
+                break;
+            }
+            consumed += run_len;
+        }
+        if target.is_none() {
+            return Err(format!("char_offset={char_offset} 超出段落范围（总长度={consumed}）"));
+        }
+    }
+
+    let prev = entry.doc.clone();
+    let RoeDocument::Writer(doc) = &mut entry.doc else { unreachable!("上面已确认是 Writer 文档"); };
+    let Some(BodyElement::Paragraph(para)) = doc.body.get_mut(para_index) else { unreachable!("上面已确认 para_index 有效"); };
+    let rev = Revision {
+        kind: RevisionKind::Insert,
+        id: new_id,
+        author: author.clone(),
+        date: crate::revisions::now_iso_utc(),
+        under: None,
+    };
+    match target {
+        None => {
+            para.runs.push(Run { text: text.to_string(), revision: Some(rev), ..Default::default() });
+        }
+        Some((ri, off)) => {
+            let plain = para.runs[ri].formula.is_none() && para.runs[ri].field.is_none();
+            let same_author_insert = matches!(
+                &para.runs[ri].revision,
+                Some(r) if r.kind == RevisionKind::Insert && r.author == author && r.under.is_none()
+            );
+            if same_author_insert && plain {
+                para.runs[ri].text.insert_str(off, text);
+            } else {
+                let len = para.runs[ri].text.len();
+                let mut newrun = para.runs[ri].clone();
+                newrun.text = text.to_string();
+                newrun.revision = Some(rev);
+                newrun.comment_range_start.clear();
+                newrun.comment_range_end.clear();
+                newrun.comment_ref = None;
+                newrun.footnote_ref = None;
+                newrun.endnote_ref = None;
+                newrun.formula = None;
+                newrun.field = None;
+                if off == 0 {
+                    para.runs.insert(ri, newrun);
+                } else if off >= len {
+                    para.runs.insert(ri + 1, newrun);
+                } else {
+                    if !plain {
+                        return Err("修订模式：不能在公式或域内部插入文字".to_string());
+                    }
+                    let mut right = para.runs[ri].clone();
+                    right.text = right.text[off..].to_string();
+                    right.comment_range_start.clear();
+                    right.comment_ref = None;
+                    right.footnote_ref = None;
+                    right.endnote_ref = None;
+                    para.runs[ri].text.truncate(off);
+                    para.runs[ri].comment_range_end.clear();
+                    para.runs.insert(ri + 1, newrun);
+                    para.runs.insert(ri + 2, right);
+                }
+            }
+        }
+    }
+    crate::formula_edit::normalize_formula_runs(para);
+
+    entry.push_undo_snapshot(prev, handle::EditCursorContext::at(para_index, char_offset));
+    Ok(format!(
+        "{{\"container_type\":0,\"container_id\":0,\"local_para_index\":{},\"char_offset\":{}}}",
+        para_index, char_offset + text.len()
+    ))
+}
+
+/// v308: 修订模式下的区间替换（IME 组合结算走这里）。
+fn tracked_replace_in_entry(
+    entry: &mut handle::DocumentEntry,
+    para_index: usize,
+    range_start: usize,
+    range_end: usize,
+    new_text: &str,
+) -> Result<String, String> {
+    let author = if entry.writer_options.track_author.is_empty() {
+        "用户".to_string()
+    } else {
+        entry.writer_options.track_author.clone()
+    };
+    let RoeDocument::Writer(doc) = &entry.doc else { return Err("非 Writer 文档".to_string()); };
+    let new_id = crate::revisions::next_revision_id(doc);
+    let prev = entry.doc.clone();
+    let RoeDocument::Writer(doc) = &mut entry.doc else { unreachable!(); };
+    let Some(BodyElement::Paragraph(para)) = doc.body.get_mut(para_index) else {
+        return Err(format!("para_index={para_index} 越界或不存在"));
+    };
+    let para_len: usize = para.runs.iter().map(|r| r.text.len()).sum();
+    if range_start > range_end || range_end > para_len {
+        return Err(format!("区间 [{range_start},{range_end}) 超出段落范围（长度={para_len}）"));
+    }
+    let removed = crate::text_edit::tracked_delete_span(para, range_start, range_end, &author, new_id, &crate::revisions::now_iso_utc())?;
+    let ins_at = range_end - removed;
+    if new_text.is_empty() {
+        entry.push_undo_snapshot(prev, handle::EditCursorContext::range(para_index, range_start, range_end));
+        return Ok(format!(
+            "{{\"container_type\":0,\"container_id\":0,\"local_para_index\":{},\"char_offset\":{}}}",
+            para_index, ins_at
+        ));
+    }
+    let out = tracked_insert_in_entry(entry, para_index, ins_at, new_text)?;
+    // 弹掉插入单独推的那一条快照，换成覆盖整次替换的 prev
+    entry.undo_stack.pop();
+    entry.push_undo_snapshot(prev, handle::EditCursorContext::range(para_index, range_start, range_end));
+    Ok(out)
 }
 
 /// 删除方向：Backspace（删除 char_offset 之前一个字符）或
@@ -596,6 +820,9 @@ fn delete_char_in_entry(
         }
     };
 
+    if entry.writer_options.track_changes {
+        return tracked_delete_in_entry(entry, para_index, char_offset, del_start, del_end, direction);
+    }
     // 校验通过，开始实际修改：克隆快照（等价 roe_begin_edit）。
     entry.snapshot = Some(entry.doc.clone());
 
@@ -633,6 +860,7 @@ fn delete_char_in_entry(
     if let Some(i) = removed_run_index {
         para.runs.remove(i);
     }
+    crate::formula_edit::normalize_formula_runs(para);
 
     let new_char_offset = match direction {
         DeleteDirection::Backward => del_start,
@@ -648,6 +876,125 @@ fn delete_char_in_entry(
     Ok(format!(
         "{{\"container_type\":0,\"container_id\":0,\"local_para_index\":{},\"char_offset\":{}}}",
         para_index, new_char_offset
+    ))
+}
+
+/// v308: 保证 off 处有 run 边界（必要时把 run 一分为二）。
+fn split_runs_at(runs: &mut Vec<roe_model::writer::Run>, off: usize) -> Result<(), String> {
+    let mut consumed = 0usize;
+    for i in 0..runs.len() {
+        let len = runs[i].text.len();
+        if off > consumed && off < consumed + len {
+            let k = off - consumed;
+            if !runs[i].text.is_char_boundary(k) {
+                return Err(format!("偏移 {off} 不在字符边界上"));
+            }
+            if runs[i].formula.is_some() || runs[i].field.is_some() {
+                return Err("修订模式：不能拆分公式或域".to_string());
+            }
+            let mut right = runs[i].clone();
+            right.text = right.text[k..].to_string();
+            right.comment_range_start.clear();
+            right.comment_ref = None;
+            right.footnote_ref = None;
+            right.endnote_ref = None;
+            runs[i].text.truncate(k);
+            runs[i].comment_range_end.clear();
+            runs.insert(i + 1, right);
+            return Ok(());
+        }
+        consumed += len;
+    }
+    Ok(())
+}
+
+/// v308: 修订模式下删除段内字节区间 [start,end)。返回被真删（自己的插入）的字节数。
+pub(crate) fn tracked_delete_span(
+    para: &mut roe_model::writer::Paragraph,
+    start: usize,
+    end: usize,
+    author: &str,
+    first_id: u32,
+    date: &str,
+) -> Result<usize, String> {
+    use roe_model::writer::{Revision, RevisionKind};
+    if start >= end { return Ok(0); }
+    split_runs_at(&mut para.runs, start)?;
+    split_runs_at(&mut para.runs, end)?;
+    let old = std::mem::take(&mut para.runs);
+    let mut out = Vec::with_capacity(old.len());
+    let mut consumed = 0usize;
+    let mut removed = 0usize;
+    let mut next_id = first_id;
+    for mut r in old {
+        let len = r.text.len();
+        let rs = consumed;
+        consumed += len;
+        if len == 0 || rs < start || rs + len > end {
+            out.push(r);
+            continue;
+        }
+        match r.revision.take() {
+            None => {
+                r.revision = Some(Revision { kind: RevisionKind::Delete, id: next_id, author: author.to_string(), date: date.to_string(), under: None });
+                next_id += 1;
+                out.push(r);
+            }
+            Some(rev) if rev.kind == RevisionKind::Delete => {
+                r.revision = Some(rev);
+                out.push(r);
+            }
+            Some(rev) if rev.author == author && rev.under.is_none() => {
+                removed += len;
+                let had_ref = r.comment_ref.is_some() || r.footnote_ref.is_some() || r.endnote_ref.is_some()
+                    || !r.comment_range_start.is_empty() || !r.comment_range_end.is_empty();
+                if had_ref {
+                    r.text.clear();
+                    out.push(r);
+                }
+            }
+            Some(rev) => {
+                r.revision = Some(Revision { kind: RevisionKind::Delete, id: next_id, author: author.to_string(), date: date.to_string(), under: Some(Box::new(rev)) });
+                next_id += 1;
+                out.push(r);
+            }
+        }
+    }
+    para.runs = out;
+    Ok(removed)
+}
+
+/// v308: 修订模式下的单字符删除（del_start/del_end 由 delete_char_in_entry 算好）。
+fn tracked_delete_in_entry(
+    entry: &mut handle::DocumentEntry,
+    para_index: usize,
+    char_offset: usize,
+    del_start: usize,
+    del_end: usize,
+    direction: DeleteDirection,
+) -> Result<String, String> {
+    let author = if entry.writer_options.track_author.is_empty() {
+        "用户".to_string()
+    } else {
+        entry.writer_options.track_author.clone()
+    };
+    let RoeDocument::Writer(doc) = &entry.doc else { return Err("非 Writer 文档".to_string()); };
+    let new_id = crate::revisions::next_revision_id(doc);
+    let prev = entry.doc.clone();
+    let RoeDocument::Writer(doc) = &mut entry.doc else { unreachable!(); };
+    let Some(BodyElement::Paragraph(para)) = doc.body.get_mut(para_index) else {
+        return Err(format!("para_index={para_index} 越界或不存在"));
+    };
+    let removed = tracked_delete_span(para, del_start, del_end, &author, new_id, &crate::revisions::now_iso_utc())?;
+    crate::formula_edit::normalize_formula_runs(para);
+    let new_off = match direction {
+        DeleteDirection::Backward => del_start,
+        DeleteDirection::Forward => del_end - removed,
+    };
+    entry.push_undo_snapshot(prev, handle::EditCursorContext::at(para_index, char_offset));
+    Ok(format!(
+        "{{\"container_type\":0,\"container_id\":0,\"local_para_index\":{},\"char_offset\":{}}}",
+        para_index, new_off
     ))
 }
 
@@ -1840,6 +2187,9 @@ fn replace_range_in_entry(
     range_end: usize,
     new_text: &str,
 ) -> Result<String, String> {
+    if entry.writer_options.track_changes {
+        return tracked_replace_in_entry(entry, para_index, range_start, range_end, new_text);
+    }
     let RoeDocument::Writer(doc) = &entry.doc else {
         return Err("非 Writer 文档".to_string());
     };
@@ -1945,6 +2295,50 @@ fn replace_range_in_entry(
         unreachable!("上面已确认 para_index 有效");
     };
 
+    // v309: 修订关闭时，纯插入（空区间）落在修订 run 里，不并入修订，另起普通 run
+    if local_start == local_end
+        && !new_text.is_empty()
+        && para.runs[run_index].revision.is_some()
+        && para.runs[run_index].formula.is_none()
+        && para.runs[run_index].field.is_none()
+    {
+        let len = para.runs[run_index].text.len();
+        let mut newrun = para.runs[run_index].clone();
+        newrun.text = new_text.to_string();
+        newrun.revision = None;
+        newrun.comment_range_start.clear();
+        newrun.comment_range_end.clear();
+        newrun.comment_ref = None;
+        newrun.footnote_ref = None;
+        newrun.endnote_ref = None;
+        if local_start == 0 {
+            para.runs.insert(run_index, newrun);
+        } else if local_start >= len {
+            para.runs.insert(run_index + 1, newrun);
+        } else {
+            let mut right = para.runs[run_index].clone();
+            right.text = right.text[local_start..].to_string();
+            right.comment_range_start.clear();
+            right.comment_ref = None;
+            right.footnote_ref = None;
+            right.endnote_ref = None;
+            para.runs[run_index].text.truncate(local_start);
+            para.runs[run_index].comment_range_end.clear();
+            para.runs.insert(run_index + 1, newrun);
+            para.runs.insert(run_index + 2, right);
+        }
+        crate::formula_edit::normalize_formula_runs(para);
+        let new_char_offset = range_start + new_text.len();
+        if let Some(prev) = entry.snapshot.take() {
+            let ctx = handle::EditCursorContext::range(para_index, range_start, range_end);
+            entry.push_undo_snapshot(prev, ctx);
+        }
+        return Ok(format!(
+            "{{\"container_type\":0,\"container_id\":0,\"local_para_index\":{},\"char_offset\":{}}}",
+            para_index, new_char_offset
+        ));
+    }
+
     let run = &mut para.runs[run_index];
     // 一次性区间替换：删除 [local_start, local_end)，插入 new_text。
     // String::replace_range 本身就是"删除区间+插入"的原子操作，比
@@ -1958,6 +2352,7 @@ fn replace_range_in_entry(
     if run.text.is_empty() {
         para.runs.remove(run_index);
     }
+    crate::formula_edit::normalize_formula_runs(para);
 
     // 新光标位置：替换区间起点 + 新文本的字节长度（光标落在新插入
     // 内容末尾，IME 组合场景需要这个语义——光标跟着组合中的文字走）。
@@ -1976,4 +2371,326 @@ fn replace_range_in_entry(
         "{{\"container_type\":0,\"container_id\":0,\"local_para_index\":{},\"char_offset\":{}}}",
         para_index, new_char_offset
     ))
+}
+
+#[cfg(test)]
+mod track_insert_tests {
+    use super::*;
+    use roe_model::writer::{Paragraph, Run, RevisionKind, WriterDocument};
+
+    fn open_plain(text: &str) -> u64 {
+        let mut doc = WriterDocument::default();
+        let mut p = Paragraph::default();
+        p.runs.push(Run { text: text.to_string(), ..Default::default() });
+        doc.body.push(BodyElement::Paragraph(p));
+        handle::insert(handle::DocumentEntry {
+            doc: RoeDocument::Writer(doc),
+            snapshot: None,
+            is_shadow: false,
+            events: std::collections::VecDeque::new(),
+            animation: std::collections::HashMap::new(),
+            writer_layout_cache: None,
+            writer_font_registry: None,
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+            writer_options: handle::WriterOptions::default(),
+            impress_font_registry: None,
+            writer_parley_font_context: None,
+            calc_engine: None,
+            pending_comment_hits: Vec::new(),
+        })
+    }
+
+    fn runs_of(h: u64) -> Vec<(String, Option<(RevisionKind, String, u32)>)> {
+        handle::with_entry(h, |entry| {
+            let RoeDocument::Writer(doc) = &entry.doc else { unreachable!() };
+            let Some(BodyElement::Paragraph(p)) = doc.body.get(0) else { unreachable!() };
+            p.runs.iter().map(|r| (r.text.clone(), r.revision.as_ref().map(|v| (v.kind, v.author.clone(), v.id)))).collect()
+        }).unwrap()
+    }
+
+    fn ins(h: u64, off: u32, t: &str) -> String {
+        let ptr = roe_insert_text(h, 0, 0, 0, off, t.as_ptr(), t.len() as u32);
+        assert!(!ptr.is_null(), "插入应成功");
+        unsafe { CString::from_raw(ptr) }.into_string().unwrap()
+    }
+
+    #[test]
+    fn tracked_insert_splits_then_merges_same_author() {
+        let h = open_plain("Hello World");
+        handle::with_entry(h, |e| {
+            e.writer_options.track_changes = true;
+            e.writer_options.track_author = "me".to_string();
+        });
+        let out = ins(h, 5, "XY");
+        assert!(out.contains("\"char_offset\":7"), "{out}");
+        let r = runs_of(h);
+        assert_eq!(r.len(), 3);
+        assert_eq!(r[0], ("Hello".to_string(), None));
+        assert_eq!(r[1].0, "XY");
+        assert_eq!(r[1].1.as_ref().map(|x| (x.0, x.1.as_str())), Some((RevisionKind::Insert, "me")));
+        assert_eq!(r[2], (" World".to_string(), None));
+        // 紧接着在自己的修订末尾继续打字：并入同一个 run
+        ins(h, 7, "Z");
+        let r = runs_of(h);
+        assert_eq!(r.len(), 3);
+        assert_eq!(r[1].0, "XYZ");
+        handle::remove(h);
+    }
+
+    #[test]
+    fn ime_replace_range_beside_revision_is_not_absorbed() {
+        let h = open_plain("Hello");
+        handle::with_entry(h, |e| {
+            e.writer_options.track_changes = true;
+            e.writer_options.track_author = "me".to_string();
+        });
+        ins(h, 5, "XY");
+        handle::with_entry(h, |e| { e.writer_options.track_changes = false; });
+        // 模拟 IME：[7,7) 插入，再 [7,8)、[7,9) 逐步替换组合文字
+        handle::with_entry(h, |e| replace_range_in_entry(e, 0, 7, 7, "a")).unwrap().unwrap();
+        handle::with_entry(h, |e| replace_range_in_entry(e, 0, 7, 8, "ab")).unwrap().unwrap();
+        handle::with_entry(h, |e| replace_range_in_entry(e, 0, 7, 9, "abc")).unwrap().unwrap();
+        let r = runs_of(h);
+        assert_eq!(r.len(), 3, "{r:?}");
+        assert_eq!(r[1].0, "XY");
+        assert!(r[1].1.is_some());
+        assert_eq!(r[2], ("abc".to_string(), None));
+        handle::remove(h);
+    }
+
+    #[test]
+    fn plain_input_beside_revision_is_not_absorbed() {
+        let h = open_plain("Hello");
+        handle::with_entry(h, |e| {
+            e.writer_options.track_changes = true;
+            e.writer_options.track_author = "me".to_string();
+        });
+        ins(h, 5, "XY");
+        handle::with_entry(h, |e| { e.writer_options.track_changes = false; });
+        ins(h, 7, "Z");
+        let r = runs_of(h);
+        assert_eq!(r.len(), 3);
+        assert_eq!(r[1].0, "XY");
+        assert!(r[1].1.is_some());
+        assert_eq!(r[2], ("Z".to_string(), None));
+        // 单字符路径
+        handle::with_entry(h, |e| insert_char_in_entry(e, 0, 7, 'W')).unwrap().unwrap();
+        let r = runs_of(h);
+        assert_eq!(r.len(), 4);
+        assert_eq!(r[1].0, "XY");
+        assert!(r[1].1.is_some());
+        assert_eq!(r[2], ("W".to_string(), None));
+        handle::remove(h);
+    }
+
+    #[test]
+    fn tracked_insert_off_means_plain() {
+        let h = open_plain("Hello World");
+        ins(h, 5, "!");
+        let r = runs_of(h);
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].0, "Hello! World");
+        handle::remove(h);
+    }
+
+    #[test]
+    fn tracked_insert_char_in_other_author_delete_splits_it() {
+        let h = open_plain("ABCD");
+        handle::with_entry(h, |e| {
+            let RoeDocument::Writer(doc) = &mut e.doc else { unreachable!() };
+            let Some(BodyElement::Paragraph(p)) = doc.body.get_mut(0) else { unreachable!() };
+            p.runs[0].revision = Some(roe_model::writer::Revision {
+                kind: RevisionKind::Delete, id: 4, author: "bob".into(), date: String::new(), under: None,
+            });
+            e.writer_options.track_changes = true;
+            e.writer_options.track_author = "me".to_string();
+        });
+        ins(h, 2, "x");
+        let r = runs_of(h);
+        assert_eq!(r.len(), 3);
+        assert_eq!(r[0].0, "AB");
+        assert_eq!(r[1].0, "x");
+        assert_eq!(r[2].0, "CD");
+        assert_eq!(r[0].1.as_ref().map(|x| x.0), Some(RevisionKind::Delete));
+        assert_eq!(r[1].1.as_ref().map(|x| x.0), Some(RevisionKind::Insert));
+        assert_eq!(r[2].1.as_ref().map(|x| x.0), Some(RevisionKind::Delete));
+        assert_eq!(r[1].1.as_ref().map(|x| x.2), Some(5));
+        handle::remove(h);
+    }
+}
+
+#[cfg(test)]
+mod track_delete_tests {
+    use super::*;
+    use roe_model::writer::{Paragraph, Revision, RevisionKind, Run, WriterDocument};
+
+    fn open_runs(runs: Vec<Run>) -> u64 {
+        let mut doc = WriterDocument::default();
+        let mut p = Paragraph::default();
+        p.runs = runs;
+        doc.body.push(BodyElement::Paragraph(p));
+        handle::insert(handle::DocumentEntry {
+            doc: RoeDocument::Writer(doc),
+            snapshot: None,
+            is_shadow: false,
+            events: std::collections::VecDeque::new(),
+            animation: std::collections::HashMap::new(),
+            writer_layout_cache: None,
+            writer_font_registry: None,
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+            writer_options: handle::WriterOptions::default(),
+            impress_font_registry: None,
+            writer_parley_font_context: None,
+            calc_engine: None,
+            pending_comment_hits: Vec::new(),
+        })
+    }
+
+    fn rev(kind: RevisionKind, author: &str, id: u32) -> Revision {
+        Revision { kind, id, author: author.into(), date: String::new(), under: None }
+    }
+
+    fn snapshot(h: u64) -> Vec<(String, Option<(RevisionKind, String, bool)>)> {
+        handle::with_entry(h, |e| {
+            let RoeDocument::Writer(doc) = &e.doc else { unreachable!() };
+            let Some(BodyElement::Paragraph(p)) = doc.body.get(0) else { unreachable!() };
+            p.runs.iter().map(|r| (r.text.clone(),
+                r.revision.as_ref().map(|v| (v.kind, v.author.clone(), v.under.is_some())))).collect()
+        }).unwrap()
+    }
+
+    fn del(h: u64, off: u32, dir: u32) -> String {
+        let ptr = roe_delete_char(h, 0, 0, 0, off, dir);
+        assert!(!ptr.is_null(), "删除应成功");
+        unsafe { CString::from_raw(ptr) }.into_string().unwrap()
+    }
+
+    fn on(h: u64) {
+        handle::with_entry(h, |e| {
+            e.writer_options.track_changes = true;
+            e.writer_options.track_author = "me".to_string();
+        });
+    }
+
+    #[test]
+    fn delete_forward_marks_plain_text() {
+        let h = open_runs(vec![Run { text: "ABCD".into(), ..Default::default() }]);
+        on(h);
+        let out = del(h, 1, 1);
+        assert!(out.contains("\"char_offset\":2"), "{out}");
+        let s = snapshot(h);
+        assert_eq!(s.len(), 3);
+        assert_eq!(s[0], ("A".to_string(), None));
+        assert_eq!(s[1].0, "B");
+        assert_eq!(s[1].1.as_ref().map(|x| (x.0, x.1.as_str())), Some((RevisionKind::Delete, "me")));
+        assert_eq!(s[2], ("CD".to_string(), None));
+        handle::remove(h);
+    }
+
+    #[test]
+    fn backspace_over_own_insert_really_deletes() {
+        let h = open_runs(vec![Run { text: "ABC".into(), revision: Some(rev(RevisionKind::Insert, "me", 1)), ..Default::default() }]);
+        on(h);
+        let out = del(h, 3, 0);
+        assert!(out.contains("\"char_offset\":2"), "{out}");
+        let s = snapshot(h);
+        assert_eq!(s.len(), 1);
+        assert_eq!(s[0].0, "AB");
+        assert_eq!(s[0].1.as_ref().map(|x| x.0), Some(RevisionKind::Insert));
+        handle::remove(h);
+    }
+
+    #[test]
+    fn delete_other_authors_insert_nests_under() {
+        let h = open_runs(vec![Run { text: "XYZ".into(), revision: Some(rev(RevisionKind::Insert, "bob", 2)), ..Default::default() }]);
+        on(h);
+        del(h, 1, 1);
+        let s = snapshot(h);
+        assert_eq!(s.len(), 3);
+        assert_eq!(s[1].0, "Y");
+        assert_eq!(s[1].1, Some((RevisionKind::Delete, "me".to_string(), true)));
+        assert_eq!(s[0].1.as_ref().map(|x| x.0), Some(RevisionKind::Insert));
+        handle::remove(h);
+    }
+
+    #[test]
+    fn backspace_over_already_deleted_keeps_run_and_moves_cursor() {
+        let h = open_runs(vec![
+            Run { text: "AB".into(), ..Default::default() },
+            Run { text: "C".into(), revision: Some(rev(RevisionKind::Delete, "bob", 3)), ..Default::default() },
+        ]);
+        on(h);
+        let out = del(h, 3, 0);
+        assert!(out.contains("\"char_offset\":2"), "{out}");
+        let s = snapshot(h);
+        assert_eq!(s.len(), 2);
+        assert_eq!(s[1].1.as_ref().map(|x| x.1.as_str()), Some("bob"));
+        handle::remove(h);
+    }
+}
+
+#[cfg(test)]
+mod track_replace_tests {
+    use super::*;
+    use roe_model::writer::{Paragraph, Run, RevisionKind, WriterDocument};
+
+    fn open_plain(text: &str) -> u64 {
+        let mut doc = WriterDocument::default();
+        let mut p = Paragraph::default();
+        p.runs.push(Run { text: text.to_string(), ..Default::default() });
+        doc.body.push(BodyElement::Paragraph(p));
+        handle::insert(handle::DocumentEntry {
+            doc: RoeDocument::Writer(doc), snapshot: None, is_shadow: false,
+            events: std::collections::VecDeque::new(), animation: std::collections::HashMap::new(),
+            writer_layout_cache: None, writer_font_registry: None,
+            undo_stack: Vec::new(), redo_stack: Vec::new(),
+            writer_options: handle::WriterOptions::default(),
+            impress_font_registry: None, writer_parley_font_context: None,
+            calc_engine: None, pending_comment_hits: Vec::new(),
+        })
+    }
+
+    fn rep(h: u64, a: u32, b: u32, t: &str) -> String {
+        let ptr = roe_replace_range(h, 0, 0, 0, a, b, t.as_ptr(), t.len() as u32);
+        assert!(!ptr.is_null(), "替换应成功");
+        unsafe { CString::from_raw(ptr) }.into_string().unwrap()
+    }
+
+    fn runs_of(h: u64) -> Vec<(String, Option<RevisionKind>)> {
+        handle::with_entry(h, |e| {
+            let RoeDocument::Writer(doc) = &e.doc else { unreachable!() };
+            let Some(BodyElement::Paragraph(p)) = doc.body.get(0) else { unreachable!() };
+            p.runs.iter().map(|r| (r.text.clone(), r.revision.as_ref().map(|v| v.kind))).collect()
+        }).unwrap()
+    }
+
+    #[test]
+    fn ime_session_resettles_without_fragments() {
+        let h = open_plain("Hello");
+        handle::with_entry(h, |e| { e.writer_options.track_changes = true; e.writer_options.track_author = "me".into(); });
+        let o1 = rep(h, 5, 5, "ni");
+        assert!(o1.contains("\"char_offset\":7"), "{o1}");
+        let o2 = rep(h, 5, 7, "你");
+        assert!(o2.contains("\"char_offset\":8"), "{o2}");
+        let r = runs_of(h);
+        assert_eq!(r.len(), 2, "{r:?}");
+        assert_eq!(r[0], ("Hello".to_string(), None));
+        assert_eq!(r[1], ("你".to_string(), Some(RevisionKind::Insert)));
+        handle::remove(h);
+    }
+
+    #[test]
+    fn replace_plain_selection_marks_delete_then_inserts() {
+        let h = open_plain("ABCD");
+        handle::with_entry(h, |e| { e.writer_options.track_changes = true; e.writer_options.track_author = "me".into(); });
+        rep(h, 1, 3, "X");
+        let r = runs_of(h);
+        let del: String = r.iter().filter(|x| x.1 == Some(RevisionKind::Delete)).map(|x| x.0.as_str()).collect();
+        let ins: String = r.iter().filter(|x| x.1 == Some(RevisionKind::Insert)).map(|x| x.0.as_str()).collect();
+        assert_eq!(del, "BC");
+        assert_eq!(ins, "X");
+        handle::remove(h);
+    }
 }

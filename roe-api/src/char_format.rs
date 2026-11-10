@@ -2036,6 +2036,7 @@ pub extern "C" fn roe_undo_group_end() -> i32 {
 // ───────── v242: 项目符号 / 编号 ─────────
 fn roe_list_style(kind: u32, variant: u32) -> (String, roe_model::writer::ListStyle) {
     use roe_model::writer::{ListStyle, ListLevelStyle, NumberListLevel, BulletListLevel, ListIndent, NumFormat};
+    if kind == 3 { return roe_multi_list_style(variant); }
     let name = if kind == 1 { format!("ROE_Bullet_{variant}") } else { format!("ROE_Number_{variant}") };
     let mut levels = Vec::new();
     for lv in 0..9u32 {
@@ -2056,18 +2057,63 @@ fn roe_list_style(kind: u32, variant: u32) -> (String, roe_model::writer::ListSt
             };
             levels.push(ListLevelStyle::Number(NumberListLevel {
                 format, prefix: String::new(), suffix: suffix.to_string(),
-                start_value: 1, display_levels: 1, indent,
+                start_value: 1, template: None, display_levels: 1, indent,
             }));
         }
     }
-    let ls = ListStyle { name: name.clone(), levels };
+    let ls = ListStyle { name: name.clone(), levels, ..Default::default() };
     (name, ls)
 }
 
-/// 设置段落列表。kind: 0=取消 1=项目符号 2=编号；variant: 1..=6（kind=0 时忽略）
+/// 多级编号预设。variant: 1="1. 1.1. 1.1.1." 2="1) a) i)" 3="I. A. 1. a. i."
+fn roe_multi_list_style(variant: u32) -> (String, roe_model::writer::ListStyle) {
+    use roe_model::writer::{ListStyle, ListLevelStyle, NumberListLevel, BulletListLevel, ListIndent, NumFormat};
+    let name = format!("ROE_Multi_{variant}");
+    let mut levels = Vec::new();
+    for lv in 0..9u32 {
+        let indent = ListIndent { margin_left: 36.0 * (lv as f32 + 1.0), text_indent: -18.0, min_label_width: 18.0 };
+        if variant >= 4 {
+            let chars: [&str; 3] = if variant == 4 { ["●", "○", "■"] } else { ["➤", "◆", "–"] };
+            levels.push(ListLevelStyle::Bullet(BulletListLevel {
+                bullet_char: chars[lv as usize % 3].to_string(), prefix: String::new(), suffix: String::new(), indent,
+            }));
+            continue;
+        }
+        let n = lv as usize + 1;
+        let (format, suffix, template, display) = match variant {
+            1 => {
+                let t: String = (1..=n).map(|i| format!("%{i}.")).collect();
+                let tpl = if n == 1 { None } else { Some(t) };
+                (NumFormat::Arabic, ".", tpl, n as u8)
+            }
+            2 => {
+                let f = match lv % 3 { 0 => NumFormat::Arabic, 1 => NumFormat::LowerAlpha, _ => NumFormat::LowerRoman };
+                (f, ")", None, 1u8)
+            }
+            _ => {
+                let f = match lv % 5 {
+                    0 => NumFormat::UpperRoman,
+                    1 => NumFormat::UpperAlpha,
+                    2 => NumFormat::Arabic,
+                    3 => NumFormat::LowerAlpha,
+                    _ => NumFormat::LowerRoman,
+                };
+                (f, ".", None, 1u8)
+            }
+        };
+        levels.push(ListLevelStyle::Number(NumberListLevel {
+            format, prefix: String::new(), suffix: suffix.to_string(),
+            start_value: 1, template, display_levels: display, indent,
+        }));
+    }
+    let ls = ListStyle { name: name.clone(), levels, ..Default::default() };
+    (name, ls)
+}
+
+/// 设置段落列表。kind: 0=取消 1=项目符号 2=编号 3=多级编号；variant: 1..=6（kind=3 时 1..=3；kind=0 时忽略）
 #[no_mangle]
 pub extern "C" fn roe_set_paragraph_list(handle: u64, local_para_index: u32, kind: u32, variant: u32) -> i32 {
-    if kind > 2 || (kind > 0 && (variant == 0 || variant > 6)) {
+    if kind > 3 || (kind > 0 && (variant == 0 || variant > 6)) || (kind == 3 && variant > 5) {
         set_last_error("roe_set_paragraph_list: 参数非法");
         return RoeErrorCode::ScriptError as i32;
     }
@@ -2235,5 +2281,71 @@ pub extern "C" fn roe_change_list_level(handle: u64, local_para_index: u32, delt
         Some(Ok(())) => RoeErrorCode::Ok as i32,
         Some(Err(m)) => { set_last_error(format!("roe_change_list_level: {m}")); RoeErrorCode::ScriptError as i32 }
         None => { set_last_error("roe_change_list_level: 无效句柄"); RoeErrorCode::InvalidHandle as i32 }
+    }
+}
+
+
+#[cfg(test)]
+mod multi_list_style_tests {
+    use super::*;
+    use roe_model::writer::ListLevelStyle;
+
+    fn tpl_of(ls: &roe_model::writer::ListStyle, lv: usize) -> Option<String> {
+        match &ls.levels[lv] {
+            ListLevelStyle::Number(n) => n.template.clone(),
+            _ => panic!("not number"),
+        }
+    }
+
+    #[test]
+    fn multi_variant1_templates() {
+        let (name, ls) = roe_list_style(3, 1);
+        assert_eq!(name, "ROE_Multi_1");
+        assert_eq!(ls.levels.len(), 9);
+        assert_eq!(tpl_of(&ls, 0), None);
+        assert_eq!(tpl_of(&ls, 1), Some("%1.%2.".to_string()));
+        assert_eq!(tpl_of(&ls, 2), Some("%1.%2.%3.".to_string()));
+        assert_eq!(tpl_of(&ls, 8), Some("%1.%2.%3.%4.%5.%6.%7.%8.%9.".to_string()));
+    }
+
+    #[test]
+    fn multi_variant2_3_cycle_and_no_template() {
+        let (n2, ls2) = roe_list_style(3, 2);
+        assert_eq!(n2, "ROE_Multi_2");
+        assert_eq!(tpl_of(&ls2, 1), None);
+        let (n3, ls3) = roe_list_style(3, 3);
+        assert_eq!(n3, "ROE_Multi_3");
+        assert_eq!(ls3.levels.len(), 9);
+    }
+
+    #[test]
+    fn multi_rejects_bad_variant() {
+        assert_ne!(roe_set_paragraph_list(0, 0, 3, 6), 0);
+        assert_ne!(roe_set_paragraph_list(0, 0, 3, 0), 0);
+        assert_ne!(roe_set_paragraph_list(0, 0, 4, 1), 0);
+    }
+}
+
+
+#[cfg(test)]
+mod multi_bullet_tests {
+    use super::*;
+    use roe_model::writer::ListLevelStyle;
+
+    #[test]
+    fn multi_bullet_variants_cycle() {
+        let (n, ls) = roe_list_style(3, 4);
+        assert_eq!(n, "ROE_Multi_4");
+        assert_eq!(ls.levels.len(), 9);
+        let ch = |lv: usize| match &ls.levels[lv] {
+            ListLevelStyle::Bullet(b) => b.bullet_char.clone(),
+            _ => panic!("not bullet"),
+        };
+        assert_eq!(ch(0), "●");
+        assert_eq!(ch(1), "○");
+        assert_eq!(ch(2), "■");
+        assert_eq!(ch(3), "●");
+        let (n5, _) = roe_list_style(3, 5);
+        assert_eq!(n5, "ROE_Multi_5");
     }
 }

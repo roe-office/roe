@@ -826,6 +826,11 @@ pub struct AutoFilter {
     // 筛选下拉按钮（如autofilterShowButton样本专门测试这个属性）。
     // 存col_offset集合，渲染时跳过这些列的按钮绘制。
     pub hidden_buttons: std::collections::HashSet<u32>,
+    /// v316 ROOT-082: 含非值列表筛选（dateGroupItem/colorFilter/customFilters/
+    /// top10/dynamicFilter）的列（col_offset）。渲染端据此画"已筛选"漏斗。
+    /// 不放进 col_filters，避免污染"允许值列表"语义。
+    #[serde(default)]
+    pub other_filtered_cols: std::collections::HashSet<u32>,
 }
 
 /// xlsx表格(Table/ListObject，如 `<table displayName="MyTable1" ref="A1:C5">`)元数据。
@@ -929,6 +934,8 @@ pub enum PivotLayoutMode {
     Outline,
     /// 表格模式：父节点与其第一个子节点共享同一行/列（视觉居中于子节点跨度）
     Tabular,
+    /// 紧凑模式：所有行字段挤在第 0 列,子级靠缩进区分(数据区从第 1 列起)
+    Compact,
 }
 
 
@@ -978,12 +985,18 @@ impl PivotHeaderNode {
     /// 递归计算 outline_span：叶节点=1，非叶节点=1（自身标题行）+ 子节点
     /// outline_span 之和（大纲模式 Outline 用：父节点独占一行/列，
     /// 子节点各自另起一行/列排在其下方/右方，不与父节点共享空间）
-    pub fn compute_outline_spans(&mut self) {
+    pub fn compute_outline_spans(&mut self, inline_subtotal: bool) {
+        // 大纲/紧凑:inline_subtotal=true(小计在上)时小计并入上级标签行,不占独立行;
+        // false(小计在下)时小计按普通节点计,占组末一行。表格形式走 cached_span,不受影响
+        if self.is_subtotal && inline_subtotal {
+            self.outline_span = 0;
+            return;
+        }
         if self.children.is_empty() {
             self.outline_span = 1;
         } else {
             for child in &mut self.children {
-                child.compute_outline_spans();
+                child.compute_outline_spans(inline_subtotal);
             }
             self.outline_span = 1 + self.children.iter().map(|c| c.outline_span).sum::<u32>();
         }
@@ -1051,6 +1064,15 @@ pub struct PivotMeta {
     /// pivot_sheet_into_workbook_v2（用户手动配置透视表路径）不涉及此概念，
     /// 构造PivotMeta时使用默认值false，不受影响。
     pub data_on_rows: bool,
+    /// 隐藏分类小计（默认 false = 显示，保持现有行为；反向命名是为了让
+    /// 未显式赋值的旧构造点与 Default 保持“显示”）
+    pub hide_row_subtotals: bool,
+    /// 隐藏列方向分类小计（默认 false = 显示）
+    pub hide_col_subtotals: bool,
+    /// 大纲/紧凑形式下小计显示在组底(默认 false = 小计在上,并入上级标签行,保持现行为)。
+    /// 反向命名是为了让旧构造点与 Default 保持现行为。表格形式恒在组末,不受此开关影响。
+    #[serde(default)]
+    pub subtotals_bottom: bool,
     /// 数据区聚合结果表（现场计算，不依赖xlsx静态快照）
     /// key: (行叶子完整路径, 列叶子完整路径, 第几个值字段) -> 聚合值
     /// 小计/总计节点的路径中，对应层级用空字符串占位（约定，后续实现聚合函数时统一遵守）
@@ -1114,8 +1136,9 @@ impl PivotMeta {
             self.col_tree.compute_spans(n_values);
             self.row_tree.compute_spans(1);
         }
-        self.col_tree.compute_outline_spans();
-        self.row_tree.compute_outline_spans();
+        let inline_subtotal = !self.subtotals_bottom;
+        self.col_tree.compute_outline_spans(inline_subtotal);
+        self.row_tree.compute_outline_spans(inline_subtotal);
     }
 
     /// 列表头物理行数

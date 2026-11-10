@@ -85,3 +85,6 @@ pub mod tool;
 pub mod prompt;
 pub mod log_hook;
 pub mod saved_path;
+pub mod mcp_adapter;
+pub mod mcp_core;
+pub mod mcp_en;

@@ -16,6 +16,7 @@ fn bench_char_offset_to_x(c: &mut Criterion) {
                 black_box(char_offset_to_x(
                     &mut reg,
                     black_box(text),
+                    &[],
                     font_size,
                     false,
                     false,
@@ -39,6 +40,7 @@ fn bench_x_to_char_offset(c: &mut Criterion) {
                 black_box(x_to_char_offset(
                     &mut reg,
                     black_box(text),
+                    &[],
                     font_size,
                     false,
                     false,

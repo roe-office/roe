@@ -422,7 +422,20 @@ impl<'a> TableResolver for SheetResolver<'a> {
         let (sheet, table) = find_table_by_name(self.workbook, &tref.name)
             .ok_or_else(|| ExcelError::new(ExcelErrorKind::Name)
                 .with_message(format!("Table not found: {}", tref.name)))?;
-        Ok(Box::new(RoeTableView::build(self, sheet, table)))
+        // v318: 只有 #Totals / #All / 无限定符 / Row / Combination 才需要汇总行。
+        // 列引用(Table1[Age])、#Data、#Headers 不读汇总行,否则汇总行里的
+        // SUBTOTAL(109,Table1[Age]) 会把自己记成依赖,被误判循环引用。
+        use formualizer_parse::parser::{SpecialItem, TableSpecifier};
+        let include_totals = !matches!(
+            &tref.specifier,
+            Some(TableSpecifier::Column(_))
+                | Some(TableSpecifier::ColumnRange(_, _))
+                | Some(TableSpecifier::Headers)
+                | Some(TableSpecifier::SpecialItem(SpecialItem::Headers))
+                | Some(TableSpecifier::Data)
+                | Some(TableSpecifier::SpecialItem(SpecialItem::Data))
+        );
+        Ok(Box::new(RoeTableView::build_with(self, sheet, table, include_totals)))
     }
 }
 
@@ -465,12 +478,25 @@ struct RoeTableView {
 
 impl RoeTableView {
     fn build(resolver: &SheetResolver<'_>, sheet: &Sheet, table: &roe_model::calc::Table) -> Self {
+        Self::build_with(resolver, sheet, table, true)
+    }
+
+    fn build_with(
+        resolver: &SheetResolver<'_>,
+        sheet: &Sheet,
+        table: &roe_model::calc::Table,
+        include_totals: bool,
+    ) -> Self {
         let (sr, sc) = table.range.start;
         let (er, ec) = table.range.end;
         let mut all_rows = Vec::with_capacity((er.saturating_sub(sr) + 1) as usize);
         for r in sr..=er {
             let mut row_vec = Vec::with_capacity((ec.saturating_sub(sc) + 1) as usize);
             for c in sc..=ec {
+                if !include_totals && table.has_totals && r == er {
+                    row_vec.push(LiteralValue::Empty);
+                    continue;
+                }
                 let v = sheet.cells.get(r, c);
                 resolver
                     .access_log
@@ -1617,7 +1643,9 @@ impl Function for RoeSubtotalFn {
             }
         };
 
-        if function_num != 9 && function_num != 1 {
+        // v318: 101~111 与 1~11 同义(对齐 LOK ScSubTotal);隐藏/筛选行暂不处理
+        let function_num = if (101..=111).contains(&function_num) { function_num - 100 } else { function_num };
+        if !(1..=11).contains(&function_num) {
             // 未支持的 function_num：明确返回 #VALUE!，不要静默当成 SUM，
             // 避免调用方以为聚合口径是对的但实际算错。
             return Ok(formualizer_eval::traits::CalcValue::Scalar(
@@ -1627,6 +1655,8 @@ impl Function for RoeSubtotalFn {
 
         let mut sum = 0.0f64;
         let mut count: u64 = 0;
+        let mut nums: Vec<f64> = Vec::new();
+        let mut counta: u64 = 0;
 
         // 剩余参数（第2个开始）：每个都应是 range，遍历其中每个 cell，
         // 跳过公式原文含嵌套 ROE_SUBTOTAL( 调用的 cell。
@@ -1645,10 +1675,12 @@ impl Function for RoeSubtotalFn {
                         }
                         LiteralValue::Number(n) => {
                             sum += n;
+                            nums.push(n);
                             count += 1;
                         }
                         LiteralValue::Int(n) => {
                             sum += n as f64;
+                            nums.push(n as f64);
                             count += 1;
                         }
                         _ => {}
@@ -1712,10 +1744,12 @@ impl Function for RoeSubtotalFn {
                     match v {
                         LiteralValue::Number(n) => {
                             sum += n;
+                            nums.push(n);
                             count += 1;
                         }
                         LiteralValue::Int(n) => {
                             sum += n as f64;
+                            nums.push(n as f64);
                             count += 1;
                         }
                         LiteralValue::Error(e) => {
@@ -1724,6 +1758,7 @@ impl Function for RoeSubtotalFn {
                             ));
                         }
                         _ => {
+                            if !matches!(v, LiteralValue::Empty) { counta += 1; }
                             // 空单元格/文本/布尔：忽略，对齐 SUM/AVERAGE
                             // 对 range 内非数值单元格的既有行为。
                         }
@@ -1732,16 +1767,42 @@ impl Function for RoeSubtotalFn {
             }
         }
 
-        let result = if function_num == 9 {
-            sum
-        } else {
-            // function_num == 1: AVERAGE
-            if count == 0 {
+        let div0 = LiteralValue::Error(ExcelError::new(ExcelErrorKind::Div));
+        let n = nums.len();
+        let mean = if n > 0 { sum / n as f64 } else { 0.0 };
+        let ss: f64 = nums.iter().map(|x| (x - mean) * (x - mean)).sum();
+        let result = match function_num {
+            1 => {
+                if count == 0 {
+                    return Ok(formualizer_eval::traits::CalcValue::Scalar(div0));
+                }
+                sum / (count as f64)
+            }
+            2 => count as f64,
+            3 => (count + counta) as f64,
+            4 => if n == 0 { 0.0 } else { nums.iter().cloned().fold(f64::NEG_INFINITY, f64::max) },
+            5 => if n == 0 { 0.0 } else { nums.iter().cloned().fold(f64::INFINITY, f64::min) },
+            6 => if n == 0 { 0.0 } else { nums.iter().product::<f64>() },
+            7 | 10 => {
+                if n < 2 {
+                    return Ok(formualizer_eval::traits::CalcValue::Scalar(div0));
+                }
+                let var = ss / ((n - 1) as f64);
+                if function_num == 7 { var.sqrt() } else { var }
+            }
+            8 | 11 => {
+                if n < 1 {
+                    return Ok(formualizer_eval::traits::CalcValue::Scalar(div0));
+                }
+                let var = ss / (n as f64);
+                if function_num == 8 { var.sqrt() } else { var }
+            }
+            9 => sum,
+            _ => {
                 return Ok(formualizer_eval::traits::CalcValue::Scalar(
-                    LiteralValue::Error(ExcelError::new(ExcelErrorKind::Div)),
+                    LiteralValue::Error(ExcelError::new(ExcelErrorKind::Value)),
                 ));
             }
-            sum / (count as f64)
         };
 
         Ok(formualizer_eval::traits::CalcValue::Scalar(
@@ -1808,6 +1869,106 @@ mod tests {
         );
     }
 
+
+    // v318: SUBTOTAL 功能号 1~11 / 101~111 回归测试
+    fn v318_eval(f: &str) -> CellValue {
+        let sheet1 = sheet_with_column_a(
+            "Sheet1",
+            vec![
+                CellValue::Number(10.0),
+                CellValue::Number(20.0),
+                CellValue::Number(30.0),
+            ],
+        );
+        let workbook = Workbook {
+            sheets: vec![sheet1],
+            named_ranges: Default::default(),
+            named_formulas: Default::default(),
+            styles: Default::default(),
+            formula_dialect_source: Default::default(),
+        };
+        eval_formula(&workbook, "Sheet1", f)
+    }
+
+    fn v318_num(f: &str) -> f64 {
+        match v318_eval(f) {
+            CellValue::Number(n) => n,
+            other => panic!("{f}: 期望数值,得到 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn v318_subtotal_function_numbers() {
+        assert_eq!(v318_num("SUBTOTAL(109,A1:A3)"), 60.0);
+        assert_eq!(v318_num("SUBTOTAL(101,A1:A3)"), 20.0);
+        assert_eq!(v318_num("SUBTOTAL(2,A1:A3)"), 3.0);
+        assert_eq!(v318_num("SUBTOTAL(3,A1:A3)"), 3.0);
+        assert_eq!(v318_num("SUBTOTAL(4,A1:A3)"), 30.0);
+        assert_eq!(v318_num("SUBTOTAL(5,A1:A3)"), 10.0);
+        assert_eq!(v318_num("SUBTOTAL(6,A1:A3)"), 6000.0);
+        assert_eq!(v318_num("SUBTOTAL(7,A1:A3)"), 10.0);
+        assert_eq!(v318_num("SUBTOTAL(10,A1:A3)"), 100.0);
+        assert!((v318_num("SUBTOTAL(8,A1:A3)") - (200.0f64 / 3.0).sqrt()).abs() < 1e-9);
+        assert!((v318_num("SUBTOTAL(11,A1:A3)") - 200.0 / 3.0).abs() < 1e-9);
+    }
+
+    /// v318: 汇总行里的 SUBTOTAL(109,Table1[Age]) 不应把自己记成依赖(否则误判循环引用)
+    #[test]
+    fn v318_table_column_ref_in_totals_row_no_self_dep() {
+        let mut sheet1 = sheet_with_column_a(
+            "Sheet1",
+            vec![
+                CellValue::Text("Age".into()),
+                CellValue::Number(10.0),
+                CellValue::Number(20.0),
+                CellValue::Number(30.0),
+                CellValue::Formula {
+                    source: "=SUBTOTAL(109,Table1[Age])".to_string(),
+                    cached: Box::new(CellValue::Number(0.0)),
+                },
+            ],
+        );
+        sheet1.tables.push(roe_model::calc::Table {
+            name: "Table1".to_string(),
+            range: roe_model::calc::CellRange {
+                sheet: "Sheet1".to_string(),
+                start: (0, 0),
+                end: (4, 0),
+            },
+            has_header: true,
+            has_totals: true,
+            columns: vec!["Age".to_string()],
+            auto_filter: None,
+            style_name: None,
+            show_first_column: false,
+            show_last_column: false,
+            show_row_stripes: true,
+            show_column_stripes: false,
+            theme_palette: vec![],
+        });
+        let workbook = Workbook {
+            sheets: vec![sheet1],
+            named_ranges: Default::default(),
+            named_formulas: Default::default(),
+            styles: Default::default(),
+            formula_dialect_source: Default::default(),
+        };
+        let (v, deps) = eval_formula_with_deps(&workbook, "Sheet1", "SUBTOTAL(109,Table1[Age])");
+        match v {
+            CellValue::Number(n) => assert_eq!(n, 60.0),
+            other => panic!("期望 60,得到 {other:?}"),
+        }
+        assert!(
+            !deps.iter().any(|(sh, r, c)| sh == "Sheet1" && *r == 4 && *c == 0),
+            "依赖里不应包含汇总行自身 A5: {deps:?}"
+        );
+    }
+
+    #[test]
+    fn v318_subtotal_unsupported_number_is_value_error() {
+        assert!(matches!(v318_eval("SUBTOTAL(12,A1:A3)"), CellValue::Error(CellError::Value)));
+        assert!(matches!(v318_eval("SUBTOTAL(0,A1:A3)"), CellValue::Error(CellError::Value)));
+    }
 
     // ============================================================
     // ROE_SUBTOTAL Step 2 单元测试
@@ -1946,7 +2107,7 @@ mod tests {
         }
     }
 
-    /// 未支持的 function_num（如2=COUNT）应明确返回 #VALUE!，不能静默按SUM处理。
+    /// 未支持的 function_num（v318 起 1~11/101~111 均支持，这里用 12）应明确返回 #VALUE!，不能静默按SUM处理。
     #[test]
     fn roe_subtotal_unsupported_function_num_is_value_error() {
         let sheet1 = sheet_with_column_a(
@@ -1960,7 +2121,7 @@ mod tests {
             styles: Default::default(),
             formula_dialect_source: Default::default(),
         };
-        let result = eval_formula(&workbook, "Sheet1", "SUBTOTAL(2,A1:A2)");
+        let result = eval_formula(&workbook, "Sheet1", "SUBTOTAL(12,A1:A2)");
         match result {
             CellValue::Error(CellError::Value) => {}
             other => panic!("expected Error(Value), got {:?}", other),

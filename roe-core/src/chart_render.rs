@@ -32,12 +32,12 @@ const MULTI_RING_HOLE_MAX: f32 = 0.8;
 // ROE-FIX(unified-fonts): 普通图字号与统计图同口径(标题16不加粗,图例/刻度11)
 macro_rules! apply_unified_fonts {
     ($c:expr) => {
-        $c.title_font_size = 16.0;
-        $c.title_font_weight = None;
-        $c.legend_font_size = 11.0;
-        $c.x_axis_font_size = 11.0;
+        $c.title.font.size = 16.0;
+        $c.title.font.weight = None;
+        $c.legend.font.size = 11.0;
+        $c.x_axis.font.size = 11.0;
         for cfg in $c.y_axis_configs.iter_mut() {
-            cfg.axis_font_size = 11.0;
+            cfg.font.size = 11.0;
         }
     };
 }
@@ -46,6 +46,40 @@ fn slice_border_color(model: &ChartModel) -> Option<charts_rs::Color> {
     model
         .slice_border_color
         .map(|c| charts_rs::Color { r: c.r, g: c.g, b: c.b, a: c.a })
+}
+
+/// 左/右竖排图例垂直居中:charts-rs 竖排图例从标题下沿起排,这里用 legend.margin.top 下移。
+/// 基准为实测(SVG)的图例首项色块 y:有标题 45;无标题 10(实测,即图上边距)。每项间距 19,色块高 10。
+const LEGEND_TOP_WITH_TITLE: f32 = 45.0;
+const LEGEND_TOP_NO_TITLE: f32 = 10.0;
+fn legend_vcenter_margin(model: &ChartModel, h: f32) -> Option<charts_rs::Box> {
+    use roe_model::impress::LegendPos as L;
+    if !model.show_legend || !matches!(model.legend_pos, Some(L::Left) | Some(L::Right)) {
+        return None;
+    }
+    let n = if matches!(model.kind, ChartKind::Pie | ChartKind::Doughnut) {
+        model.x_labels.len()
+    } else {
+        model.series.len()
+    };
+    if n == 0 { return None; }
+    let vis = (n as f32 - 1.0) * 19.0 + 10.0;
+    let has_title = model.title.as_deref().map_or(false, |t| !t.is_empty());
+    let base = if has_title { LEGEND_TOP_WITH_TITLE } else { LEGEND_TOP_NO_TITLE };
+    let top = ((h - vis) / 2.0 - base).max(0.0);
+    Some(charts_rs::Box { top, ..Default::default() })
+}
+
+/// ChartModel.legend_pos -> charts-rs legend.position。
+/// None 保持不设(顶部默认);注意 Position::default() 是 Left,不能用 unwrap_or_default。
+fn legend_position(p: Option<roe_model::impress::LegendPos>) -> Option<charts_rs::Position> {
+    use roe_model::impress::LegendPos as L;
+    p.map(|v| match v {
+        L::Top => charts_rs::Position::Top,
+        L::Bottom => charts_rs::Position::Bottom,
+        L::Left => charts_rs::Position::Left,
+        L::Right => charts_rs::Position::Right,
+    })
 }
 
 /// ChartModel → SVG 字符串。width/height 为目标像素尺寸。
@@ -113,13 +147,7 @@ pub fn chart_model_to_svg(model: &ChartModel, width: u32, height: u32) -> Option
             let mut ser = Series::new(s.name.clone(), data);
             // 数据标签：百分比堆积的数据已被归一化，显示的不是原值，故不开
             ser.label_show = model.data_labels.show_val && !percent;
-            // 线性趋势线（折线/面积图；柱形图库里不支持）
-            if s.trendline && matches!(model.kind, ChartKind::Line | ChartKind::Area) {
-                ser.mark_lines = vec![charts_rs::MarkLine {
-                    category: charts_rs::MarkLineCategory::Trend,
-                    label_show: false,
-                }];
-            }
+            // 趋势线：charts-rs 2.3 无等价实现，不画（模型 trendline 字段保留）
             // 组合图：柱形图里属于 lineChart 的系列按折线画，且不参与堆积
             let combo_line = s.as_line && matches!(model.kind, ChartKind::Bar);
             if combo_line {
@@ -138,10 +166,17 @@ pub fn chart_model_to_svg(model: &ChartModel, width: u32, height: u32) -> Option
             // 文档里 X 为文字或缺失时，X 取 1 起的序号（与 Word/WPS 一致）
             if matches!(model.kind, ChartKind::Scatter) {
                 let ys = std::mem::take(&mut ser.data);
+                let bubble_mode = model.series.iter().all(|t| t.sizes.as_ref().map_or(false, |z| z.len() >= t.data.len()));
                 ser.data = ys
                     .into_iter()
                     .enumerate()
-                    .flat_map(|(i, y)| [Some((i + 1) as f32), y])
+                    .flat_map(|(i, y)| {
+                        let x = s.x_values.as_ref().and_then(|xs| xs.get(i)).map(|&v| v as f32).unwrap_or((i + 1) as f32);
+                        match s.sizes.as_ref().and_then(|z| z.get(i)) {
+                            Some(&z) if bubble_mode => vec![Some(x), y, Some(z as f32)],
+                            _ => vec![Some(x), y],
+                        }
+                    })
                     .collect();
             }
             ser
@@ -172,16 +207,17 @@ pub fn chart_model_to_svg(model: &ChartModel, width: u32, height: u32) -> Option
     macro_rules! apply_common {
         ($c:expr) => {
             if let Some(t) = &model.title {
-                $c.title_text = t.clone();
+                $c.title.text = t.clone();
             }
             $c.width = w;
             $c.height = h;
-            $c.legend_show = Some(model.show_legend);
-            $c.stack_title_legend = true;
-            $c.legend_category = charts_rs::LegendCategory::RoundRect;
+            $c.legend.show = Some(model.show_legend);
+            $c.legend.category = charts_rs::LegendCategory::Square;
+            $c.legend.position = legend_position(model.legend_pos);
+            $c.legend.margin = legend_vcenter_margin(model, h);
             apply_unified_fonts!($c);
-            $c.grid_stroke_width = grid_width;
-            $c.series_colors = series_colors.clone();
+            $c.grid.stroke_width = grid_width;
+            $c.series.colors = series_colors.clone();
         };
     }
 
@@ -191,16 +227,16 @@ pub fn chart_model_to_svg(model: &ChartModel, width: u32, height: u32) -> Option
         ($c:expr) => {
             if percent {
                 if let Some(cfg) = $c.y_axis_configs.first_mut() {
-                    cfg.axis_min = Some(0.0);
-                    cfg.axis_max = Some(100.0);
-                    cfg.axis_split_number = 10;
-                    cfg.axis_formatter = Some("{c}%".to_string());
+                    cfg.min = Some(0.0);
+                    cfg.max = Some(100.0);
+                    cfg.split_number = 10;
+                    cfg.formatter = Some("{c}%".to_string());
                 }
             } else if let Some((mx, n)) = model_data_max(model, stacked).and_then(nice_axis) {
                 if let Some(cfg) = $c.y_axis_configs.first_mut() {
-                    cfg.axis_min = Some(0.0);
-                    cfg.axis_max = Some(mx);
-                    cfg.axis_split_number = n;
+                    cfg.min = Some(0.0);
+                    cfg.max = Some(mx);
+                    cfg.split_number = n;
                 }
             }
         };
@@ -208,8 +244,10 @@ pub fn chart_model_to_svg(model: &ChartModel, width: u32, height: u32) -> Option
 
     macro_rules! apply_axis_titles {
         ($c:expr) => {
-            $c.x_axis_title_text = model.x_axis_label.clone();
-            $c.y_axis_title_text = model.y_axis_label.clone();
+            $c.x_axis.title = model.x_axis_label.clone();
+            if let Some(cfg) = $c.y_axis_configs.first_mut() {
+                cfg.title = Some(model.y_axis_label.clone()).filter(|t| !t.is_empty());
+            }
         };
     }
 
@@ -219,8 +257,9 @@ pub fn chart_model_to_svg(model: &ChartModel, width: u32, height: u32) -> Option
             apply_common!(c);
             apply_axis_titles!(c);
             // Word dLblPos=ctr：标签居中于柱段（堆积图默认如此）
-            c.label_center = model.data_labels.position
-                == roe_model::impress::DataLabelPos::Center;
+            if model.data_labels.position == roe_model::impress::DataLabelPos::Center {
+                c.series_label_position = Some(charts_rs::Position::Inside);
+            }
             // Word/PPTX 的 gapWidth 以【单根柱宽】为基准，charts-rs 的 bar_chart_margin_pct
             // 以【簇宽】为基准，需换算：pct = gapWidth / (n + (n-1)*s)，
             // 其中 n 为簇内柱数，s 为柱间距占柱宽的比例（overlap 为负时 = -overlap/100）。
@@ -235,17 +274,17 @@ pub fn chart_model_to_svg(model: &ChartModel, width: u32, height: u32) -> Option
                 model.overlap_pct.map(|o| (-o).max(0.0) / 100.0).unwrap_or(0.0)
             };
             // 组合图文档未写 gapWidth 时，Word 默认 150
-            c.bar_chart_margin_pct = model
+            c.bar_margin_pct = model
                 .gap_width_pct
                 .or(Some(150.0))
                 .map(|g| g / (n + (n - 1.0) * s));
             // 组合图折线加粗（该字段只影响折线，柱形不用）
             if combo {
-                c.series_stroke_width = 3.5;
-                c.series_symbol = None;
+                c.series.stroke_width = 3.5;
+                c.series.symbol = None;
             }
             // overlap 为负 => 簇内柱间有空隙，对应 charts-rs 的 bar_chart_gap_pct（占柱宽百分比）
-            c.bar_chart_gap_pct = if stacked {
+            c.bar_gap_pct = if stacked {
                 None
             } else {
                 model.overlap_pct.filter(|o| *o < 0.0).map(|o| -o)
@@ -261,7 +300,7 @@ pub fn chart_model_to_svg(model: &ChartModel, width: u32, height: u32) -> Option
             if let Some(gw) = Some(model.gap_width_pct.unwrap_or(150.0)) {
                 let g = gw / 100.0;
                 let n = if stacked { 1.0 } else { model.series.len().max(1) as f32 };
-                c.bar_chart_margin_pct = Some(g / (n + g));
+                c.bar_margin_pct = Some(g / (n + g));
             }
             apply_percent_axis!(c);
             c.svg().ok()?
@@ -270,9 +309,8 @@ pub fn chart_model_to_svg(model: &ChartModel, width: u32, height: u32) -> Option
             let mut c = LineChart::new(series, model.x_labels.clone());
             apply_common!(c);
             apply_axis_titles!(c);
-            c.trend_follow_series_color = true;
-            c.series_stroke_width = 3.5;
-            c.series_symbol = None;
+            c.series.stroke_width = 3.5;
+            c.series.symbol = None;
             apply_percent_axis!(c);
             c.svg().ok()?
         }
@@ -280,11 +318,9 @@ pub fn chart_model_to_svg(model: &ChartModel, width: u32, height: u32) -> Option
             let mut c = LineChart::new(series, model.x_labels.clone());
             apply_common!(c);
             apply_axis_titles!(c);
-            c.series_fill = true;
-            c.trend_follow_series_color = true;
-            c.series_symbol = None;
-            c.x_boundary_gap = Some(false);
-            c.edge_label_align = true; // ROE-PATCH(edge-label)
+            c.series.fill = true;
+            c.series.symbol = None;
+            c.x_axis.boundary_gap = Some(false);
             apply_percent_axis!(c);
             c.svg().ok()?
         }
@@ -314,7 +350,7 @@ pub fn chart_model_to_svg(model: &ChartModel, width: u32, height: u32) -> Option
         ChartKind::Scatter => {
             let mut c = ScatterChart::new(series);
             apply_common!(c);
-            c.x_axis_config.axis_font_size = 11.0;
+            c.x_axis_config.font.size = 11.0;
             apply_axis_titles!(c);
             c.series_symbols = model
                 .series
@@ -323,13 +359,80 @@ pub fn chart_model_to_svg(model: &ChartModel, width: u32, height: u32) -> Option
                 .collect();
             // ROE-FIX(scatter-xmax): X 轴范围 0~点数+1,整数刻度,与 Word/WPS 一致
             let scatter_pts = model.series.iter().map(|s| s.data.len()).max().unwrap_or(0);
-            if scatter_pts > 0 {
-                c.x_axis_config.axis_min = Some(0.0);
-                c.x_axis_config.axis_max = Some((scatter_pts + 1) as f32);
-                c.x_axis_config.axis_split_number = scatter_pts + 1;
+            let scatter_real_x: Option<(f32, f32, usize)> = {
+                let xs: Vec<f32> = model.series.iter().filter_map(|s| s.x_values.as_ref()).flatten().map(|&v| v as f32).collect();
+                if xs.is_empty() { None } else {
+                    let minx = xs.iter().cloned().fold(f32::INFINITY, f32::min);
+                    let maxx = xs.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                    let span = (maxx - minx).max(maxx.abs().max(1.0) * 0.1);
+                    let raw = span / 6.0;
+                    let mag = 10f32.powf(raw.log10().floor());
+                    let norm = raw / mag;
+                    let step = mag * if norm <= 1.0 { 1.0 } else if norm <= 2.0 { 2.0 } else if norm <= 5.0 { 5.0 } else { 10.0 };
+                    let lo = if minx >= 0.0 && minx <= span { 0.0 } else { (minx / step).floor() * step };
+                    let mut hi = (maxx / step).ceil() * step;
+                    if hi <= lo { hi = lo + step; }
+                    Some((lo, hi, (((hi - lo) / step).round() as usize).max(1)))
+                }
+            };
+            if !model.series.is_empty() && model.series.iter().all(|t| t.sizes.as_ref().map_or(false, |z| z.len() >= t.data.len())) {
+                c.bubble = true;
+                let all_sz: Vec<f64> = model.series.iter().filter_map(|t| t.sizes.as_ref()).flatten().copied().filter(|v| *v > 0.0).collect();
+                if let (Some(mx), Some(mn)) = (
+                    all_sz.iter().cloned().fold(None, |a: Option<f64>, v| Some(a.map_or(v, |x| x.max(v)))),
+                    all_sz.iter().cloned().fold(None, |a: Option<f64>, v| Some(a.map_or(v, |x| x.min(v)))),
+                ) {
+                    let max_r = (h * 0.065).clamp(10.0, 36.0);
+                    let min_r = (max_r * ((mn / mx).sqrt() as f32)).max(3.0);
+                    c.bubble_max_size = max_r;
+                    c.bubble_min_size = min_r.min(max_r);
+                }
+            }
+            if let Some((lo, hi, n)) = scatter_real_x {
+                c.x_axis_config.min = Some(lo);
+                c.x_axis_config.max = Some(hi);
+                c.x_axis_config.split_number = n;
+            } else if scatter_pts > 0 {
+                c.x_axis_config.min = Some(0.0);
+                c.x_axis_config.max = Some((scatter_pts + 1) as f32);
+                c.x_axis_config.split_number = scatter_pts + 1;
             }
             apply_percent_axis!(c);
             c.svg().ok()?
+        }
+        ChartKind::Stock => {
+            if model.series.len() == 4 {
+                // OOXML 顺序 开/高/低/收 -> charts-rs 每日 [开, 收, 低, 高]
+                let days = model.series.iter().map(|s| s.data.len()).min().unwrap_or(0);
+                let mut flat: Vec<f32> = Vec::with_capacity(days * 4);
+                for i in 0..days {
+                    let (o, hi, lo, cl) = (
+                        model.series[0].data[i],
+                        model.series[1].data[i],
+                        model.series[2].data[i],
+                        model.series[3].data[i],
+                    );
+                    flat.extend([o as f32, cl as f32, lo as f32, hi as f32]);
+                }
+                let mut c = charts_rs::CandlestickChart::new(
+                    vec![Series::new(String::new(), flat)],
+                    model.x_labels.clone(),
+                );
+                apply_common!(c);
+                c.legend.show = Some(false);
+                c.x_axis.title = model.x_axis_label.clone();
+                c.candlestick_up_color = charts_rs::Color { r: 0xA9, g: 0xC4, b: 0xEB, a: 255 };
+                c.candlestick_up_border_color = charts_rs::Color { r: 0x44, g: 0x72, b: 0xC4, a: 255 };
+                c.candlestick_down_color = charts_rs::Color { r: 0x44, g: 0x72, b: 0xC4, a: 255 };
+                c.candlestick_down_border_color = charts_rs::Color { r: 0x44, g: 0x72, b: 0xC4, a: 255 };
+                c.svg().ok()?
+            } else {
+                // 非 OHLC 四系列(HLC/VOHLC 等)暂降级为折线
+                let mut c = LineChart::new(series, model.x_labels.clone());
+                apply_common!(c);
+                apply_axis_titles!(c);
+                c.svg().ok()?
+            }
         }
         ChartKind::Radar => {
             let radar_data_max = model
@@ -343,7 +446,7 @@ pub fn chart_model_to_svg(model: &ChartModel, width: u32, height: u32) -> Option
                 model
                     .x_labels
                     .iter()
-                    .map(|s| charts_rs::RadarIndicator { name: s.clone(), max: radar_max })
+                    .map(|s| charts_rs::RadarIndicator { name: s.clone(), min: 0.0, max: radar_max })
                     .collect(),
             );
             apply_common!(c);
@@ -414,8 +517,19 @@ fn chart_model_doughnut_rings_to_svg(model: &ChartModel, width: u32, height: u32
             })
             .collect()
     };
-    let mut rings: Vec<Vec<Series>> = model.series.iter().map(|s| make_ring(&s.data)).collect();
-    let first = rings.remove(0);
+    let ring_count = model.series.len();
+    let all_slices: Vec<Series> = model
+        .series
+        .iter()
+        .enumerate()
+        .flat_map(|(k, s)| {
+            let mut ring = make_ring(&s.data);
+            for it in ring.iter_mut() {
+                it.ring = k;
+            }
+            ring
+        })
+        .collect();
 
     let series_colors: Vec<charts_rs::Color> = (0..slice_count)
         .map(|i| {
@@ -426,17 +540,20 @@ fn chart_model_doughnut_rings_to_svg(model: &ChartModel, width: u32, height: u32
     let w = width as f32;
     let h = height as f32;
 
-    let mut c = PieChart::new(first);
+    let mut c = PieChart::new(all_slices);
     if let Some(t) = &model.title {
-        c.title_text = t.clone();
+        c.title.text = t.clone();
     }
     c.width = w;
     c.height = h;
-    c.legend_show = Some(model.show_legend);
-    c.stack_title_legend = true;
-    c.legend_category = charts_rs::LegendCategory::RoundRect;
+    c.legend.show = Some(model.show_legend);
+    c.legend.category = charts_rs::LegendCategory::Square;
+    c.legend.position = legend_position(model.legend_pos);
+    c.legend.margin = legend_vcenter_margin(model, h);
     apply_unified_fonts!(c);
-    c.series_colors = series_colors;
+    c.series.colors = (0..slice_count * ring_count)
+        .map(|i| series_colors[i % slice_count.max(1)])
+        .collect();
     c.rose_type = Some(false);
     c.border_radius = Some(0.0);
     c.slice_stroke_color = slice_border_color(model);
@@ -450,7 +567,8 @@ fn chart_model_doughnut_rings_to_svg(model: &ChartModel, width: u32, height: u32
         .unwrap_or(0.35)
         .clamp(0.0, MULTI_RING_HOLE_MAX);
     c.inner_radius = r * hole;
-    c.extra_rings = rings;
+    c.ring_gap = Some(0.0);
+    c.min_show_label_angle = 361.0;
     c.svg().ok()
 }
 
@@ -476,21 +594,24 @@ fn chart_model_pie_to_svg(
         ($c:expr) => {
             // Word 饼图/环形图标签只显示数值
             if model.data_labels.show_val {
-                $c.series_label_formatter = "{c}".to_string();
+                $c.series.label.formatter = "{c}".to_string();
             }
             // 文档明确写了 dLbls 却不显示数值（如 Word 里没有标签的饼图）：隐藏标签
-            $c.hide_labels = model.data_labels.explicit && !model.data_labels.show_val;
+            if model.data_labels.explicit && !model.data_labels.show_val {
+                $c.min_show_label_angle = 361.0;
+            }
             if let Some(t) = &model.title {
-                $c.title_text = t.clone();
+                $c.title.text = t.clone();
             }
             $c.width = w;
             $c.height = h;
-            $c.legend_show = Some(model.show_legend);
-            $c.stack_title_legend = true;
-            $c.legend_category = charts_rs::LegendCategory::RoundRect;
+            $c.legend.show = Some(model.show_legend);
+            $c.legend.category = charts_rs::LegendCategory::Square;
+            $c.legend.position = legend_position(model.legend_pos);
+            $c.legend.margin = legend_vcenter_margin(model, h);
             apply_unified_fonts!($c);
-            $c.grid_stroke_width = grid_width;
-            $c.series_colors = series_colors.clone();
+            $c.grid.stroke_width = grid_width;
+            $c.series.colors = series_colors.clone();
         };
     }
 

@@ -24,6 +24,22 @@ use std::cell::RefCell;
 /// 路径、做沙盒安全校验；本 trait 不关心具体怎么存、怎么校验。
 pub trait MediaAssetSource {
     fn read_media(&self, virtual_path: &str) -> Result<Vec<u8>, String>;
+
+    /// 保存导出的图片(file_name 不含目录),返回实际写入的虚拟路径。
+    /// 默认实现表示当前会话没有 workspace。
+    fn write_export(&self, _file_name: &str, _bytes: &[u8]) -> Result<String, String> {
+        Err("当前会话未提供 workspace,无法保存导出图片".to_string())
+    }
+
+    /// 在 exports 下新建一个导出文件夹(名称_MMDD_vN,不覆盖),返回其虚拟路径。
+    fn begin_export_dir(&self, _base: &str) -> Result<String, String> {
+        Err("当前会话未提供 workspace,无法保存导出图片".to_string())
+    }
+
+    /// 往 begin_export_dir 返回的文件夹里写一个文件,返回文件的虚拟路径。
+    fn write_export_file(&self, _dir: &str, _file_name: &str, _bytes: &[u8]) -> Result<String, String> {
+        Err("当前会话未提供 workspace,无法保存导出图片".to_string())
+    }
 }
 
 thread_local! {

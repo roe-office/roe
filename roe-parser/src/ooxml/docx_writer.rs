@@ -526,7 +526,10 @@ fn write_numbering_xml(doc: &WriterDocument, lists: &[(String, u32, String)]) ->
                         NumFormat::UpperRoman => "upperRoman",
                         NumFormat::None => "none",
                     };
-                    (f, format!("{}%{}{}", n.prefix, i + 1, n.suffix), n.start_value, &n.indent)
+                    (f, match &n.template {
+                        Some(t) => t.clone(),
+                        None => format!("{}%{}{}", n.prefix, i + 1, n.suffix),
+                    }, n.start_value, &n.indent)
                 }
                 ListLevelStyle::Bullet(b) => {
                     ("bullet", format!("{}{}{}", b.prefix, b.bullet_char, b.suffix), 1u32, &b.indent)
@@ -718,12 +721,12 @@ fn write_doc_defaults_xml(styles: &roe_model::style::StyleRegistry) -> String {
 fn write_styles_xml(doc: &WriterDocument) -> String {
     let mut styles_body = String::new();
 
-    for style in doc.styles.paragraph_styles.values() {
-        styles_body.push_str(&write_one_paragraph_style_xml(style));
+    for (sid, style) in doc.styles.paragraph_styles.iter() {
+        styles_body.push_str(&write_one_paragraph_style_xml_with_id(sid, style));
     }
 
-    for style in doc.styles.char_styles.values() {
-        styles_body.push_str(&write_one_char_style_xml(style));
+    for (sid, style) in doc.styles.char_styles.iter() {
+        styles_body.push_str(&write_one_char_style_xml_with_id(sid, style));
     }
 
     let doc_defaults_xml = write_doc_defaults_xml(&doc.styles);
@@ -833,6 +836,13 @@ fn write_char_props_rpr_xml(
 /// 预设色，不认 w:shd，与 ParagraphStyle/Run 的 background 写法不能
 /// 直接复用），留作独立的第二小步，见交接文档。
 fn write_one_char_style_xml(style: &roe_model::style::CharStyle) -> String {
+    write_one_char_style_xml_with_id(&style.name, style)
+}
+
+fn write_one_char_style_xml_with_id(
+    style_id: &str,
+    style: &roe_model::style::CharStyle,
+) -> String {
     // background：此前留 None 是因为解析层（read_styles 的 in_rpr 分支）
     // 当时只认 w:highlight（16种预设色名），不认 w:shd（任意RGB）。本次
     // 会话已经给 read_styles 补上了 w:shd 解析（ROE-STYLE-SHD，新增
@@ -867,12 +877,19 @@ fn write_one_char_style_xml(style: &roe_model::style::CharStyle) -> String {
 
     format!(
         r#"<w:style w:type="character" w:styleId="{}"><w:name w:val="{}"/>{based_on_xml}{rpr_xml}</w:style>"#,
-        xml_escape_attr(&style.name),
+        xml_escape_attr(style_id),
         xml_escape_attr(&style.name),
     )
 }
 
 fn write_one_paragraph_style_xml(style: &roe_model::style::ParagraphStyle) -> String {
+    write_one_paragraph_style_xml_with_id(&style.name, style)
+}
+
+fn write_one_paragraph_style_xml_with_id(
+    style_id: &str,
+    style: &roe_model::style::ParagraphStyle,
+) -> String {
     let rpr = write_char_props_rpr_xml(
         style.bold,
         style.italic,
@@ -958,8 +975,9 @@ fn write_one_paragraph_style_xml(style: &roe_model::style::ParagraphStyle) -> St
     // w:styleId 直接用 style.name 本身作为 ID（与 style 定义/引用两侧
     // 保持同一个字符串，避免额外维护一张 name -> styleId 映射表）。
     format!(
-        r#"<w:style w:type="paragraph" w:styleId="{name}"><w:name w:val="{name}"/>{based_on_xml}{ppr_xml}{rpr_xml}</w:style>"#,
-        name = style.name,
+        r#"<w:style w:type="paragraph" w:styleId="{sid}"><w:name w:val="{name}"/>{based_on_xml}{ppr_xml}{rpr_xml}</w:style>"#,
+        sid = xml_escape_attr(style_id),
+        name = xml_escape_attr(&style.name),
     )
 }
 
@@ -1769,6 +1787,29 @@ fn xml_fill_attr(color: Option<roe_model::common::Color>) -> String {
     }
 }
 
+/// 修订包裹：Insert 包 <w:ins>；Delete 包 <w:del> 且 w:t 改 w:delText，
+/// 删除之下还有插入层时外面再包一层 <w:ins>（与解析端嵌套对称）。
+fn wrap_revision_xml(rev: &roe_model::writer::Revision, run_xml: String) -> String {
+    use roe_model::writer::RevisionKind;
+    let tag = |r: &roe_model::writer::Revision, name: &str, inner: String| -> String {
+        format!(
+            r#"<w:{n} w:id="{}" w:author="{}" w:date="{}">{}</w:{n}>"#,
+            r.id, xml_escape_attr(&r.author), xml_escape_attr(&r.date), inner, n = name
+        )
+    };
+    match rev.kind {
+        RevisionKind::Insert => tag(rev, "ins", run_xml),
+        RevisionKind::Delete => {
+            let x = run_xml.replace("<w:t ", "<w:delText ").replace("</w:t>", "</w:delText>");
+            let del = tag(rev, "del", x);
+            match rev.under.as_deref() {
+                Some(u) if u.kind == RevisionKind::Insert => tag(u, "ins", del),
+                _ => del,
+            }
+        }
+    }
+}
+
 fn write_paragraph_xml(p: &roe_model::writer::Paragraph) -> String {
     let mut runs_xml = String::new();
     for run in &p.runs {
@@ -1792,7 +1833,11 @@ fn write_paragraph_xml(p: &roe_model::writer::Paragraph) -> String {
                     .map(|seg| format!(r#"<w:t xml:space="preserve">{}</w:t>"#, xml_escape_text(seg)))
                     .collect::<Vec<_>>()
                     .join("<w:br/>");
-                runs_xml.push_str(&format!("<w:r>{}{}</w:r>", rpr_xml, t_xml));
+                let mut run_xml = format!("<w:r>{}{}</w:r>", rpr_xml, t_xml);
+                if let Some(rev) = &run.revision {
+                    run_xml = wrap_revision_xml(rev, run_xml);
+                }
+                runs_xml.push_str(&run_xml);
             }
             // v282: 脚注/尾注引用、注释内部编号占位符
             let sup = r#"<w:rPr><w:vertAlign w:val="superscript"/></w:rPr>"#;
@@ -2111,6 +2156,31 @@ mod tests {
             body,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn test_roundtrip_revision_ins_then_del() {
+        use roe_model::writer::{Revision, RevisionKind, Run, Paragraph, BodyElement, WriterDocument};
+        let alice = Revision { kind: RevisionKind::Insert, id: 0, author: "Alice".into(), date: "2025-04-16T10:37:00Z".into(), under: None };
+        let bob = Revision { kind: RevisionKind::Delete, id: 1, author: "Bob".into(), date: "2025-04-16T11:07:00Z".into(), under: Some(Box::new(alice.clone())) };
+        let mk = |t: &str, r: Option<Revision>| Run { text: t.into(), revision: r, ..Default::default() };
+        let para = Paragraph {
+            runs: vec![mk("AAA", Some(alice.clone())), mk("BBB", Some(bob)), mk("CCC", Some(alice.clone())), mk("DDD", None)],
+            ..Default::default()
+        };
+        let doc = WriterDocument { body: vec![BodyElement::Paragraph(para)], ..Default::default() };
+        let bytes = DocxWriter::write(&doc).expect("write failed");
+        let back = crate::ooxml::docx::DocxParser::parse(&bytes).expect("reparse failed");
+        let BodyElement::Paragraph(p) = &back.body[0] else { panic!("expected paragraph") };
+        assert_eq!(p.runs.len(), 4);
+        let texts: Vec<&str> = p.runs.iter().map(|r| r.text.as_str()).collect();
+        assert_eq!(texts, vec!["AAA", "BBB", "CCC", "DDD"]);
+        let r1 = p.runs[1].revision.as_ref().expect("BBB 应有 revision");
+        assert_eq!((r1.kind, r1.author.as_str(), r1.id), (RevisionKind::Delete, "Bob", 1));
+        let u = r1.under.as_ref().expect("BBB 应保留 under");
+        assert_eq!((u.kind, u.author.as_str()), (RevisionKind::Insert, "Alice"));
+        assert_eq!(p.runs[0].revision.as_ref().unwrap().kind, RevisionKind::Insert);
+        assert!(p.runs[3].revision.is_none());
     }
 
     #[test]
@@ -2801,6 +2871,36 @@ mod tests {
         );
         let color = got.color.expect("color missing");
         assert_eq!((color.r, color.g, color.b), (0x12, 0x34, 0x56));
+    }
+
+    #[test]
+    fn test_write_style_xml_uses_registry_key_as_style_id() {
+        // 回归：导入 docx 的样式在注册表里以原 styleId（如 917）为键，
+        // 段落 pStyle 和 basedOn 引用的也是这个 id。写出时 styleId 必须
+        // 用键，w:name 才用样式名，否则引用悬空（LibreOffice 会丢列表和缩进）。
+        use roe_model::style::{CharStyle, ParagraphStyle};
+
+        let pstyle = ParagraphStyle {
+            name: "ROE_Imp_x".to_string(),
+            based_on: Some("905".to_string()),
+            ..Default::default()
+        };
+        let xml = write_one_paragraph_style_xml_with_id("917", &pstyle);
+        assert!(xml.contains(r#"w:styleId="917""#), "xml={xml}");
+        assert!(xml.contains(r#"<w:name w:val="ROE_Imp_x"/>"#), "xml={xml}");
+        assert!(xml.contains(r#"<w:basedOn w:val="905"/>"#), "xml={xml}");
+
+        let cstyle = CharStyle {
+            name: "MyChar".to_string(),
+            ..Default::default()
+        };
+        let cxml = write_one_char_style_xml_with_id("c12", &cstyle);
+        assert!(cxml.contains(r#"w:styleId="c12""#), "xml={cxml}");
+        assert!(cxml.contains(r#"<w:name w:val="MyChar"/>"#), "xml={cxml}");
+
+        // 旧入口（键等于名字）行为不变
+        let old = write_one_paragraph_style_xml(&pstyle);
+        assert!(old.contains(r#"w:styleId="ROE_Imp_x""#), "xml={old}");
     }
 
     #[test]

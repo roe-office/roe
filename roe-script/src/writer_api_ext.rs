@@ -266,6 +266,9 @@ fn st_delete_range(doc: &mut WriterDocument, pa: i64, oa: i64, pb: i64, ob: i64)
     let last = st_para(doc, pb)?;
     let oa = st_offset(first, oa)?;
     let ob = st_offset(last, ob as i64)?;
+    if let Some(a) = crate::writer_api::track_author() {
+        return roe_writer::tracked::tracked_delete_range(doc, pa as usize, oa, pb as usize, ob, &a);
+    }
     let mut left = st_split(&first.runs, oa)?.0;
     let right = st_split(&last.runs, ob)?.1;
     left.extend(right);
@@ -370,11 +373,11 @@ fn fm_list_style(kind: i64, variant: i64) -> (String, roe_model::writer::ListSty
             };
             levels.push(ListLevelStyle::Number(NumberListLevel {
                 format, prefix: String::new(), suffix: suffix.to_string(),
-                start_value: 1, display_levels: 1, indent,
+                start_value: 1, template: None, display_levels: 1, indent,
             }));
         }
     }
-    (name.clone(), ListStyle { name, levels })
+    (name.clone(), ListStyle { name, levels, ..Default::default() })
 }
 
 fn fm_list(doc: &mut WriterDocument, para: i64, kind: i64, variant: i64) -> Result<(), String> {
@@ -1403,6 +1406,7 @@ pub fn register_comments(engine: &mut Engine) {
 /// 只读函数(inspect_document / get_table_cell),同时供只读引擎使用。
 pub fn register_read(engine: &mut Engine) {
     register_comment_read(engine);
+    register_revisions_read(engine);
     // find_text: 查找全部匹配,返回 {"total","truncated","matches":[{"para","start","end","text"}]}。
     // para 是 body 下标(与 get_paragraph 同一空间),start/end 是段内 UTF-8 字节偏移(一个汉字 3 字节)。
     // 只搜 body 直属段落,不搜表格/文本框,不跨段匹配。最多返回 200 条,超出 truncated=true(total 仍是总数)。
@@ -1575,12 +1579,216 @@ pub fn register_read(engine: &mut Engine) {
     });
 }
 
+// ───────── 修订:list_revisions / resolve_revision / resolve_all_revisions ─────────
+// 逻辑对应 roe-api/src/revisions.rs(roe-script 不能依赖 roe-api,改一处请同步另一处)。
+// 偏移是段内 UTF-8 字节,与 find_text 一致。只处理 body 直属段落。
+
+use roe_model::writer::RevisionKind as RevK;
+
+struct RevInfo {
+    para: usize,
+    start: usize,
+    end: usize,
+    kind: &'static str,
+    author: String,
+    date: String,
+    text: String,
+}
+
+/// 列出全部修订;同段内相邻、类型和作者相同的 run 合并成一条。
+fn rev_list(doc: &WriterDocument) -> Vec<RevInfo> {
+    let mut out: Vec<RevInfo> = Vec::new();
+    for (i, el) in doc.body.iter().enumerate() {
+        if let BodyElement::Paragraph(p) = el {
+            let mut base = 0usize;
+            for r in &p.runs {
+                let start = base;
+                base += r.text.len();
+                let Some(rev) = &r.revision else { continue };
+                let kind = match rev.kind { RevK::Insert => "insert", RevK::Delete => "delete" };
+                let merged = match out.last_mut() {
+                    Some(l) if l.para == i && l.end == start && l.kind == kind && l.author == rev.author => {
+                        l.end = base;
+                        l.text.push_str(&r.text);
+                        true
+                    }
+                    _ => false,
+                };
+                if !merged {
+                    out.push(RevInfo {
+                        para: i, start, end: base, kind,
+                        author: rev.author.clone(), date: rev.date.clone(), text: r.text.clone(),
+                    });
+                }
+            }
+        }
+    }
+    out
+}
+
+fn rev_resolve_run(mut r: roe_model::writer::Run, accept: bool) -> Option<roe_model::writer::Run> {
+    let Some(rev) = r.revision.take() else { return Some(r) };
+    match (rev.kind, accept) {
+        (RevK::Insert, true) => Some(r),
+        (RevK::Insert, false) => None,
+        (RevK::Delete, true) => None,
+        (RevK::Delete, false) => {
+            r.revision = rev.under.map(|b| *b);
+            Some(r)
+        }
+    }
+}
+
+/// range=None 处理全部;Some((a,b)) 只处理与字节区间 [a,b) 相交的 run。返回(新 runs, 处理的 run 数)。
+fn rev_resolve_runs(runs: Vec<roe_model::writer::Run>, accept: bool, range: Option<(usize, usize)>) -> (Vec<roe_model::writer::Run>, usize) {
+    let mut out = Vec::with_capacity(runs.len());
+    let mut changed = 0usize;
+    let mut base = 0usize;
+    for r in runs {
+        let s = base;
+        base += r.text.len();
+        let hit = r.revision.is_some()
+            && match range {
+                None => true,
+                Some((a, b)) => s < b && base.max(s + 1) > a,
+            };
+        if !hit { out.push(r); continue; }
+        changed += 1;
+        let had_ref = r.comment_ref.is_some() || r.footnote_ref.is_some() || r.endnote_ref.is_some()
+            || !r.comment_range_start.is_empty() || !r.comment_range_end.is_empty();
+        match rev_resolve_run(r.clone(), accept) {
+            Some(x) => out.push(x),
+            None if had_ref => {
+                let mut keep = r;
+                keep.text.clear();
+                keep.revision = None;
+                out.push(keep);
+            }
+            None => {}
+        }
+    }
+    (out, changed)
+}
+
+/// 只读:list_revisions(由 register_read 调用,只读引擎也可用)。
+pub fn register_revisions_read(engine: &mut Engine) {
+    // list_revisions: 列出全部修订(合并后的整条)。
+    // 返回 {"total":N,"revisions":[{"para","start","end","kind":"insert"|"delete","author","date","text"}]}。
+    // para 是 body 下标,start/end 是段内 UTF-8 字节偏移,可直接喂给 resolve_revision。
+    engine.register_fn("list_revisions", || -> String {
+        with_doc(|doc| {
+            let l = rev_list(doc);
+            let items: Vec<serde_json::Value> = l.iter().map(|r| serde_json::json!({
+                "para": r.para, "start": r.start, "end": r.end, "kind": r.kind,
+                "author": r.author, "date": r.date, "text": r.text,
+            })).collect();
+            serde_json::json!({ "total": items.len(), "revisions": items }).to_string()
+        })
+        .unwrap_or_else(|| NO_DOC.to_string())
+    });
+
+}
+
+/// insert_text 的实现：修订开启（脚本里 set_track_changes(true)）时记成作者 AI 的纯插入，否则是普通文字。
+fn st_insert_text(doc: &mut WriterDocument, para: i64, offset: i64, text: &str) -> Result<(), String> {
+    let p = st_para(doc, para)?;
+    let off = st_offset(p, offset)?;
+    let rev = crate::writer_api::track_author().map(|a| roe_model::writer::Revision {
+        kind: roe_model::writer::RevisionKind::Insert,
+        id: roe_writer::tracked::next_revision_id(doc),
+        author: a,
+        date: roe_writer::tracked::now_iso_utc(),
+        under: None,
+    });
+    match doc.body.get_mut(para as usize) {
+        Some(BodyElement::Paragraph(p)) => roe_writer::tracked::insert_text_at(p, off, text, rev),
+        _ => Err(format!("para {} 不是普通段落", para)),
+    }
+}
+
+/// 写:resolve_revision / resolve_all_revisions。
+pub fn register_revisions(engine: &mut Engine) {
+    // set_track_changes: 开关本次脚本的修订记录。脚本开始时一律是关;开启后编辑记为作者 AI 的修订。
+    // 脚本结束后自动清零,与用户在界面的修订开关无关。
+    engine.register_fn("set_track_changes", |on: bool| -> String {
+        crate::writer_api::set_track_author(if on { Some("AI".to_string()) } else { None });
+        "ok".to_string()
+    });
+    // insert_text(para, offset, text): 在 body 下标 para 的段内 UTF-8 字节偏移 offset 处纯插入文字。
+    // 先 set_track_changes(true) 则记为作者 AI 的插入修订;否则是普通文字。成功 ok,失败 err:。
+    engine.register_fn("insert_text", |para: i64, offset: i64, text: String| -> String {
+        with_doc(|doc| st_reply(st_insert_text(doc, para, offset, &text))).unwrap_or_else(|| NO_DOC.to_string())
+    });
+    // resolve_revision: 接受(accept=true)或拒绝(false)段 para 内字节区间 [start,end) 的修订。
+    // 返回 {"resolved_runs":N,"para":P,"text_before":"..","text_after":"..","remaining_revisions":M}。
+    // text 含被标记删除的文字(它们在接受前仍在段内)。拒绝删除会退回下层的插入,remaining 可能不减少。
+    // 区间内没有修订、参数非法、段落不存在返回 err:,文档不变。
+    engine.register_fn("resolve_revision", |para: i64, start: i64, end: i64, accept: bool| -> String {
+        if para < 0 || start < 0 || end < start {
+            return "err: 参数非法(para/start 不能为负,end 不能小于 start)".to_string();
+        }
+        with_doc(|doc| {
+            let idx = para as usize;
+            let Some(BodyElement::Paragraph(p)) = doc.body.get_mut(idx) else {
+                return format!("err: 段落 {} 不存在或不是普通段落", para);
+            };
+            let before = para_text(p);
+            let (new_runs, changed) = rev_resolve_runs(p.runs.clone(), accept, Some((start as usize, end as usize)));
+            if changed == 0 {
+                return "err: 该区间没有修订(先用 list_revisions 取 start/end)".to_string();
+            }
+            p.runs = new_runs;
+            let after = para_text(p);
+            let remaining = rev_list(doc).len();
+            serde_json::json!({
+                "resolved_runs": changed, "para": idx,
+                "text_before": before, "text_after": after,
+                "remaining_revisions": remaining,
+            }).to_string()
+        })
+        .unwrap_or_else(|| NO_DOC.to_string())
+    });
+
+    // resolve_all_revisions: 全部接受/拒绝(循环到无修订为止,拒绝删除会退回下层插入再清一轮)。
+    // 返回 {"resolved":N,"affected_para_indices":[..],"remaining_revisions":M}。没有修订返回 err:。
+    engine.register_fn("resolve_all_revisions", |accept: bool| -> String {
+        with_doc(|doc| {
+            let total = rev_list(doc).len();
+            if total == 0 {
+                return "err: 文档中没有修订".to_string();
+            }
+            let mut affected: Vec<usize> = Vec::new();
+            for _ in 0..8 {
+                let mut any = false;
+                for (i, el) in doc.body.iter_mut().enumerate() {
+                    if let BodyElement::Paragraph(p) = el {
+                        let runs = std::mem::take(&mut p.runs);
+                        let (nr, ch) = rev_resolve_runs(runs, accept, None);
+                        p.runs = nr;
+                        if ch > 0 {
+                            any = true;
+                            if !affected.contains(&i) { affected.push(i); }
+                        }
+                    }
+                }
+                if !any { break; }
+            }
+            let remaining = rev_list(doc).len();
+            serde_json::json!({
+                "resolved": total, "affected_para_indices": affected, "remaining_revisions": remaining,
+            }).to_string()
+        })
+        .unwrap_or_else(|| NO_DOC.to_string())
+    });
+}
+
 /// 全量注册:只读函数 + 写函数 set_table_cell。
 pub fn register(engine: &mut Engine) {
     register_read(engine);
     register_structure(engine);
     register_format(engine);
     register_comments(engine);
+    register_revisions(engine);
 
     // replace_text_ex: 全文替换,支持整词与字面量。use_regex=false 时 pattern 按字面量。
     // 只处理 body 直属段落(不含表格/文本框)。返回 {"total_count":N,"affected_para_indices":[...]},失败 err:。
@@ -1594,7 +1802,10 @@ pub fn register(engine: &mut Engine) {
             Err(e) => return format!("err: {}", e),
         };
         with_doc(|doc| {
-            let r = roe_writer::find_replace::replace_text_in_document(doc, &re, &replacement, None);
+            let r = match crate::writer_api::track_author() {
+                Some(a) => roe_writer::tracked::tracked_replace_in_document(doc, &re, &replacement, None, &a),
+                None => roe_writer::find_replace::replace_text_in_document(doc, &re, &replacement, None),
+            };
             serde_json::json!({ "total_count": r.total_count, "affected_para_indices": r.affected_para_indices }).to_string()
         })
         .unwrap_or_else(|| NO_DOC.to_string())
@@ -3195,5 +3406,220 @@ mod wfml_tests {
         assert!(out.starts_with("err:"), "{out}");
         let g = jv(&run(&mut d, &format!("get_writer_formula(0, {ri})")));
         assert_eq!(g["latex"], "x^2");
+    }
+}
+
+#[cfg(test)]
+mod track_script_tests {
+    use super::*;
+    use crate::writer_api::{register, set_track_author, with_document};
+    use roe_model::writer::{BodyElement, Paragraph, RevisionKind, Run};
+
+    fn doc_with(texts: &[&str]) -> WriterDocument {
+        let mut doc = WriterDocument::default();
+        for t in texts {
+            doc.body.push(BodyElement::Paragraph(Paragraph {
+                runs: vec![Run { text: (*t).into(), ..Default::default() }],
+                ..Default::default()
+            }));
+        }
+        doc
+    }
+
+    fn exec(doc: &mut WriterDocument, script: &str) -> String {
+        let mut e = Engine::new();
+        register(&mut e);
+        let mut out = String::new();
+        with_document(doc, || { out = e.eval::<String>(script).unwrap(); });
+        out
+    }
+
+    fn runs_of(doc: &WriterDocument, i: usize) -> Vec<(String, Option<(RevisionKind, String)>)> {
+        match &doc.body[i] {
+            BodyElement::Paragraph(p) => p.runs.iter()
+                .map(|r| (r.text.clone(), r.revision.as_ref().map(|v| (v.kind.clone(), v.author.clone()))))
+                .collect(),
+            _ => vec![],
+        }
+    }
+
+    #[test]
+    fn track_off_edits_plain() {
+        set_track_author(None);
+        let mut doc = doc_with(&["Hello World"]);
+        exec(&mut doc, r#"replace_text("World", "Rust", true, -1, -1)"#);
+        assert_eq!(runs_of(&doc, 0).iter().map(|r| r.0.as_str()).collect::<String>(), "Hello Rust");
+        assert!(runs_of(&doc, 0).iter().all(|r| r.1.is_none()));
+    }
+
+    #[test]
+    fn track_on_replace_text_records_ai_revisions() {
+        set_track_author(Some("AI".into()));
+        let mut doc = doc_with(&["Hello World"]);
+        exec(&mut doc, r#"replace_text("World", "Rust", true, -1, -1)"#);
+        set_track_author(None);
+        let r = runs_of(&doc, 0);
+        assert_eq!(r.len(), 3);
+        assert_eq!(r[1], ("World".to_string(), Some((RevisionKind::Delete, "AI".to_string()))));
+        assert_eq!(r[2], ("Rust".to_string(), Some((RevisionKind::Insert, "AI".to_string()))));
+    }
+
+    #[test]
+    fn track_on_set_and_append_paragraph() {
+        set_track_author(Some("AI".into()));
+        let mut doc = doc_with(&["old"]);
+        exec(&mut doc, r#"set_paragraph(0, "new")"#);
+        exec(&mut doc, r#"append_paragraph("tail")"#);
+        set_track_author(None);
+        let r0 = runs_of(&doc, 0);
+        assert_eq!(r0[0].1.as_ref().unwrap().0, RevisionKind::Delete);
+        assert_eq!(r0[1], ("new".to_string(), Some((RevisionKind::Insert, "AI".to_string()))));
+        assert_eq!(runs_of(&doc, 1)[0].1.as_ref().unwrap().0, RevisionKind::Insert);
+    }
+
+    #[test]
+    fn script_set_track_changes_toggles() {
+        set_track_author(None);
+        let mut doc = doc_with(&["Hello World"]);
+        exec(&mut doc, r#"set_track_changes(true); replace_text("World", "Rust", true, -1, -1)"#);
+        exec(&mut doc, r#"set_track_changes(false); append_paragraph("plain")"#);
+        set_track_author(None);
+        assert_eq!(runs_of(&doc, 0).len(), 3);
+        assert!(runs_of(&doc, 1)[0].1.is_none());
+    }
+
+    #[test]
+    fn insert_text_tracked_is_pure_insert_and_reject_restores() {
+        set_track_author(None);
+        let mut doc = doc_with(&["EF GH"]);
+        exec(&mut doc, r#"set_track_changes(true); insert_text(0, 5, "IJ")"#);
+        set_track_author(None);
+        let r = runs_of(&doc, 0);
+        assert_eq!(r.len(), 2);
+        assert_eq!(r[0], ("EF GH".to_string(), None));
+        assert_eq!(r[1], ("IJ".to_string(), Some((RevisionKind::Insert, "AI".to_string()))));
+        exec(&mut doc, r#"resolve_all_revisions(false)"#);
+        let text: String = runs_of(&doc, 0).iter().map(|r| r.0.as_str()).collect();
+        assert_eq!(text, "EF GH");
+    }
+
+    #[test]
+    fn insert_text_plain_beside_revision_not_absorbed() {
+        set_track_author(None);
+        let mut doc = WriterDocument::default();
+        doc.body.push(BodyElement::Paragraph(Paragraph {
+            runs: vec![Run {
+                text: "ab".into(),
+                revision: Some(roe_model::writer::Revision {
+                    kind: RevisionKind::Insert, id: 1, author: "u".into(), date: String::new(), under: None,
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }));
+        exec(&mut doc, r#"insert_text(0, 2, "X")"#);
+        let r = runs_of(&doc, 0);
+        assert_eq!(r.len(), 2);
+        assert_eq!(r[1], ("X".to_string(), None));
+    }
+
+    #[test]
+    fn track_on_then_reject_all_restores_text() {
+        set_track_author(Some("AI".into()));
+        let mut doc = doc_with(&["Hello World"]);
+        exec(&mut doc, r#"replace_text("World", "Rust", true, -1, -1)"#);
+        set_track_author(None);
+        exec(&mut doc, r#"resolve_all_revisions(false)"#);
+        let text: String = runs_of(&doc, 0).iter().map(|r| r.0.as_str()).collect();
+        assert_eq!(text, "Hello World");
+    }
+}
+
+#[cfg(test)]
+mod revision_tests {
+    use crate::writer_api::tests::empty_doc;
+    use crate::writer_api::{register, with_document};
+    use roe_model::writer::{BodyElement, Paragraph, Revision, RevisionKind, Run};
+
+    fn rev(kind: RevisionKind, a: &str, under: Option<Revision>) -> Revision {
+        Revision { kind, id: 0, author: a.into(), date: String::new(), under: under.map(Box::new) }
+    }
+    fn run(t: &str, r: Option<Revision>) -> Run { Run { text: t.into(), revision: r, ..Default::default() } }
+
+    /// 段落 0 = AAA(Alice 插入) BBB(Bob 删除,下层 Alice 插入) CCC(Alice 插入) DDD(无修订)
+    fn exec(script: &str) -> String {
+        let mut doc = empty_doc();
+        let alice = rev(RevisionKind::Insert, "Alice", None);
+        let bob = rev(RevisionKind::Delete, "Bob", Some(alice.clone()));
+        doc.body[0] = BodyElement::Paragraph(Paragraph {
+            runs: vec![run("AAA", Some(alice.clone())), run("BBB", Some(bob)), run("CCC", Some(alice)), run("DDD", None)],
+            ..Default::default()
+        });
+        let mut e = rhai::Engine::new();
+        register(&mut e);
+        let mut out = String::new();
+        with_document(&mut doc, || {
+            out = e.eval::<String>(script).unwrap();
+        });
+        out
+    }
+
+    #[test]
+    fn list_revisions_returns_three() {
+        let v: serde_json::Value = serde_json::from_str(&exec("list_revisions()")).unwrap();
+        assert_eq!(v["total"], 3);
+        assert_eq!(v["revisions"][0]["kind"], "insert");
+        assert_eq!(v["revisions"][1]["kind"], "delete");
+        assert_eq!(v["revisions"][1]["author"], "Bob");
+        assert_eq!(v["revisions"][1]["start"], 3);
+        assert_eq!(v["revisions"][2]["start"], 6);
+    }
+
+    #[test]
+    fn resolve_reject_insert_range() {
+        let v: serde_json::Value = serde_json::from_str(&exec("resolve_revision(0, 0, 3, false)")).unwrap();
+        assert_eq!(v["text_before"], "AAABBBCCCDDD");
+        assert_eq!(v["text_after"], "BBBCCCDDD");
+        assert_eq!(v["remaining_revisions"], 2);
+    }
+
+    #[test]
+    fn resolve_accept_delete_range() {
+        let v: serde_json::Value = serde_json::from_str(&exec("resolve_revision(0, 3, 6, true)")).unwrap();
+        assert_eq!(v["text_after"], "AAACCCDDD");
+        // AAA 与 CCC 删除后相邻，同类型同作者，按列表规则合并为 1 条
+        assert_eq!(v["remaining_revisions"], 1);
+    }
+
+    #[test]
+    fn resolve_without_revision_is_err_and_doc_unchanged() {
+        let out = exec(r#"let r = resolve_revision(0, 9, 12, true); r + "|" + get_paragraph(0)"#);
+        let (r, text) = out.rsplit_once('|').unwrap();
+        assert!(r.starts_with("err:"), "{}", r);
+        assert_eq!(text, "AAABBBCCCDDD");
+        let out2 = exec(r#"resolve_revision(5, 0, 1, true)"#);
+        assert!(out2.starts_with("err:"));
+    }
+
+    #[test]
+    fn resolve_all_reject_leaves_plain_text() {
+        let out = exec(r#"let r = resolve_all_revisions(false); r + "|" + get_paragraph(0)"#);
+        let (r, text) = out.rsplit_once('|').unwrap();
+        let v: serde_json::Value = serde_json::from_str(r).unwrap();
+        assert_eq!(v["resolved"], 3);
+        assert_eq!(v["remaining_revisions"], 0);
+        assert_eq!(text, "DDD");
+    }
+
+    #[test]
+    fn resolve_all_without_revision_is_err() {
+        let mut doc = empty_doc();
+        let mut e = rhai::Engine::new();
+        register(&mut e);
+        let mut out = String::new();
+        with_document(&mut doc, || {
+            out = e.eval::<String>("resolve_all_revisions(true)").unwrap();
+        });
+        assert!(out.starts_with("err:"), "{}", out);
     }
 }

@@ -1175,6 +1175,8 @@ struct NumberingStore {
     seen_num_ids:  HashSet<u32>,
     /// v257: abstractNumId -> ROE_ 列表样式名（roe 自己导出的标记）
     roe_names:     HashMap<u32, String>,
+    /// 导入的项目符号列表迁移：abstractNumId -> ROE_Imp_ 样式名
+    imp_names:     HashMap<u32, String>,
 }
 
 impl NumberingStore {
@@ -1185,6 +1187,131 @@ impl NumberingStore {
             counters:      HashMap::new(),
             seen_num_ids:  HashSet::new(),
             roe_names:     HashMap::new(),
+            imp_names:     HashMap::new(),
+        }
+    }
+
+    /// 编号级：lvlText 里每个 %N 的 N 都不超过本级序号+1 才可迁移。
+    /// 只含本级 %N 的单级写法返回 (前缀, 后缀, None)；
+    /// 含多个 %N 或引用上级的写法返回 (空, 空, Some(模板原文))。
+    fn imp_number_parts(lv: &NumLevel, ilvl: usize) -> Option<(String, String, Option<String>)> {
+        match lv.num_fmt.as_str() {
+            "decimal" | "lowerLetter" | "upperLetter" | "lowerRoman" | "upperRoman" => {}
+            _ => return None,
+        }
+        let t = &lv.lvl_text;
+        let chars: Vec<char> = t.chars().collect();
+        let mut refs: Vec<usize> = Vec::new();
+        let mut i = 0;
+        while i < chars.len() {
+            if chars[i] == '%' {
+                let d = chars.get(i + 1).and_then(|c| c.to_digit(10))? as usize;
+                if d == 0 || d > ilvl + 1 { return None; }
+                refs.push(d);
+                i += 2;
+            } else {
+                i += 1;
+            }
+        }
+        if refs.is_empty() { return None; }
+        if refs.len() == 1 && refs[0] == ilvl + 1 {
+            let pos = t.find('%')?;
+            return Some((t[..pos].to_string(), t[pos + 2..].to_string(), None));
+        }
+        Some((String::new(), String::new(), Some(t.clone())))
+    }
+
+    fn imp_bullet_char(lv: &NumLevel) -> Option<char> {
+        if lv.num_fmt != "bullet" { return None; }
+        let mut it = lv.lvl_text.chars();
+        let c = it.next()?;
+        if it.next().is_some() { return None; }
+        let (o, _) = normalize_symbol_bullet_char(c, lv.font_family.as_deref());
+        let hint = lv.font_family.as_deref().unwrap_or("").to_ascii_lowercase();
+        if o == '\u{A7}' && hint.contains("wingdings") { return Some('\u{25AA}'); }
+        if "\u{25CF}\u{25CB}\u{25A0}\u{25AA}\u{25FC}\u{2013}\u{2713}\u{2022}".contains(o) { Some(o) } else { Some('\u{25CF}') }
+    }
+
+    /// 导入列表某一级的标签颜色: 只认 6 位十六进制, auto 等返回 None
+    fn imp_label_color(lv: &NumLevel) -> Option<[u8; 4]> {
+        let c = lv.color.as_ref()?;
+        let h = c.trim().trim_start_matches('#');
+        if h.len() != 6 || !h.chars().all(|x| x.is_ascii_hexdigit()) { return None; }
+        let col = parse_hex_color(h);
+        Some([col.r, col.g, col.b, 255])
+    }
+
+    /// 导入的单级列表（项目符号或单级编号）：满足条件则返回 ROE_Imp_ 样式名，并记下待登记。
+    fn try_migrate_bullet(&mut self, num_id: u32, ilvl: u8) -> Option<String> {
+        let inst = self.nums.get(&num_id)?;
+        if inst.level_overrides.is_empty() == false { return None; }
+        let abs_id = inst.abstract_num_id;
+        let abs = self.abstract_nums.get(&abs_id)?;
+        if abs.levels.is_empty() || (ilvl as usize) >= abs.levels.len().min(9) { return None; }
+        if inst.overrides.is_empty() == false { return None; }
+        let mut has_num = false;
+        for (i, lv) in abs.levels.iter().take(9).enumerate() {
+            if lv.num_fmt == "bullet" {
+                Self::imp_bullet_char(lv)?;
+            } else {
+                Self::imp_number_parts(lv, i)?;
+                has_num = true;
+            }
+        }
+        let _ = has_num;
+        let name = "ROE_Imp_".to_string() + &abs_id.to_string();
+        self.imp_names.insert(abs_id, name.clone());
+        Some(name)
+    }
+
+    fn register_imp_styles(&self, reg: &mut StyleRegistry) {
+        use roe_model::writer::{ListStyle, ListLevelStyle, BulletListLevel, ListIndent};
+        for (abs_id, name) in &self.imp_names {
+            let Some(abs) = self.abstract_nums.get(abs_id) else { continue };
+            let mut levels = Vec::new();
+            for lv in abs.levels.iter().take(9) {
+                let lvl_no = levels.len();
+                // 读 numbering.xml 的 w:ind；缺失时保持原默认值
+                let indent = match (lv.indent_left, lv.indent_first) {
+                    (Some(l), Some(f)) => ListIndent {
+                        margin_left: l,
+                        text_indent: f,
+                        min_label_width: if f < 0.0 { -f } else { 18.0 },
+                    },
+                    (Some(l), None) => ListIndent {
+                        margin_left: l,
+                        text_indent: 0.0,
+                        min_label_width: 18.0,
+                    },
+                    _ => ListIndent {
+                        margin_left: 36.0 * (lvl_no as f32 + 1.0),
+                        text_indent: -18.0,
+                        min_label_width: 18.0,
+                    },
+                };
+                if lv.num_fmt == "bullet" {
+                    let ch = Self::imp_bullet_char(lv).unwrap_or('\u{25CF}');
+                    levels.push(ListLevelStyle::Bullet(BulletListLevel {
+                        bullet_char: ch.to_string(), prefix: String::new(), suffix: String::new(), indent,
+                    }));
+                } else {
+                    let (prefix, suffix, template) = Self::imp_number_parts(lv, lvl_no).unwrap_or((String::new(), ".".to_string(), None));
+                    let format = match lv.num_fmt.as_str() {
+                        "lowerLetter" => roe_model::writer::NumFormat::LowerAlpha,
+                        "upperLetter" => roe_model::writer::NumFormat::UpperAlpha,
+                        "lowerRoman" => roe_model::writer::NumFormat::LowerRoman,
+                        "upperRoman" => roe_model::writer::NumFormat::UpperRoman,
+                        _ => roe_model::writer::NumFormat::Arabic,
+                    };
+                    levels.push(ListLevelStyle::Number(roe_model::writer::NumberListLevel {
+                        format, prefix, suffix, start_value: lv.start_val.max(1), template, display_levels: 1, indent,
+                    }));
+                }
+            }
+            let label_colors: Vec<Option<[u8; 4]>> = abs.levels.iter().take(9).map(|lv| Self::imp_label_color(lv)).collect();
+            if levels.is_empty() == false {
+                reg.list_styles.entry(name.clone()).or_insert(ListStyle { name: name.clone(), levels, label_colors });
+            }
         }
     }
 
@@ -1196,6 +1323,7 @@ impl NumberingStore {
 
     /// v257: 用 abstractNum 各级定义重建 ROE_ ListStyle 并注册
     fn register_roe_styles(&self, reg: &mut StyleRegistry) {
+        self.register_imp_styles(reg);
         use roe_model::writer::{ListStyle, ListLevelStyle, NumberListLevel, BulletListLevel, ListIndent, NumFormat};
         for (abs_id, name) in &self.roe_names {
             let Some(abs) = self.abstract_nums.get(abs_id) else { continue };
@@ -1219,6 +1347,12 @@ impl NumberingStore {
                         "none" => NumFormat::None,
                         _ => NumFormat::Arabic,
                     };
+                    let template: Option<String> = {
+                        let t = &lv.lvl_text;
+                        let cnt = t.matches('%').count();
+                        let own = format!("%{}", levels.len() + 1);
+                        if cnt > 1 || (cnt == 1 && !t.contains(&own)) { Some(t.clone()) } else { None }
+                    };
                     let (prefix, suffix) = match lv.lvl_text.find('%') {
                         Some(pos) => (
                             lv.lvl_text[..pos].to_string(),
@@ -1227,12 +1361,12 @@ impl NumberingStore {
                         None => (String::new(), String::new()),
                     };
                     levels.push(ListLevelStyle::Number(NumberListLevel {
-                        format, prefix, suffix, start_value: lv.start_val.max(1), display_levels: 1, indent,
+                        format, prefix, suffix, start_value: lv.start_val.max(1), template, display_levels: 1, indent,
                     }));
                 }
             }
             if !levels.is_empty() {
-                reg.list_styles.entry(name.clone()).or_insert(ListStyle { name: name.clone(), levels });
+                reg.list_styles.entry(name.clone()).or_insert(ListStyle { name: name.clone(), levels, ..Default::default() });
             }
         }
     }
@@ -1356,9 +1490,11 @@ fn normalize_symbol_bullet_char(c: char, font_hint: Option<&str>) -> (char, bool
     // font_hint 目前仅用于未来扩展时进一步收窄匹配范围（比如同一码位在
     // 不同字体下语义不同），本次两个码位在实际样本中含义明确，暂不依赖
     // font_hint 做判断，仅接收该参数保留调用点语义、避免未来误用忽略此信息。
-    let _ = font_hint;
+    let hint = font_hint.unwrap_or("").trim().to_ascii_lowercase();
     match c {
-        '\u{F0B7}' => ('\u{2022}', true),
+        '\u{F0B7}' => ('\u{25CF}', true),
+        '\u{00B7}' if hint == "symbol" => ('\u{25CF}', true),
+        'o' if hint == "courier new" => ('\u{25CB}', true),
         '\u{F0A7}' => ('\u{25AA}', true),
         _ => (c, false),
     }
@@ -2482,6 +2618,11 @@ fn read_document<R: Read + std::io::Seek>(
     let mut in_t = false;
     let mut t_buf = String::new();
     let mut t_preserve_space = false;
+    // 修订：当前所处的 w:ins / w:del 嵌套栈（外层在前）
+    let mut rev_stack: Vec<roe_model::writer::Revision> = Vec::new();
+    // 格式修订（rPrChange/pPrChange 等）内部是修订前的旧格式，整段跳过，
+    // 不得当作当前 run/段落的属性读取。
+    let mut fmt_change_depth: u32 = 0;
     let mut cur_num_id: Option<u32> = None;
     let mut cur_ilvl: Option<u8> = None;
     // WROOT-118：只有 w:pPr/w:numPr 内部的 w:numId/w:ilvl 才是编号定义。
@@ -2707,6 +2848,10 @@ fn read_document<R: Read + std::io::Seek>(
 
     loop {
         match reader.read_event()? {
+            Event::Start(ref e) if matches!(e.name().as_ref(), b"w:rPrChange" | b"w:pPrChange" | b"w:sectPrChange" | b"w:tblPrChange" | b"w:tcPrChange" | b"w:trPrChange" | b"w:tblGridChange" | b"w:numberingChange") => { fmt_change_depth += 1; }
+            Event::Start(ref e) | Event::Empty(ref e) if fmt_change_depth > 0 => { let _ = e; }
+            Event::End(ref e) if matches!(e.name().as_ref(), b"w:rPrChange" | b"w:pPrChange" | b"w:sectPrChange" | b"w:tblPrChange" | b"w:tcPrChange" | b"w:trPrChange" | b"w:tblGridChange" | b"w:numberingChange") => { fmt_change_depth = fmt_change_depth.saturating_sub(1); }
+            Event::End(_) if fmt_change_depth > 0 => {}
             Event::Start(ref e) => match e.name().as_ref() {
                 // DOCX-7: w:object 包裹 VML 降级图（v:shape > v:imagedata），
                 // 进入时清空上一次残留的 rid，避免跨对象串数据
@@ -3336,7 +3481,27 @@ fn read_document<R: Read + std::io::Seek>(
                     run_footnote_ref_id = None;
                     run_comment_ref = None;
                 }
-                b"w:t" if in_run => {
+                b"w:ins" | b"w:del" if cur_para.is_some() => {
+                    let mut rid = 0u32;
+                    let mut author = String::new();
+                    let mut date = String::new();
+                    for attr in e.attributes().flatten() {
+                        let v = attr.unescape_value().map(|v| v.to_string()).unwrap_or_default();
+                        match attr.key.as_ref() {
+                            b"w:id" => { rid = v.parse().unwrap_or(0); }
+                            b"w:author" => { author = v; }
+                            b"w:date" => { date = v; }
+                            _ => {}
+                        }
+                    }
+                    let kind = if e.name().as_ref() == b"w:del" {
+                        roe_model::writer::RevisionKind::Delete
+                    } else {
+                        roe_model::writer::RevisionKind::Insert
+                    };
+                    rev_stack.push(roe_model::writer::Revision { kind, id: rid, author, date, under: None });
+                }
+                b"w:t" | b"w:delText" if in_run => {
                     in_t = true;
                     t_buf.clear();
                     t_preserve_space = e.attributes().flatten().any(|attr| {
@@ -4901,7 +5066,7 @@ fn read_document<R: Read + std::io::Seek>(
                                     // 改用Parley原生InlineBox机制（layout.rs构建阶段
                                     // push_inline_box，宽高直接传width_pt/height_pt+depth_pt），
                                     // run.text留空字符串，不再需要在此模拟占位宽度。
-                                    let fallback_text = String::new();
+                                    let fallback_text = "\u{FFFC}".to_string();
                                     // DOCX-8-v2(方案乙): 同一时机顺便算出绘制指令列表，
                                     // 供tile.rs直接画图，不需要在渲染阶段重新parse。
                                     // 失败时（如公式含未支持语法）降级为空DisplayList——
@@ -4966,7 +5131,7 @@ fn read_document<R: Read + std::io::Seek>(
                             };
                         if let Some(ref mut p) = cur_para {
                             // WROOT-080修复：同上，不再用空格模拟宽度，改走InlineBox。
-                            let fallback_text = String::new();
+                            let fallback_text = "\u{FFFC}".to_string();
                             let display_list = roe_formula::latex_to_display_list(&latex, font_size_pt)
                                 .unwrap_or_default();
                             p.runs.push(Run {
@@ -5064,7 +5229,8 @@ fn read_document<R: Read + std::io::Seek>(
                     ole_height_pt = 0.0;
                 }
                 b"w:drawing" => { in_drawing = false; }
-                b"w:t" => {
+                b"w:ins" | b"w:del" => { rev_stack.pop(); }
+                b"w:t" | b"w:delText" => {
                     in_t = false;
                     if t_preserve_space {
                         cur_text.push_str(&t_buf);
@@ -5144,6 +5310,15 @@ fn read_document<R: Read + std::io::Seek>(
                                 // 声明处的完整设计说明。
                                 comment_range_start: std::mem::take(&mut pending_comment_range_start),
                                 comment_ref: run_comment_ref,
+                                revision: {
+                                    use roe_model::writer::RevisionKind as RK;
+                                    let del = rev_stack.iter().rev().find(|r| r.kind == RK::Delete).cloned();
+                                    let ins = rev_stack.iter().find(|r| r.kind == RK::Insert).cloned();
+                                    match del {
+                                        Some(mut d) => { d.under = ins.map(Box::new); Some(d) }
+                                        None => ins,
+                                    }
+                                },
                                 ..Default::default()
                             });
                             cur_text.clear();
@@ -5216,7 +5391,8 @@ fn read_document<R: Read + std::io::Seek>(
                         }
                         let effective_num = if roe_restored { None } else { effective_num };
                         if let Some((num_id, ilvl)) = effective_num {
-                            let label = numbering.advance(num_id, ilvl);
+                            let imp_style: Option<String> = numbering.try_migrate_bullet(num_id, ilvl);
+                            let label = if imp_style.is_some() { String::new() } else { numbering.advance(num_id, ilvl) };
                             // 从 numbering 取该级别的缩进，段落自身未设置时才应用
                             // WROOT-108：先查 lvlOverride 内嵌定义，再回退 abstractNum
                             let lvl_indent = numbering.effective_level(num_id, ilvl as usize);
@@ -5242,9 +5418,9 @@ fn read_document<R: Read + std::io::Seek>(
                                 }
                             }
                             p.list_info = Some(ListInfo {
-                                list_id: num_id.to_string(),
+                                list_id: if imp_style.is_some() { "ROE_L".to_string() + &num_id.to_string() } else { num_id.to_string() },
                                 level: ilvl,
-                                style_name: cur_style_id.clone(),
+                                style_name: match &imp_style { Some(n) => n.clone(), None => cur_style_id.clone() },
                             });
                             // WROOT-111：只承载 w:sectPr（分节符）、没有任何可见 run 的
                             // 空段落，仅作为分节符的载体，Word/LibreOffice 导入时会把它
@@ -7300,6 +7476,75 @@ mod tests_wroot001_page_break {
         let doc = DocxParser::parse(&bytes).expect("parse should succeed");
         let BodyElement::Paragraph(p) = &doc.body[0] else { panic!("expected paragraph") };
         assert!(!p.page_break_before);
+    }
+
+    /// 格式修订：rPrChange/pPrChange 内部的旧格式不得污染当前 run 与段落。
+    #[test]
+    fn revision_fmt_change_does_not_leak() {
+        let plain = make_docx_body(r#"<w:p><w:r><w:t>x</w:t></w:r></w:p>"#);
+        let changed = make_docx_body(r#"<w:p><w:pPr><w:pPrChange w:id="1" w:author="A" w:date="d"><w:pPr><w:ind w:left="720"/></w:pPr></w:pPrChange></w:pPr><w:r><w:rPr><w:rPrChange w:id="2" w:author="A" w:date="d"><w:rPr><w:b/></w:rPr></w:rPrChange></w:rPr><w:t>x</w:t></w:r></w:p>"#);
+        let d0 = DocxParser::parse(&plain).expect("parse");
+        let d1 = DocxParser::parse(&changed).expect("parse");
+        let BodyElement::Paragraph(p0) = &d0.body[0] else { panic!() };
+        let BodyElement::Paragraph(p1) = &d1.body[0] else { panic!() };
+        assert_eq!(p1.runs.len(), 1);
+        assert_eq!(p1.runs[0].text, "x");
+        assert!(p1.runs[0].bold.is_none(), "旧格式的 b 不应进入当前 run");
+        assert_eq!(format!("{:?}", p1.indent_left), format!("{:?}", p0.indent_left), "旧缩进不应进入当前段落");
+    }
+
+    /// 修订第一版：纯 w:ins，run 带 Insert 标记，作者与日期原样保留。
+    #[test]
+    fn revision_plain_insert() {
+        use roe_model::writer::RevisionKind;
+        let body = r#"<w:p><w:ins w:id="0" w:author="Alice" w:date="2025-04-16T10:37:00Z"><w:r><w:t>AAABBBCCC</w:t></w:r></w:ins></w:p>"#;
+        let bytes = make_docx_body(body);
+        let doc = DocxParser::parse(&bytes).expect("parse should succeed");
+        let BodyElement::Paragraph(p) = &doc.body[0] else { panic!("expected paragraph") };
+        assert_eq!(p.runs.len(), 1);
+        assert_eq!(p.runs[0].text, "AAABBBCCC");
+        let r = p.runs[0].revision.as_ref().expect("应有 revision");
+        assert_eq!(r.kind, RevisionKind::Insert);
+        assert_eq!(r.author, "Alice");
+        assert_eq!(r.date, "2025-04-16T10:37:00Z");
+        assert!(r.under.is_none());
+    }
+
+    /// 对应 sw_doc_data__ins-then-del.docx：Alice 插入 AAABBBCCC，
+    /// Bob 又删除其中的 BBB。BBB 的 revision 是 Bob 的 Delete，under 是 Alice 的 Insert。
+    #[test]
+    fn revision_insert_then_delete_nested() {
+        use roe_model::writer::RevisionKind;
+        let body = r#"<w:p><w:ins w:id="0" w:author="Alice" w:date="2025-04-16T10:37:00Z"><w:r><w:t>AAA</w:t></w:r><w:del w:id="1" w:author="Bob" w:date="2025-04-16T11:07:00Z"><w:r><w:delText>BBB</w:delText></w:r></w:del><w:r><w:t>CCC</w:t></w:r></w:ins></w:p>"#;
+        let bytes = make_docx_body(body);
+        let doc = DocxParser::parse(&bytes).expect("parse should succeed");
+        let BodyElement::Paragraph(p) = &doc.body[0] else { panic!("expected paragraph") };
+        assert_eq!(p.runs.len(), 3, "三个 run: AAA / BBB / CCC");
+        assert_eq!(p.runs[0].text, "AAA");
+        assert_eq!(p.runs[1].text, "BBB");
+        assert_eq!(p.runs[2].text, "CCC");
+        let r0 = p.runs[0].revision.as_ref().unwrap();
+        assert_eq!((r0.kind, r0.author.as_str()), (RevisionKind::Insert, "Alice"));
+        let r1 = p.runs[1].revision.as_ref().unwrap();
+        assert_eq!((r1.kind, r1.author.as_str()), (RevisionKind::Delete, "Bob"));
+        let under = r1.under.as_ref().expect("删除之下应有原插入层");
+        assert_eq!((under.kind, under.author.as_str()), (RevisionKind::Insert, "Alice"));
+        let r2 = p.runs[2].revision.as_ref().unwrap();
+        assert_eq!((r2.kind, r2.author.as_str()), (RevisionKind::Insert, "Alice"));
+    }
+
+    /// 只有 w:delText 的删除：文字不能丢（此前解析器不认 delText，整段消失）。
+    #[test]
+    fn revision_delete_keeps_text() {
+        use roe_model::writer::RevisionKind;
+        let body = r#"<w:p><w:r><w:t xml:space="preserve">keep </w:t></w:r><w:del w:id="3" w:author="X" w:date="2025-01-01T00:00:00Z"><w:r><w:delText xml:space="preserve">gone</w:delText></w:r></w:del></w:p>"#;
+        let bytes = make_docx_body(body);
+        let doc = DocxParser::parse(&bytes).expect("parse should succeed");
+        let BodyElement::Paragraph(p) = &doc.body[0] else { panic!("expected paragraph") };
+        assert_eq!(p.runs.len(), 2);
+        assert!(p.runs[0].revision.is_none(), "普通文字不带 revision");
+        assert_eq!(p.runs[1].text, "gone");
+        assert_eq!(p.runs[1].revision.as_ref().unwrap().kind, RevisionKind::Delete);
     }
 
     /// WROOT-031第三步：正文 commentRangeStart/End/commentReference 锚点
@@ -9861,14 +10106,10 @@ mod tests_docx8_omath_para_e2e {
             .find(|r| r.formula.is_some())
             .expect("应存在1个带公式的Run");
 
-        assert!(formula_run.text.is_empty(), "WROOT-080后公式Run的text应为空，宽度信息改由InlineBox读取formula.width_pt");
+        assert_eq!(formula_run.text, "\u{FFFC}", "U+FFFC专项后公式Run的text应为单个占位符(3字节)，宽度信息仍由InlineBox读取formula.width_pt");
         assert!(
             formula_run.formula.as_ref().map(|f| f.width_pt > 0.0).unwrap_or(false),
             "公式的width_pt应为正值，InlineBox渲染依赖此字段定位"
-        );
-        assert!(
-            formula_run.text.chars().all(|c| c == ' '),
-            "占位符应为纯空格串（撑宽度用），不应包含可见的LaTeX语法文本，实际text: {:?}", formula_run.text
         );
     }
 }

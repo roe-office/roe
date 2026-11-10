@@ -75,9 +75,9 @@ mod tests {
     #[test]
     fn meta_counts_match_inventory() {
         // meta 漏登记写函数会被误判成只读(不安全方向);新增函数后须同步 meta 并更新这里的数量
-        assert_eq!(crate::writer_api_meta::WRITER_API_META.len(), 113, "Writer meta 条数应为 113");
+        assert_eq!(crate::writer_api_meta::WRITER_API_META.len(), 118, "Writer meta 条数应为 118");
         assert_eq!(crate::impress_api_meta::IMPRESS_API_META.len(), 54, "Impress meta 条数应为 54");
-        assert!(write_names(Kind::Writer).len() >= 113 - 22 - 1);
+        assert!(write_names(Kind::Writer).len() >= 118 - 22 - 1);
         assert!(write_names(Kind::Impress).len() >= 54 - 18);
     }
 

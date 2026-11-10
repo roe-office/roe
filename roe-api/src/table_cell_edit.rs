@@ -654,3 +654,263 @@ fn fmt_font_in_entry(
     commit(entry, cid, p, newp, split_cid(cid).0, start, end)?;
     Ok(format!("{{\"ct\":1,\"cid\":{},\"para\":{}}}", cid, p))
 }
+
+
+// ───────── 单元格内取文本（复制用）─────────
+/// 取单元格内 (sp,so) 到 (ep,eo) 的文本，段落间用 \n 连接；起止顺序不限。
+fn get_text_in_doc(doc: &WriterDocument, cid: u32, sp: usize, so: usize, ep: usize, eo: usize) -> Result<String, String> {
+    let ((sp, so), (ep, eo)) = if (sp, so) <= (ep, eo) { ((sp, so), (ep, eo)) } else { ((ep, eo), (sp, so)) };
+    let mut parts: Vec<String> = Vec::new();
+    for p in sp..=ep {
+        let para = cell_para(doc, cid, p)?;
+        let full: String = para.runs.iter().map(|r| r.text.as_str()).collect();
+        let a = if p == sp { so } else { 0 };
+        let b = if p == ep { eo } else { full.len() };
+        if a > b || b > full.len() || !full.is_char_boundary(a) || !full.is_char_boundary(b) {
+            return Err(format!("段落 {p} 的区间 [{a},{b}) 非法"));
+        }
+        parts.push(full[a..b].to_string());
+    }
+    Ok(parts.join("\n"))
+}
+
+/// 取单元格内选区文本。失败返回 null。用 roe_free_string 释放。
+#[no_mangle]
+pub extern "C" fn roe_cell_get_text(handle_val: u64, cid: u32, sp: u32, so: u32, ep: u32, eo: u32) -> *mut c_char {
+    let r = handle::with_entry(handle_val, |entry| -> Result<String, String> {
+        let RoeDocument::Writer(doc) = &entry.doc else { return Err("非 Writer 文档".to_string()); };
+        get_text_in_doc(doc, cid, sp as usize, so as usize, ep as usize, eo as usize)
+    });
+    match r {
+        None => { set_last_error("roe_cell_get_text: 无效句柄"); std::ptr::null_mut() }
+        Some(Err(m)) => { set_last_error(format!("roe_cell_get_text: {m}")); std::ptr::null_mut() }
+        Some(Ok(t)) => CString::new(t.replace('\0', "")).map(|c| c.into_raw()).unwrap_or(std::ptr::null_mut()),
+    }
+}
+
+#[cfg(test)]
+mod cell_text_tests {
+    use super::*;
+    use roe_model::common::{Color, StyleRef, Table, TableCell, TableRow};
+
+    fn para(t: &str) -> CellContent {
+        CellContent::Paragraph(Paragraph {
+            style: StyleRef("Default".into()),
+            runs: vec![Run { text: t.to_string(), ..Default::default() }],
+            ..Default::default()
+        })
+    }
+
+    fn doc() -> WriterDocument {
+        let black = Some(Color { r: 0, g: 0, b: 0, a: 255 });
+        let cell = TableCell {
+            content: vec![para("hello"), para("世界ab")],
+            col_span: 1, row_span: 1, style: None, hidden: false, bg_color: None,
+            border_color: None, border_width: None,
+            pad_left: None, pad_right: None, pad_top: None, pad_bottom: None,
+        };
+        let table = Table {
+            float_pos: None, col_widths: vec![100.0], style_id: None,
+            first_row: false, first_col: false, last_row: false, last_col: false,
+            band_row: false, band_col: false,
+            default_border_color: black, default_border_width: Some(0.5),
+            inside_h_color: black, inside_h_width: Some(0.5),
+            inside_v_color: black, inside_v_width: Some(0.5),
+            rows: vec![TableRow { cells: vec![cell], row_height: None }],
+        };
+        let mut d = WriterDocument::default();
+        d.body = vec![BodyElement::Table(table)];
+        d
+    }
+
+    #[test]
+    fn get_text_within_and_across_paragraphs() {
+        let d = doc();
+        assert_eq!(get_text_in_doc(&d, 0, 0, 1, 0, 4).unwrap(), "ell");
+        assert_eq!(get_text_in_doc(&d, 0, 0, 2, 1, 6).unwrap(), "llo\n世界");
+        assert_eq!(get_text_in_doc(&d, 0, 1, 6, 0, 2).unwrap(), "llo\n世界");
+    }
+
+    #[test]
+    fn get_text_errors() {
+        let d = doc();
+        assert!(get_text_in_doc(&d, 0, 1, 1, 1, 2).is_err());
+        assert!(get_text_in_doc(&d, 0, 0, 0, 0, 99).is_err());
+        assert!(get_text_in_doc(&d, 0, 0, 0, 5, 0).is_err());
+    }
+}
+
+
+// ───────── v309: 多单元格矩形清空 / 取 TSV ─────────
+fn cell_rect(doc: &WriterDocument, a: u32, b: u32) -> Result<(usize, usize, usize, usize, usize), String> {
+    let (ta, ra, ca) = split_cid(a);
+    let (tb, rb, cb) = split_cid(b);
+    if ta != tb {
+        return Err("两个单元格不在同一张表".to_string());
+    }
+    if !matches!(doc.body.get(ta), Some(BodyElement::Table(_))) {
+        return Err(format!("body[{ta}] 不是表格"));
+    }
+    Ok((ta, ra.min(rb), ra.max(rb), ca.min(cb), ca.max(cb)))
+}
+
+/// 清空矩形内所有格：每格保留第一个段落（清空文字），多余段落删除，图片/嵌套表格不动。
+/// 被合并隐藏的格跳过。返回处理的格数。
+pub fn clear_cell_range_in_doc(doc: &mut WriterDocument, a: u32, b: u32) -> Result<usize, String> {
+    let (t, r1, r2, c1, c2) = cell_rect(doc, a, b)?;
+    let Some(BodyElement::Table(tbl)) = doc.body.get_mut(t) else {
+        return Err("不是表格".to_string());
+    };
+    let mut n = 0usize;
+    for r in r1..=r2 {
+        let Some(row) = tbl.rows.get_mut(r) else { continue };
+        for c in c1..=c2 {
+            let Some(cell) = row.cells.get_mut(c) else { continue };
+            if cell.hidden { continue; }
+            let mut seen = false;
+            cell.content.retain(|x| match x {
+                CellContent::Paragraph(_) => {
+                    if seen { false } else { seen = true; true }
+                }
+                _ => true,
+            });
+            for x in cell.content.iter_mut() {
+                if let CellContent::Paragraph(p) = x {
+                    p.runs.clear();
+                    break;
+                }
+            }
+            n += 1;
+        }
+    }
+    Ok(n)
+}
+
+/// 矩形内文字，格间 \t，行间 \n；格内换行折成空格；隐藏格输出空串。
+pub fn cell_range_tsv_in_doc(doc: &WriterDocument, a: u32, b: u32) -> Result<String, String> {
+    let (t, r1, r2, c1, c2) = cell_rect(doc, a, b)?;
+    let Some(BodyElement::Table(tbl)) = doc.body.get(t) else {
+        return Err("不是表格".to_string());
+    };
+    let mut lines: Vec<String> = Vec::new();
+    for r in r1..=r2 {
+        let mut cols: Vec<String> = Vec::new();
+        for c in c1..=c2 {
+            let txt = match tbl.rows.get(r).and_then(|row| row.cells.get(c)) {
+                Some(cell) if !cell.hidden => {
+                    let parts: Vec<String> = cell.content.iter().filter_map(|x| match x {
+                        CellContent::Paragraph(p) => Some(p.runs.iter().map(|r| r.text.as_str()).collect::<String>()),
+                        _ => None,
+                    }).collect();
+                    parts.join(" ").replace(['\t', '\n', '\r'], " ")
+                }
+                _ => String::new(),
+            };
+            cols.push(txt);
+        }
+        lines.push(cols.join("\t"));
+    }
+    Ok(lines.join("\n"))
+}
+
+/// 清空 cid_a、cid_b 围成的矩形内所有单元格，一次撤销。成功返回 {"ok":true,"cells":N}。
+#[no_mangle]
+pub extern "C" fn roe_cell_clear_range(handle_val: u64, cid_a: u32, cid_b: u32) -> *mut c_char {
+    let r = handle::with_entry(handle_val, |entry| -> Result<String, String> {
+        if !matches!(&entry.doc, RoeDocument::Writer(_)) { return Err("非 Writer 文档".to_string()); }
+        let prev = entry.doc.clone();
+        let RoeDocument::Writer(doc) = &mut entry.doc else { return Err("非 Writer 文档".to_string()); };
+        let n = clear_cell_range_in_doc(doc, cid_a, cid_b)?;
+        entry.push_undo_snapshot(prev, handle::EditCursorContext::at(split_cid(cid_a).0, 0));
+        Ok(format!("{{\"ok\":true,\"cells\":{}}}", n))
+    });
+    if matches!(&r, Some(Ok(_))) {
+        handle::invalidate_writer_layout_cache(handle_val);
+    }
+    finish(handle_val, r, "roe_cell_clear_range")
+}
+
+/// 取矩形内文字（TSV）。失败返回 null，用 roe_free_string 释放。
+#[no_mangle]
+pub extern "C" fn roe_cell_range_tsv(handle_val: u64, cid_a: u32, cid_b: u32) -> *mut c_char {
+    let r = handle::with_entry(handle_val, |entry| -> Result<String, String> {
+        let RoeDocument::Writer(doc) = &entry.doc else { return Err("非 Writer 文档".to_string()); };
+        cell_range_tsv_in_doc(doc, cid_a, cid_b)
+    });
+    match r {
+        None => { set_last_error("roe_cell_range_tsv: 无效句柄"); std::ptr::null_mut() }
+        Some(Err(m)) => { set_last_error(format!("roe_cell_range_tsv: {m}")); std::ptr::null_mut() }
+        Some(Ok(t)) => CString::new(t.replace('\0', "")).map(|c| c.into_raw()).unwrap_or(std::ptr::null_mut()),
+    }
+}
+
+#[cfg(test)]
+mod cell_range_tests {
+    use super::*;
+    use roe_model::common::{Color, StyleRef, Table, TableCell, TableRow};
+
+    fn para(t: &str) -> CellContent {
+        CellContent::Paragraph(Paragraph {
+            style: StyleRef("Default".into()),
+            runs: vec![Run { text: t.to_string(), ..Default::default() }],
+            ..Default::default()
+        })
+    }
+
+    fn cell(paras: &[&str], hidden: bool) -> TableCell {
+        TableCell {
+            content: paras.iter().map(|t| para(t)).collect(),
+            col_span: 1, row_span: 1, style: None, hidden, bg_color: None,
+            border_color: None, border_width: None,
+            pad_left: None, pad_right: None, pad_top: None, pad_bottom: None,
+        }
+    }
+
+    fn doc() -> WriterDocument {
+        let black = Some(Color { r: 0, g: 0, b: 0, a: 255 });
+        let table = Table {
+            float_pos: None, col_widths: vec![100.0, 100.0], style_id: None,
+            first_row: false, first_col: false, last_row: false, last_col: false,
+            band_row: false, band_col: false,
+            default_border_color: black, default_border_width: Some(0.5),
+            inside_h_color: black, inside_h_width: Some(0.5),
+            inside_v_color: black, inside_v_width: Some(0.5),
+            rows: vec![
+                TableRow { cells: vec![cell(&["a1", "a2"], false), cell(&["b"], false)], row_height: None },
+                TableRow { cells: vec![cell(&["c"], false), cell(&["d"], false)], row_height: None },
+            ],
+        };
+        let mut d = WriterDocument::default();
+        d.body.push(BodyElement::Table(table));
+        d
+    }
+
+    fn cid(r: u32, c: u32) -> u32 { r * 64 + c }
+
+    #[test]
+    fn tsv_of_rect() {
+        let d = doc();
+        assert_eq!(cell_range_tsv_in_doc(&d, cid(0, 0), cid(1, 1)).unwrap(), "a1 a2\tb\nc\td");
+        assert_eq!(cell_range_tsv_in_doc(&d, cid(1, 1), cid(0, 0)).unwrap(), "a1 a2\tb\nc\td");
+        assert_eq!(cell_range_tsv_in_doc(&d, cid(0, 1), cid(1, 1)).unwrap(), "b\nd");
+    }
+
+    #[test]
+    fn clear_rect_keeps_one_empty_paragraph() {
+        let mut d = doc();
+        let n = clear_cell_range_in_doc(&mut d, cid(0, 0), cid(0, 1)).unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(cell_range_tsv_in_doc(&d, cid(0, 0), cid(1, 1)).unwrap(), "\t\nc\td");
+        let BodyElement::Table(t) = &d.body[0] else { panic!() };
+        assert_eq!(t.rows[0].cells[0].content.len(), 1);
+    }
+
+    #[test]
+    fn hidden_cell_skipped_and_other_table_rejected() {
+        let mut d = doc();
+        if let BodyElement::Table(t) = &mut d.body[0] { t.rows[1].cells[1].hidden = true; }
+        let n = clear_cell_range_in_doc(&mut d, cid(1, 0), cid(1, 1)).unwrap();
+        assert_eq!(n, 1);
+        assert!(clear_cell_range_in_doc(&mut d, cid(0, 0), (1 << 16) | cid(0, 0)).is_err());
+    }
+}

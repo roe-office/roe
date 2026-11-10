@@ -291,7 +291,7 @@ fn chart_to_xml_impl(m: &ChartModel, r: Refs) -> String {
                 axes.push_str(&val_ax(AX2, AX1, "l", yl, m.show_grid, pct));
             }
         }
-        ChartKind::Line => {
+        ChartKind::Line | ChartKind::Stock => {
             plot.push_str(&format!(
                 "<c:lineChart><c:grouping val=\"{g_line}\"/><c:varyColors val=\"0\"/>{}{dl}<c:marker val=\"1\"/>{ids}</c:lineChart>",
                 sers("line", &all, &labs, r)
@@ -349,7 +349,14 @@ fn chart_to_xml_impl(m: &ChartModel, r: Refs) -> String {
         _ => "<c:autoTitleDeleted val=\"1\"/>".to_string(),
     };
     let legend = if m.show_legend {
-        let pos = if matches!(m.kind, ChartKind::Pie | ChartKind::Doughnut) { "r" } else { "b" };
+        use roe_model::impress::LegendPos;
+        let pos = match m.legend_pos {
+            Some(LegendPos::Top) => "t",
+            Some(LegendPos::Bottom) => "b",
+            Some(LegendPos::Left) => "l",
+            Some(LegendPos::Right) => "r",
+            None => if matches!(m.kind, ChartKind::Pie | ChartKind::Doughnut) { "r" } else { "b" },
+        };
         format!("<c:legend><c:legendPos val=\"{pos}\"/><c:overlay val=\"0\"/></c:legend>")
     } else {
         String::new()
@@ -365,4 +372,40 @@ fn chart_to_xml_impl(m: &ChartModel, r: Refs) -> String {
 <c:chartSpace xmlns:c=\"http://schemas.openxmlformats.org/drawingml/2006/chart\" xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">\
 <c:roundedCorners val=\"0\"/><c:chart>{title}<c:plotArea>{plot}</c:plotArea>{legend}<c:plotVisOnly val=\"1\"/><c:dispBlanksAs val=\"gap\"/></c:chart>{border}</c:chartSpace>"
     )
+}
+
+#[cfg(test)]
+mod legend_pos_tests {
+    use super::*;
+    use roe_model::impress::LegendPos;
+    use std::collections::HashMap;
+
+    fn model(kind: &str, pos: Option<&str>) -> ChartModel {
+        let mut v = serde_json::json!({
+            "kind": kind, "title": "T", "x_labels": ["a", "b"],
+            "series": [{"name": "S", "data": [1.0, 2.0]}], "show_legend": true
+        });
+        if let Some(p) = pos { v["legend_pos"] = serde_json::json!(p); }
+        serde_json::from_value(v).unwrap()
+    }
+
+    #[test]
+    fn writes_explicit_pos_and_keeps_old_defaults() {
+        for (p, want) in [("Top", "t"), ("Bottom", "b"), ("Left", "l"), ("Right", "r")] {
+            let xml = chart_to_xml(&model("Bar", Some(p)));
+            assert!(xml.contains(&format!("<c:legendPos val=\"{want}\"/>")), "{p}");
+        }
+        assert!(chart_to_xml(&model("Bar", None)).contains("<c:legendPos val=\"b\"/>"));
+        assert!(chart_to_xml(&model("Pie", None)).contains("<c:legendPos val=\"r\"/>"));
+    }
+
+    #[test]
+    fn legend_pos_roundtrip() {
+        for (p, want) in [("Left", LegendPos::Left), ("Right", LegendPos::Right), ("Top", LegendPos::Top), ("Bottom", LegendPos::Bottom)] {
+            let xml = chart_to_xml(&model("Line", Some(p)));
+            let back = crate::ooxml::chart_common::parse_ooxml_chart_xml(&xml, &HashMap::new(), &HashMap::new())
+                .expect("parse back");
+            assert_eq!(back.legend_pos, Some(want), "{p}");
+        }
+    }
 }

@@ -203,6 +203,24 @@ impl FontRegistry {
             let blob = parley::fontique::Blob::new(std::sync::Arc::new(font_bytes.to_vec()));
             self.font_context.collection.register_fonts(blob, None);
         }
+        // 项目符号专用字体（ROE 自绘，见 tools/gen_roe_symbols.py）。挂在这里
+        // 是因为所有构造路径都会经过本函数，两套注册表（cosmic-text / Parley）一并加载。
+        self.load_roe_symbols();
+    }
+
+    /// 加载 ROE 自带的项目符号字体（族名 "ROE Symbols"，约 1.4KB）。
+    /// 覆盖 • ● ○ ■ ▪ ◼ – ✓，宽度和视觉大小统一，不依赖系统字体。
+    pub fn load_roe_symbols(&mut self) {
+        const ROE_SYMBOLS: &[u8] = include_bytes!("../assets/roe_symbols/ROESymbols.ttf");
+        self.font_system.db_mut().load_font_data(ROE_SYMBOLS.to_vec());
+        let blob = parley::fontique::Blob::new(std::sync::Arc::new(ROE_SYMBOLS.to_vec()));
+        self.font_context.collection.register_fonts(blob, None);
+        // OpenSymbol（LibreOffice 的项目符号字体，临时采用；许可证待确认，
+        // 见 roe-writer/assets/roe_symbols/README.md）。族名 "OpenSymbol"。
+        const OPEN_SYMBOL: &[u8] = include_bytes!("../assets/roe_symbols/opens___.ttf");
+        self.font_system.db_mut().load_font_data(OPEN_SYMBOL.to_vec());
+        let blob2 = parley::fontique::Blob::new(std::sync::Arc::new(OPEN_SYMBOL.to_vec()));
+        self.font_context.collection.register_fonts(blob2, None);
     }
 
     /// 统一入口：构造一个已加载19个KaTeX字体的 parley::FontContext，

@@ -56,7 +56,8 @@ fn build_formula(latex: &str, font_pt: f32) -> Result<Formula, String> {
 /// 在段落全文字节偏移 char_offset 处插入一个公式 run，返回新 run 的下标。
 /// 公式 run 的 text 恒为空串，不影响现有偏移体系。
 fn insert_formula_run(para: &mut Paragraph, char_offset: usize, formula: Formula) -> Result<usize, String> {
-    let new_run = Run { formula: Some(formula), ..Default::default() };
+    // U+FFFC 占位：公式在段落文字里占 3 字节，光标才能区分公式前后
+    let new_run = Run { text: "\u{FFFC}".to_string(), formula: Some(formula), ..Default::default() };
 
     if para.runs.is_empty() {
         if char_offset != 0 {
@@ -260,8 +261,8 @@ fn insert_in_entry(
     };
     entry.push_undo_snapshot(prev, handle::EditCursorContext::at(para_index, char_offset));
     Ok(format!(
-        "{{\"para_index\":{},\"run_idx\":{},\"char_offset\":{}}}",
-        para_index, run_idx, char_offset
+        "{{\"para_index\":{},\"run_idx\":{},\"char_offset\":{},\"after_offset\":{}}}",
+        para_index, run_idx, char_offset, char_offset + 3
     ))
 }
 
@@ -390,6 +391,51 @@ pub extern "C" fn roe_formula_hit_test(handle: u64, x: f64, y: f64) -> *mut c_ch
     finish("roe_formula_hit_test", handle, result, false)
 }
 
+/// 编辑后规范化公式 Run：公式 Run 的 text 必须恰为 U+FFFC。
+/// - text 里占位符前后混入的文字，拆成独立的普通 Run；
+/// - 占位符已被删除的公式 Run 整个移除（旧存档里 text 为空的公式 Run 需在加载时先补占位符）。
+pub(crate) fn normalize_formula_runs(para: &mut Paragraph) {
+    const OBJ: &str = "\u{FFFC}";
+    let old: Vec<Run> = std::mem::take(&mut para.runs);
+    let mut out: Vec<Run> = Vec::with_capacity(old.len());
+    for run in old {
+        if run.formula.is_none() || run.text == OBJ {
+            out.push(run);
+            continue;
+        }
+        let plain = |t: &str, base: &Run| {
+            let mut r = base.clone();
+            r.formula = None;
+            r.text = t.to_string();
+            r.comment_range_start.clear();
+            r.comment_range_end.clear();
+            r
+        };
+        let text = run.text.clone();
+        match text.find(OBJ) {
+            Some(i) => {
+                let before = &text[..i];
+                let after = &text[i + OBJ.len()..];
+                if !before.is_empty() { out.push(plain(before, &run)); }
+                let mut f = run.clone();
+                f.text = OBJ.to_string();
+                out.push(f);
+                if !after.is_empty() { out.push(plain(after, &run)); }
+            }
+            None if text.is_empty() => {
+                // 旧存档：公式 Run 的 text 为空，补占位符而不是删除
+                let mut f = run.clone();
+                f.text = OBJ.to_string();
+                out.push(f);
+            }
+            None => {
+                out.push(plain(&text, &run));
+            }
+        }
+    }
+    para.runs = out;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -442,6 +488,34 @@ mod tests {
         let mut s = Paragraph::default();
         s.runs.push(text_run("abcd"));
         assert!(insert_formula_run(&mut s, 9, build_formula("y", 10.5).unwrap()).is_err());
+    }
+
+    #[test]
+    fn normalize_splits_and_removes() {
+        let mut p = Paragraph::default();
+        p.runs.push(text_run("ab"));
+        p.runs.push(Run { text: "\u{FFFC}world".to_string(), formula: Some(build_formula("y", 10.5).unwrap()), ..Default::default() });
+        p.runs.push(Run { text: String::new(), formula: Some(build_formula("z", 10.5).unwrap()), ..Default::default() });
+        normalize_formula_runs(&mut p);
+        assert_eq!(p.runs.len(), 4);
+        assert_eq!(p.runs[3].text, "\u{FFFC}");
+        assert_eq!(p.runs[1].text, "\u{FFFC}");
+        assert!(p.runs[1].formula.is_some());
+        assert_eq!(p.runs[2].text, "world");
+        assert!(p.runs[2].formula.is_none());
+    }
+
+    #[test]
+    fn formula_run_occupies_three_bytes() {
+        let mut p = Paragraph::default();
+        p.runs.push(text_run("abcd"));
+        insert_formula_run(&mut p, 4, build_formula("y", 10.5).unwrap()).unwrap();
+        assert_eq!(p.runs[1].text, "\u{FFFC}");
+        // 公式之后（偏移 7）可再插入，落在公式 Run 之后
+        let idx = insert_formula_run(&mut p, 7, build_formula("z", 10.5).unwrap()).unwrap();
+        assert_eq!(idx, 2);
+        // 公式占位符 3 字节内部不可插入
+        assert!(insert_formula_run(&mut p, 5, build_formula("w", 10.5).unwrap()).is_err());
     }
 }
 

@@ -150,7 +150,16 @@ fn query_selection_rects_in_entry(
             // 非段落元素（比如表格）本次不支持选区几何，跳过而不是报错
             // ——选区可能横跨"段落+表格+段落"，表格部分本次没有行数据
             // 可产出矩形，静默跳过好过整体失败。
-            _ => continue,
+            _ => {
+                // v302：选区中间的整块元素（表格）出整格矩形，与复制时带走表格一致
+                if para_index > from_para && para_index < to_para {
+                    if let Some(layout) = entry.writer_layout_cache.as_ref() {
+                        rects.extend(table_rects(&layout.arena, para_index));
+                        rects.extend(object_rects(&doc.body, &layout.arena, para_index));
+                    }
+                }
+                continue;
+            }
         };
         let resolved = resolve_para_style(doc, para, default_font_size);
 
@@ -177,7 +186,11 @@ fn query_selection_rects_in_entry(
         for &fid in &chain {
             let frame = &arena.frames[fid];
             let page = &arena.pages[frame.page];
-            let content_width = page.content_width();
+            // 分栏：栏偏移用于文字起点，栏宽用于"铺满到行尾"，与 tile.rs 渲染一致；单栏时不变
+            let col_x_offset = page.columns.col_x_offsets
+                .get(frame.column_index).copied().unwrap_or(0.0);
+            let content_width = page.columns.col_widths
+                .get(frame.column_index).copied().unwrap_or_else(|| page.content_width());
             let page_idx = arena.page_order.iter().position(|&pid| pid == frame.page).unwrap_or(0);
             let is_last_frame_in_chain = fid == last_fid_in_chain;
 
@@ -227,7 +240,7 @@ fn query_selection_rects_in_entry(
                     // x 必须是"文档全局坐标"（含 margin_left + text_x_offset），
                     // 不能是行内相对坐标。此前这里只返回 x_in_line，导致选区
                     // 矩形系统性偏左约 margin_left 的量，与光标坐标系不一致。
-                    let line_abs_x_start = page.margin_left + line.text_x_offset;
+                    let line_abs_x_start = page.margin_left + col_x_offset + line.text_x_offset;
 
                     // 本行是否需要裁剪起点/终点（首尾行精确到字符，
                     // 中间行用整行宽度，不重新 shape）。
@@ -297,6 +310,37 @@ fn query_selection_rects_in_entry(
                         (line_abs_x_start, line_abs_x_start + (content_width - line.text_x_offset).max(0.0))
                     };
 
+                    // 列表符号修复：DOCX 列表（self_labeled 路径）的符号是首行 run 里的真实文字，
+                    // 首行 text_x_offset 为负悬挂，选区会从符号左侧开始。首行起点钳到正文起点
+                    // （line.x_offset = margin_left，与续行一致）。仅对段落首行、带 list_info 且
+                    // list_styles 查不到的段落生效，普通悬挂缩进段落不受影响。
+                    let is_self_labeled_list = para.list_info.as_ref().map_or(false, |li| {
+                        doc.styles.list_styles.get(&li.style_name)
+                            .and_then(|ls| ls.level(li.level))
+                            .is_none()
+                    });
+                    // 符号 run 是段落第一个 run，文字形如 "● " 或 "1. "（以空格结尾、很短）。
+                    // 用它的字节长度量出符号实际宽度，选区起点钳到符号之后，与光标测宽函数一致。
+                    let sym_len = para.runs.first()
+                        .filter(|r| r.text.ends_with(' ') && r.text.chars().count() <= 8)
+                        .map(|r| r.text.len())
+                        .unwrap_or(0)
+                        .min(line_len);
+                    let x0 = if is_self_labeled_list && line_start_in_para == 0 && sym_len > 0 {
+                        let registry = entry
+                            .writer_font_registry
+                            .as_mut()
+                            .ok_or_else(|| "writer_font_registry 未建立（内部错误）".to_string())?;
+                        let sym_x = line_abs_x_start + char_offset_to_x(
+                            registry, &line.text, &line.runs,
+                            resolved.font_size, resolved.bold, resolved.italic,
+                            sym_len,
+                        );
+                        x0.max(sym_x)
+                    } else {
+                        x0
+                    };
+
                     let w = (x1 - x0).max(0.0);
                     rects.push(format!(
                         "{{\"page_idx\":{},\"x\":{:.2},\"y\":{:.2},\"w\":{:.2},\"h\":{:.2}}}",
@@ -314,6 +358,73 @@ fn query_selection_rects_in_entry(
     }
 
     Ok(format!("[{}]", rects.join(",")))
+}
+
+/// v302：独立 body 元素（图片、图表）的外框矩形；浮动的 Shape、Frame 不处理。
+fn object_rects(
+    body: &[BodyElement],
+    arena: &roe_writer::frame::FrameArena,
+    idx: usize,
+) -> Vec<String> {
+    let (w, h) = match body.get(idx) {
+        Some(BodyElement::Image(img)) => (img.width_pt, img.height_pt),
+        Some(BodyElement::InlineChart { width_pt, height_pt, .. }) => (*width_pt, *height_pt),
+        Some(BodyElement::InlineStatChart { width_pt, height_pt, .. }) => (*width_pt, *height_pt),
+        _ => return Vec::new(),
+    };
+    let mut out: Vec<String> = Vec::new();
+    for (page_idx, &pid) in arena.page_order.iter().enumerate() {
+        for &fid in arena.pages[pid].frames.iter() {
+            let f = &arena.frames[fid];
+            if f.para_index != idx {
+                continue;
+            }
+            let roe_writer::frame::FrameContent::Paragraph(ls) = &f.content else {
+                continue;
+            };
+            if !ls.is_empty() {
+                continue;
+            }
+            out.push(format!(
+                "{{\"page_idx\":{},\"x\":{:.2},\"y\":{:.2},\"w\":{:.2},\"h\":{:.2}}}",
+                page_idx,
+                arena.pages[f.page].margin_left,
+                f.y_on_page,
+                w,
+                h
+            ));
+        }
+    }
+    out
+}
+
+/// v302：整张表（body 下标 table_idx）所有单元格的页内矩形，格式同选区矩形。
+fn table_rects(arena: &roe_writer::frame::FrameArena, table_idx: usize) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for (page_idx, &pid) in arena.page_order.iter().enumerate() {
+        for &fid in arena.pages[pid].frames.iter() {
+            let f = &arena.frames[fid];
+            if f.para_index != table_idx {
+                continue;
+            }
+            let roe_writer::frame::FrameContent::TableRow(cells) = &f.content else {
+                continue;
+            };
+            let margin_left = arena.pages[f.page].margin_left;
+            let h = f.height();
+            for cell in cells.iter() {
+                out.push(format!(
+                    "{{\"page_idx\":{},\"x\":{:.2},\"y\":{:.2},\"w\":{:.2},\"h\":{:.2}}}",
+                    page_idx,
+                    margin_left + cell.x_offset,
+                    f.y_on_page,
+                    cell.cell_width,
+                    h
+                ));
+            }
+        }
+    }
+    out
 }
 
 fn frame_text_len(arena: &roe_writer::frame::FrameArena, fid: FrameId) -> usize {

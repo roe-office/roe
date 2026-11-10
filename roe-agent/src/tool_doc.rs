@@ -199,7 +199,7 @@ pub struct SaveDocumentArgs {
 
 #[derive(Debug, Serialize)]
 pub struct SaveDocumentOutput {
-    /// 产物的虚拟路径,如 /exports/报表.xlsx。重名时自动加序号,不会覆盖旧文件。
+    /// 产物的虚拟路径,如 /exports/报表.xlsx。文件名自动带日期和版本号(如 报表_1105_v1.xlsx),不会覆盖旧文件。
     pub virtual_path: String,
     pub kind: DocKind,
     pub size_bytes: u64,
@@ -216,7 +216,16 @@ impl SaveDocumentTool {
     }
 
     pub async fn run(&self, args: SaveDocumentArgs) -> Result<SaveDocumentOutput, DocToolError> {
-        let saved = self.worker.save_document().await.map_err(m)?;
+        self.run_for(args, None).await
+    }
+
+    /// doc: 目标文档 id(None = 当前文档)。MCP 层用;GUI 的 Tool 接口不变。
+    pub async fn run_for(
+        &self,
+        args: SaveDocumentArgs,
+        doc: Option<String>,
+    ) -> Result<SaveDocumentOutput, DocToolError> {
+        let saved = self.worker.save_document_of(doc).await.map_err(m)?;
         let stem = file_stem(args.name.as_deref().unwrap_or(&saved.name));
         let file_name = format!("{stem}.{}", saved.kind.ext());
         let virtual_path = self.workspace.write_file(EXPORTS_DIR, &file_name, &saved.bytes).map_err(m)?;
@@ -233,7 +242,7 @@ impl Tool for SaveDocumentTool {
     fn description(&self) -> String {
         "把当前文档保存到工作区的 /exports/,返回产物的虚拟路径。扩展名按文档类型自动确定\
          (表格 xlsx、文字文档 docx、演示文稿 pptx),name 里写的扩展名会被忽略。\
-         重名自动加序号,不会覆盖已有文件。任务完成后必须保存,并把返回的路径告诉用户。"
+         文件名自动带日期和版本号(如 报表_1105_v1.xlsx),再次保存版本号递增,不会覆盖已有文件。任务完成后必须保存,并把返回的路径告诉用户。"
             .to_string()
     }
 
@@ -267,8 +276,13 @@ impl CloseDocumentTool {
         Self { worker }
     }
 
-    pub async fn run(&self, _args: CloseDocumentArgs) -> Result<DocSummary, DocToolError> {
-        self.worker.close_current().await.map_err(m)
+    pub async fn run(&self, args: CloseDocumentArgs) -> Result<DocSummary, DocToolError> {
+        self.run_for(args, None).await
+    }
+
+    /// doc: 目标文档 id(None = 当前文档)。
+    pub async fn run_for(&self, _args: CloseDocumentArgs, doc: Option<String>) -> Result<DocSummary, DocToolError> {
+        self.worker.close_document_of(doc).await.map_err(m)
     }
 }
 
@@ -409,15 +423,15 @@ mod tests {
         w.execute(r#"set_cell(0, 0, 0, "42")"#.into()).await.unwrap();
 
         let out = save_t.run(SaveDocumentArgs { name: None }).await.unwrap();
-        assert_eq!(out.virtual_path, "/exports/销售.xlsx");
+        assert!(out.virtual_path.starts_with("/exports/销售_") && out.virtual_path.ends_with("_v1.xlsx"), "{}", out.virtual_path);
         assert_eq!(out.kind, DocKind::Calc);
         assert!(out.size_bytes > 100);
         // 再存一次:不覆盖,加序号
         let out2 = save_t.run(SaveDocumentArgs { name: Some("销售".into()) }).await.unwrap();
-        assert_eq!(out2.virtual_path, "/exports/销售 (1).xlsx");
+        assert!(out2.virtual_path.starts_with("/exports/销售_") && out2.virtual_path.ends_with("_v2.xlsx"), "{}", out2.virtual_path);
         // 模型给了错的扩展名:被替换
         let out3 = save_t.run(SaveDocumentArgs { name: Some("x.docx".into()) }).await.unwrap();
-        assert_eq!(out3.virtual_path, "/exports/x.xlsx");
+        assert!(out3.virtual_path.starts_with("/exports/x_") && out3.virtual_path.ends_with("_v1.xlsx"), "{}", out3.virtual_path);
 
         close_t.run(CloseDocumentArgs {}).await.unwrap();
         assert!(w.list_documents().await.unwrap().is_empty());
@@ -453,7 +467,7 @@ mod tests {
         let s = open_t.run(OpenDocumentArgs { path: "/inputs/d.csv".into() }).await.unwrap();
         assert_eq!(s.kind, DocKind::Calc);
         let out = save_t.run(SaveDocumentArgs { name: None }).await.unwrap();
-        assert_eq!(out.virtual_path, "/exports/d.xlsx");
+        assert!(out.virtual_path.starts_with("/exports/d_") && out.virtual_path.ends_with("_v1.xlsx"), "{}", out.virtual_path);
     }
 
     #[tokio::test]

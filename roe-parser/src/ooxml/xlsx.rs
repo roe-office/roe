@@ -57,7 +57,7 @@ impl XlsxParser {
 
         // 4. 逐张 worksheet 解析
         let mut sheets = Vec::with_capacity(sheet_refs.len());
-        let mut pivot_pending: Vec<(usize, Option<String>, crate::ooxml::pivot::PivotConfigExtract, Option<String>, Option<String>, Option<String>)> = Vec::new();
+        let mut pivot_pending: Vec<(usize, Option<String>, crate::ooxml::pivot::PivotConfigExtract, Option<String>, Option<String>, Option<String>, Option<roe_model::calc::PivotLayoutMode>, bool)> = Vec::new();
         // chartEx 统计图:循环内只收集,全部 sheet 读完后再回填数据(支持跨 sheet 引用)
         let mut stat_pending: Vec<(usize, String, i64, i64, i64, i64)> = Vec::new();
         for sr in &sheet_refs {
@@ -217,7 +217,9 @@ impl XlsxParser {
                     let (field_names, _cache_fields, data_source_sheet, data_source_ref) = crate::ooxml::pivot::parse_cache_definition_full(&cache_xml);
                     let (pt_name, pt_style) = crate::ooxml::pivot::parse_pivot_table_info(&pivot_xml);
                     if let Some(cfg_extract) = crate::ooxml::pivot::extract_pivot_config(&pivot_xml, &field_names) {
-                        pivot_pending.push((sheets.len(), data_source_sheet, cfg_extract, data_source_ref, pt_name, pt_style));
+                        let pt_layout = crate::ooxml::pivot::parse_pivot_layout(&pivot_xml);
+                        let pt_sub_bottom = crate::ooxml::pivot::parse_pivot_subtotals_bottom(&pivot_xml);
+                        pivot_pending.push((sheets.len(), data_source_sheet, cfg_extract, data_source_ref, pt_name, pt_style, pt_layout, pt_sub_bottom));
                     }
                     break; // 每个 sheet 只处理第一个 pivotTable
                 }
@@ -304,7 +306,7 @@ impl XlsxParser {
         // 索引），避免产生更隐蔽的数据错误。多透视表场景的支持留待
         // 后续升级（需要重新设计索引管理，比如逆序处理或改用稳定
         // 标识而非位置索引）。
-        if let Some((pivot_sheet_idx, data_source_sheet_name, cfg_extract, pv_source_ref, pv_name, pv_style)) = pivot_pending.into_iter().next() {
+        if let Some((pivot_sheet_idx, data_source_sheet_name, cfg_extract, pv_source_ref, pv_name, pv_style, pv_layout, pv_sub_bottom)) = pivot_pending.into_iter().next() {
             if let Some(source_name) = data_source_sheet_name {
                 if let Some(source_idx) = wb.sheets.iter().position(|s| s.name == source_name) {
                     // xlsx dataField subtotal 命名 -> ROE 内部聚合命名映射
@@ -339,6 +341,14 @@ impl XlsxParser {
                     if let Ok(new_idx) = roe_polars_bridge::pivot_sheet_into_workbook_v2(
                         &mut wb, source_idx, &cfg, "__pivot_pathB_tmp__".to_string(),
                     ) {
+                        if let Some(mode) = pv_layout.clone() {
+                            // 重建后按文件声明的布局就地切换(重算 data_col_start/last_col 并重新物化);失败保持默认
+                            let _ = roe_polars_bridge::pivot_set_layout_in_place(&mut wb, new_idx, mode);
+                        }
+                        if pv_sub_bottom {
+                            // 小计在组底:只存在于 parser 读取结果里,重建后必须显式回灌;失败保持默认(在上)
+                            let _ = roe_polars_bridge::pivot_set_subtotals_position_in_place(&mut wb, new_idx, false);
+                        }
                         let mut taken_pivot = wb.sheets[new_idx].pivot.take();
                         if let Some(m) = taken_pivot.as_mut() {
                             m.source_ref = pv_source_ref.clone();
@@ -828,7 +838,9 @@ fn read_worksheet<R: Read + std::io::Seek>(
     let mut cur_f_shared_si: Option<u32> = None;
 
     loop {
-        match reader.read_event_into(&mut buf)? {
+        let ev_cur = reader.read_event_into(&mut buf)?;
+        let is_empty_evt = matches!(ev_cur, Event::Empty(_));
+        match ev_cur {
             Event::Start(e) | Event::Empty(e) => match e.name().as_ref() {
                 b"row" => {
                     let mut row_no: Option<u32> = None;
@@ -1270,6 +1282,16 @@ fn read_worksheet<R: Read + std::io::Seek>(
                                 cur_style = attr.unescape_value()?.parse().unwrap_or(0);
                             }
                             _ => {}
+                        }
+                    }
+                
+                    // v319: 自闭合 <c r=".." s=".."/> 只产生 Event::Empty,不会触发
+                    // Event::End(b"c"),原登记逻辑走不到,空格背景/边框样式丢失。
+                    if is_empty_evt && cur_style != 0 {
+                        let row0 = cur_row.saturating_sub(1);
+                        let col0 = cur_col.saturating_sub(1);
+                        if let Some(Some(fmt)) = style_formats.get(cur_style as usize) {
+                            cell_formats.insert((row0, col0), fmt.clone());
                         }
                     }
                 }
@@ -2025,16 +2047,14 @@ fn parse_table_xml(xml: &str) -> Option<roe_model::calc::Table> {
                                         header_col: mc.c1,
                                         end_col: mc.c2,
                                         col_filters: std::collections::HashMap::new(),
-                                        hidden_buttons: std::collections::HashSet::new(),
-                                    });
+                                        hidden_buttons: std::collections::HashSet::new(), other_filtered_cols: Default::default() });
                                 } else if let Some((r, c)) = parse_cell_ref(ref_str.split(':').next().unwrap_or("")) {
                                     auto_filter = Some(roe_model::calc::AutoFilter {
                                         header_row: r,
                                         header_col: c,
                                         end_col: c,
                                         col_filters: std::collections::HashMap::new(),
-                                        hidden_buttons: std::collections::HashSet::new(),
-                                    });
+                                        hidden_buttons: std::collections::HashSet::new(), other_filtered_cols: Default::default() });
                                 }
                             }
                         }
@@ -2186,6 +2206,7 @@ fn parse_autofilter_from_xml(xml: &str) -> Option<roe_model::calc::AutoFilter> {
     let mut end_col = 0u32;
     let mut col_filters: std::collections::HashMap<u32, Vec<String>> = std::collections::HashMap::new();
     let mut hidden_buttons: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    let mut other_filtered_cols: std::collections::HashSet<u32> = std::collections::HashSet::new();
 
     let mut cur_col_id: Option<u32> = None;
     let mut cur_filters: Vec<String> = Vec::new();
@@ -2248,6 +2269,10 @@ fn parse_autofilter_from_xml(xml: &str) -> Option<roe_model::calc::AutoFilter> {
                         }
                     }
                     b"filters" => { in_filters = true; }
+                    // v316 ROOT-082: 非值列表筛选也算"该列已筛选"
+                    b"dateGroupItem" | b"colorFilter" | b"customFilters" | b"top10" | b"dynamicFilter" => {
+                        if let Some(cid) = cur_col_id { other_filtered_cols.insert(cid); }
+                    }
                     _ => {}
                 }
             }
@@ -2277,6 +2302,7 @@ fn parse_autofilter_from_xml(xml: &str) -> Option<roe_model::calc::AutoFilter> {
         end_col,
         col_filters,
         hidden_buttons,
+        other_filtered_cols,
     })
 }
 
@@ -3660,13 +3686,25 @@ fn builtin_num_fmt(id: u32) -> Option<&'static str> {
         20 => Some("h:mm"),
         21 => Some("h:mm:ss"),
         22 => Some("m/d/yyyy h:mm"),
+        // 27~36、50~58：CJK 区域日期/时间内置 id。按 LOK spBuiltinFormats_zh_CN 取值（简体中文），
+        // 其它区域（日语年号 GE、繁体 E 等）渲染器暂不支持，不在此处理。
+        // 36、50、51、54~58 在 zh_CN 块无定义，LOK 回落基础表 REUSE 14。
+        27 | 52 => Some("yyyy\"年\"m\"月\""),
+        28 | 53 => Some("m\"月\"d\"日\""),
+        30 => Some("m-d-yy"),
+        31 => Some("yyyy\"年\"m\"月\"d\"日\""),
+        32 => Some("h\"时\"mm\"分\""),
+        33 => Some("h\"时\"mm\"分\"ss\"秒\""),
+        34 => Some("AM/PM h\"时\"mm\"分\""),
+        35 => Some("AM/PM h\"时\"mm\"分\"ss\"秒\""),
+        36 | 50 | 51 | 54 | 55 | 56 | 57 | 58 => Some("m/d/yyyy"),
         37 => Some("#,##0 ;(#,##0)"),
         38 => Some("#,##0 ;[Red](#,##0)"),
         39 => Some("#,##0.00;(#,##0.00)"),
         40 => Some("#,##0.00;[Red](#,##0.00)"),
         45 => Some("mm:ss"),
         46 => Some("[h]:mm:ss"),
-        47 => Some("mmss.0"),
+        47 => Some("mm:ss.0"),
         48 => Some("##0.0E+0"),
         49 => Some("@"),
         _  => None,
@@ -4910,6 +4948,27 @@ mod test_a2b {
     use super::*;
 
     #[test]
+    fn test_builtin_num_fmt_cjk_dates() {
+        let ym  = r#"yyyy"年"m"月""#;
+        let md  = r#"m"月"d"日""#;
+        let ymd = r#"yyyy"年"m"月"d"日""#;
+        assert_eq!(builtin_num_fmt(27), Some(ym));
+        assert_eq!(builtin_num_fmt(28), Some(md));
+        assert_eq!(builtin_num_fmt(30), Some("m-d-yy"));
+        assert_eq!(builtin_num_fmt(31), Some(ymd));
+        assert_eq!(builtin_num_fmt(32), Some(r#"h"时"mm"分""#));
+        assert_eq!(builtin_num_fmt(33), Some(r#"h"时"mm"分"ss"秒""#));
+        assert_eq!(builtin_num_fmt(34), Some(r#"AM/PM h"时"mm"分""#));
+        assert_eq!(builtin_num_fmt(35), Some(r#"AM/PM h"时"mm"分"ss"秒""#));
+        assert_eq!(builtin_num_fmt(52), Some(ym));
+        assert_eq!(builtin_num_fmt(53), Some(md));
+        for id in [36u32, 50, 51, 54, 55, 56, 57, 58] {
+            assert_eq!(builtin_num_fmt(id), Some("m/d/yyyy"), "id={}", id);
+        }
+        assert_eq!(builtin_num_fmt(47), Some("mm:ss.0"));
+    }
+
+    #[test]
     fn test_builtin_num_fmt() {
         assert_eq!(builtin_num_fmt(0), None);          // General
         assert_eq!(builtin_num_fmt(2), Some("0.00"));
@@ -5239,5 +5298,27 @@ mod chartex_cache_tests {
                     c.model.data.first().map(|d| d.values.clone()));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests_v316_autofilter {
+    use super::*;
+
+    #[test]
+    fn test_v316_autofilter_date_group_marks_filtered() {
+        let xml = r#"<worksheet><autoFilter ref="A1:C17"><filterColumn colId="0"><filters><dateGroupItem year="2014" month="12" day="13" dateTimeGrouping="day"/></filters></filterColumn><filterColumn colId="1"><filters><filter val="b"/></filters></filterColumn></autoFilter></worksheet>"#;
+        let af = parse_autofilter_from_xml(xml).expect("af");
+        assert!(af.other_filtered_cols.contains(&0), "dateGroupItem 列应标记已筛选");
+        assert!(!af.col_filters.contains_key(&0), "不应污染值列表");
+        assert!(af.col_filters.contains_key(&1));
+        assert!(!af.other_filtered_cols.contains(&1));
+    }
+
+    #[test]
+    fn test_v316_autofilter_color_filter_marks_filtered() {
+        let xml = r#"<worksheet><autoFilter ref="A1:A8"><filterColumn colId="0"><colorFilter dxfId="0" cellColor="0"/></filterColumn></autoFilter></worksheet>"#;
+        let af = parse_autofilter_from_xml(xml).expect("af");
+        assert!(af.other_filtered_cols.contains(&0), "colorFilter 列应标记已筛选");
     }
 }

@@ -172,6 +172,8 @@ enum ResolvedFill {
         stops: Vec<(f32, u8, u8, u8, u8)>,
         kind: GradientKindResolved,
     },
+    /// v314: 图案填充，fg/bg 为 (r,g,b,a)。
+    Pattern { preset: String, fg: (u8, u8, u8, u8), bg: (u8, u8, u8, u8) },
 }
 
 /// PPTX-12: 渲染层实际消费的渐变类型。Rect 在模型层是独立变体，但
@@ -180,7 +182,8 @@ enum ResolvedFill {
 /// （见该处注释），所以这里只需要 Linear/Radial 两种。
 enum GradientKindResolved {
     Linear { angle: f32 },
-    Radial,
+    Radial { cx: f32, cy: f32 },
+    Rect { cx: f32, cy: f32 },
 }
 
 /// v1 默认字号（pt 等价单位）：Impress 内存模型暂未解析段落/字符样式继承链
@@ -521,6 +524,19 @@ impl SlideRenderer {
                         pw, ph, scale,
                     );
                 }
+                roe_model::common::FillStyle::Pattern { preset, fg, bg } => {
+                    let resolved = ResolvedFill::Pattern {
+                        preset,
+                        fg: (fg.r, fg.g, fg.b, fg.a),
+                        bg: (bg.r, bg.g, bg.b, bg.a),
+                    };
+                    if let Some(pm) = Self::pattern_pixmap(&resolved) {
+                        let paint = Self::pattern_paint(&pm, scale);
+                        if let Some(rect) = Rect::from_xywh(0.0, 0.0, pw as f32, ph as f32) {
+                            pixmap.fill_rect(rect, &paint, Transform::identity(), None);
+                        }
+                    }
+                }
                 roe_model::common::FillStyle::Gradient { stops, kind, .. } => {
                     // v318p: 背景渐变，复用形状渐变的 build_fill_paint，铺满整页。
                     let resolved_stops: Vec<(f32, u8, u8, u8, u8)> = stops.iter()
@@ -528,10 +544,17 @@ impl SlideRenderer {
                         .collect();
                     let resolved_kind = match kind {
                         roe_model::common::GradientKind::Linear { angle } => GradientKindResolved::Linear { angle },
-                        _ => GradientKindResolved::Radial,
+                        roe_model::common::GradientKind::Radial { cx, cy } => GradientKindResolved::Radial { cx, cy },
+                        roe_model::common::GradientKind::Rect { cx, cy } => GradientKindResolved::Rect { cx, cy },
                     };
                     let resolved = ResolvedFill::Gradient { stops: resolved_stops, kind: resolved_kind };
-                    if let Some(paint) = Self::build_fill_paint(&resolved, 0.0, 0.0, pw as f32, ph as f32) {
+                    let rect_pm = Self::rect_gradient_pixmap(&resolved, pw as f32, ph as f32);
+                    let rect_paint = rect_pm.as_ref().map(|pm| {
+                        let mut p = Paint::default();
+                        p.shader = tiny_skia::Pattern::new(pm.as_ref(), SpreadMode::Pad, tiny_skia::FilterQuality::Bilinear, 1.0, Transform::identity());
+                        p
+                    });
+                    if let Some(paint) = rect_paint.or_else(|| Self::build_fill_paint(&resolved, 0.0, 0.0, pw as f32, ph as f32)) {
                         if let Some(rect) = Rect::from_xywh(0.0, 0.0, pw as f32, ph as f32) {
                             pixmap.fill_rect(rect, &paint, Transform::identity(), None);
                         }
@@ -870,7 +893,15 @@ impl SlideRenderer {
                     // 或渐变 Shader），Ellipse/其他geometry 分支共享同一个 Paint，
                     // 不再各自手动拼 r,g,b,a。渐变起止点/半径按屏幕坐标 x,y,w,h 算，
                     // 与 shape_transform 独立（见 build_fill_paint 文档注释）。
-                    if let Some(paint) = Self::build_fill_paint(resolved, x, y, w, h) {
+                    let rect_pm = Self::rect_gradient_pixmap(resolved, w, h);
+                    let rect_paint = rect_pm.as_ref().map(|pm| {
+                        let mut p = Paint::default();
+                        p.shader = tiny_skia::Pattern::new(pm.as_ref(), SpreadMode::Pad, tiny_skia::FilterQuality::Bilinear, 1.0, Transform::from_translate(x, y));
+                        p
+                    });
+                    let pat_pm = Self::pattern_pixmap(resolved);
+                    let pat_paint = pat_pm.as_ref().map(|pm| Self::pattern_paint(pm, scale));
+                    if let Some(paint) = pat_paint.or(rect_paint).or_else(|| Self::build_fill_paint(resolved, x, y, w, h)) {
                         match &shape.geometry {
                             ShapeGeometry::Ellipse => {
                                 Self::fill_ellipse(pixmap, x, y, w, h, &paint, shape_transform);
@@ -2102,13 +2133,13 @@ impl SlideRenderer {
                 // Linear 的 angle 里了（PPTX-12, pptx.rs），这里不需要
                 // 再处理，直接用 kind 里的最终角度。
                 let resolved_stops: Vec<(f32, u8, u8, u8, u8)> = stops.iter()
-                    .map(|s| (s.pos, s.color.r, s.color.g, s.color.b, alpha))
+                    .map(|s| (s.pos, s.color.r, s.color.g, s.color.b, (s.color.a as u32 * alpha as u32 / 255) as u8))
                     .collect();
                 let resolved_kind = match kind {
                     roe_model::common::GradientKind::Linear { angle } => {
                         GradientKindResolved::Linear { angle: *angle }
                     }
-                    roe_model::common::GradientKind::Radial => GradientKindResolved::Radial,
+                    roe_model::common::GradientKind::Radial { cx, cy } => GradientKindResolved::Radial { cx: *cx, cy: *cy },
                     // tiny-skia 无原生"矩形渐变"（RectGradient）能力，只有
                     // Linear/Radial/Sweep 三种。用 Radial 近似替代：视觉上
                     // 都是"中心到边缘过渡"的观感，比完全不处理（比如退化
@@ -2116,7 +2147,7 @@ impl SlideRenderer {
                     // 降级，不是遗漏——如果未来需要精确的方形等值线渐变，
                     // 需要手写 Shader 或用径向渐变的椭圆变体近似，属于
                     // 独立的后续优化项。
-                    roe_model::common::GradientKind::Rect => GradientKindResolved::Radial,
+                    roe_model::common::GradientKind::Rect { cx, cy } => GradientKindResolved::Rect { cx: *cx, cy: *cy },
                 };
                 Some(ResolvedFill::Gradient { stops: resolved_stops, kind: resolved_kind })
             }
@@ -2130,6 +2161,11 @@ impl SlideRenderer {
             // Slide/MasterSlide.background（走 render_slide 独立绘制路径），
             // 不会出现在普通 shape.style.fill 上。同理按"无填充"处理保底。
             Some(FillStyle::PictureTiled { .. }) => None,
+            Some(FillStyle::Pattern { preset, fg, bg }) => Some(ResolvedFill::Pattern {
+                preset: preset.clone(),
+                fg: (fg.r, fg.g, fg.b, (fg.a as u32 * alpha as u32 / 255) as u8),
+                bg: (bg.r, bg.g, bg.b, (bg.a as u32 * alpha as u32 / 255) as u8),
+            }),
             None => {
                 // PROOT-005 附带修复：占位符（shape.placeholder.is_some()）没有显式
                 // fill 时不应套用下面的"主题accent1半透明兜底"——真实样本tdf158512
@@ -2199,6 +2235,7 @@ impl SlideRenderer {
                 paint.set_color_rgba8(*r, *g, *b, *a);
                 Some(paint)
             }
+            ResolvedFill::Pattern { .. } => None,
             ResolvedFill::Gradient { stops, kind } => {
                 if stops.is_empty() {
                     return None;
@@ -2227,13 +2264,17 @@ impl SlideRenderer {
                         let end = Point::from_xy(cx + dx, cy + dy);
                         LinearGradient::new(start, end, sk_stops, SpreadMode::Pad, Transform::identity())
                     }
-                    GradientKindResolved::Radial => {
+                    GradientKindResolved::Radial { cx: rcx, cy: rcy } | GradientKindResolved::Rect { cx: rcx, cy: rcy } => {
                         // 第一期固定中心 = 形状几何中心（0.5,0.5），不读取
                         // fillToRect 精确偏移中心，见 GradientKind::Radial
                         // 模型层文档注释。半径取形状对角线一半，确保径向
                         // 渐变能覆盖到形状四角。
-                        let radius = ((w * w + h * h).sqrt()) / 2.0;
-                        let center = Point::from_xy(cx, cy);
+                        let ccx = x + w * rcx;
+                        let ccy = y + h * rcy;
+                        let dx = (ccx - x).max(x + w - ccx);
+                        let dy = (ccy - y).max(y + h - ccy);
+                        let radius = (dx * dx + dy * dy).sqrt().max(1.0);
+                        let center = Point::from_xy(ccx, ccy);
                         RadialGradient::new(center, 0.0, center, radius, sk_stops, SpreadMode::Pad, Transform::identity())
                     }
                 };
@@ -2244,6 +2285,92 @@ impl SlideRenderer {
                 })
             }
         }
+    }
+
+    /// v314: 图案填充的 8x8 小位图（非图案返回 None）。
+    fn pattern_pixmap(resolved: &ResolvedFill) -> Option<tiny_skia::Pixmap> {
+        let ResolvedFill::Pattern { preset, fg, bg } = resolved else { return None };
+        let mut pm = tiny_skia::Pixmap::new(8, 8)?;
+        pm.data_mut().copy_from_slice(&crate::pattern::tile_premul_rgba(preset, *fg, *bg));
+        Some(pm)
+    }
+
+    /// v314: 把 8x8 小位图按"一格 = 0.75pt x 缩放"最近邻平铺，从原点起排。
+    fn pattern_paint(pm: &tiny_skia::Pixmap, scale: f32) -> Paint<'_> {
+        let k = (crate::pattern::CELL_PT * scale).max(0.01);
+        let mut p = Paint::default();
+        p.shader = tiny_skia::Pattern::new(
+            pm.as_ref(),
+            SpreadMode::Repeat,
+            tiny_skia::FilterQuality::Nearest,
+            1.0,
+            Transform::from_scale(k, k),
+        );
+        p
+    }
+
+    /// v313c: 真矩形渐变。tiny-skia 没有矩形渐变 shader，这里按"到中心的
+    /// 矩形距离"逐像素算出一张与形状等大的位图，调用方把它当 Pattern 填充。
+    /// 非 Rect 渐变、尺寸过大时返回 None（调用方退回 build_fill_paint 的径向近似）。
+    fn rect_gradient_pixmap(resolved: &ResolvedFill, w: f32, h: f32) -> Option<tiny_skia::Pixmap> {
+        let (stops, cx, cy) = match resolved {
+            ResolvedFill::Gradient { stops, kind: GradientKindResolved::Rect { cx, cy } } => (stops, *cx, *cy),
+            _ => return None,
+        };
+        if stops.is_empty() || !(w >= 1.0) || !(h >= 1.0) {
+            return None;
+        }
+        let pw = w.ceil() as u32;
+        let ph = h.ceil() as u32;
+        if pw > 4096 || ph > 4096 || (pw as u64) * (ph as u64) > 4_000_000 {
+            return None;
+        }
+        let mut sorted: Vec<(f32, u8, u8, u8, u8)> = stops.clone();
+        sorted.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        let color_at = |t: f32| -> (f32, f32, f32, f32) {
+            let first = sorted[0];
+            let last = sorted[sorted.len() - 1];
+            if t <= first.0 {
+                return (first.1 as f32, first.2 as f32, first.3 as f32, first.4 as f32);
+            }
+            if t >= last.0 {
+                return (last.1 as f32, last.2 as f32, last.3 as f32, last.4 as f32);
+            }
+            for i in 1..sorted.len() {
+                let a = sorted[i - 1];
+                let b = sorted[i];
+                if t <= b.0 {
+                    let span = (b.0 - a.0).max(1e-6);
+                    let k = (t - a.0) / span;
+                    let m = |x: u8, y: u8| x as f32 + (y as f32 - x as f32) * k;
+                    return (m(a.1, b.1), m(a.2, b.2), m(a.3, b.3), m(a.4, b.4));
+                }
+            }
+            (last.1 as f32, last.2 as f32, last.3 as f32, last.4 as f32)
+        };
+        let mut pm = tiny_skia::Pixmap::new(pw, ph)?;
+        let ccx = pw as f32 * cx;
+        let ccy = ph as f32 * cy;
+        let data = pm.data_mut();
+        for py in 0..ph {
+            let dy = py as f32 + 0.5 - ccy;
+            let exty = if dy < 0.0 { ccy } else { ph as f32 - ccy };
+            let ty = if exty > 0.0 { dy.abs() / exty } else { 0.0 };
+            for px in 0..pw {
+                let dx = px as f32 + 0.5 - ccx;
+                let extx = if dx < 0.0 { ccx } else { pw as f32 - ccx };
+                let tx = if extx > 0.0 { dx.abs() / extx } else { 0.0 };
+                let t = tx.max(ty).clamp(0.0, 1.0);
+                let (r, g, b, a) = color_at(t);
+                let af = a / 255.0;
+                let i = ((py * pw + px) * 4) as usize;
+                data[i] = (r * af).round().clamp(0.0, 255.0) as u8;
+                data[i + 1] = (g * af).round().clamp(0.0, 255.0) as u8;
+                data[i + 2] = (b * af).round().clamp(0.0, 255.0) as u8;
+                data[i + 3] = a.round().clamp(0.0, 255.0) as u8;
+            }
+        }
+        Some(pm)
     }
 
     /// PPTX-12: 签名从 (r,g,b,a) 改为接受现成的 &Paint，让椭圆分支能够
@@ -4416,7 +4543,7 @@ mod tests {
                 title: Some("No Legend No Grid".to_string()),
                 x_labels: vec!["Mon".to_string(), "Tue".to_string(), "Wed".to_string()],
                 series: vec![
-                    ChartSeries { name: "A".to_string(), data: vec![120.0, 200.0, 150.0], color: None, as_line: false, trendline: false },
+                    ChartSeries { name: "A".to_string(), data: vec![120.0, 200.0, 150.0], color: None, as_line: false, trendline: false, x_values: None, sizes: None },
                 ],
                 x_pt: 0.0, y_pt: 0.0, width_pt: 600.0, height_pt: 300.0,
                 show_legend: false, show_grid: false,
@@ -4427,7 +4554,7 @@ mod tests {
                 overlap_pct: None,
                 grouping: Default::default(),
                 hole_size_pct: None,
-                slice_border_color: None,
+                slice_border_color: None, legend_pos: None,
                 data_labels: Default::default(),
             }),
             text_body: Default::default(),
@@ -4457,8 +4584,8 @@ mod tests {
                 title: Some("Sales".to_string()),
                 x_labels: vec!["Mon".to_string(), "Tue".to_string(), "Wed".to_string()],
                 series: vec![
-                    ChartSeries { name: "A".to_string(), data: vec![120.0, 200.0, 150.0], color: None, as_line: false, trendline: false },
-                    ChartSeries { name: "B".to_string(), data: vec![80.0, 160.0, 90.0], color: None, as_line: false, trendline: false },
+                    ChartSeries { name: "A".to_string(), data: vec![120.0, 200.0, 150.0], color: None, as_line: false, trendline: false, x_values: None, sizes: None },
+                    ChartSeries { name: "B".to_string(), data: vec![80.0, 160.0, 90.0], color: None, as_line: false, trendline: false, x_values: None, sizes: None },
                 ],
                 x_pt: 0.0, y_pt: 0.0, width_pt: 600.0, height_pt: 300.0,
                 show_legend: true, show_grid: true,
@@ -4469,7 +4596,7 @@ mod tests {
                 overlap_pct: None,
                 grouping: Default::default(),
                 hole_size_pct: None,
-                slice_border_color: None,
+                slice_border_color: None, legend_pos: None,
                 data_labels: Default::default(),
             }),
             text_body: Default::default(),

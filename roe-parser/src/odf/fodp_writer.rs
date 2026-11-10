@@ -299,6 +299,10 @@ fn write_graphic_style_def(out: &mut String, name: &str, style: &ShapeStyle) {
         Some(FillStyle::PictureTiled { .. }) => {
             out.push_str(r#" draw:fill="none""#);
         }
+        // v314: 图案填充 ODF 写出未实现，降级为 none 保底。
+        Some(FillStyle::Pattern { .. }) => {
+            out.push_str(r#" draw:fill="none""#);
+        }
         None => {}
     }
     if let Some(stroke) = &style.stroke {
@@ -1307,7 +1311,7 @@ mod tests {
             grouping: roe_model::impress::ChartGrouping::Standard,
             hole_size_pct: None,
             data_labels: Default::default(),
-            slice_border_color: None,
+            slice_border_color: None, legend_pos: None,
         }));
         let mut slide = empty_slide(None);
         slide.shapes.push(shape);

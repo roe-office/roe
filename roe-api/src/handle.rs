@@ -36,6 +36,10 @@ pub struct WriterOptions {
     pub ruler_height_pt: f32,
     /// v265: 显示段落标记/手动换行标记（只影响渲染）
     pub show_marks: bool,
+    /// v308: 修订模式开关（开启后键盘编辑与脚本编辑记成修订，不进 docx）
+    pub track_changes: bool,
+    /// v308: 修订作者名（由前台传入，如主机名；AI 编辑用另一个名字）
+    pub track_author: String,
 }
 
 impl Default for WriterOptions {
@@ -44,6 +48,8 @@ impl Default for WriterOptions {
             ruler_enabled: false,
             ruler_height_pt: 20.0,
             show_marks: false,
+            track_changes: false,
+            track_author: String::new(),
         }
     }
 }

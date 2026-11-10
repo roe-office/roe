@@ -1293,6 +1293,52 @@ pub extern "C" fn roe_writer_get_chart_json(handle_val: u64, body_index: u32) ->
     }
 }
 
+/// 内联图表(普通图/统计图)的配置 JSON,字段同 roe_get_chart_config。失败返回 null。
+#[no_mangle]
+pub extern "C" fn roe_writer_get_chart_config(handle_val: u64, body_index: u32) -> *mut c_char {
+    let result = handle::with_entry(handle_val, |entry| -> Result<String, String> {
+        let RoeDocument::Writer(doc) = &entry.doc else { return Err("非 Writer 文档".to_string()); };
+        match doc.body.get(body_index as usize) {
+            Some(BodyElement::InlineChart { model, .. }) => Ok(crate::chart_query::chart_config_json(model)),
+            Some(BodyElement::InlineStatChart { model, .. }) => {
+                Ok(crate::chart_query::stat_chart_config_json(body_index as u64, model))
+            }
+            _ => Err("该位置不是图表".to_string()),
+        }
+    });
+    match result {
+        Some(Ok(s)) => match std::ffi::CString::new(s) { Ok(c) => c.into_raw(), Err(_) => std::ptr::null_mut() },
+        Some(Err(m)) => { set_last_error(format!("roe_writer_get_chart_config: {m}")); std::ptr::null_mut() }
+        None => { set_last_error("roe_writer_get_chart_config: 无效句柄"); std::ptr::null_mut() }
+    }
+}
+
+/// 局部修改内联图表样式(键与 roe_set_chart_style 相同,校验在 roe_core::chart_style),带撤销。
+/// 成功返回 0,失败(含值非法整体不生效)返回 -1。
+#[no_mangle]
+pub extern "C" fn roe_writer_set_chart_style(handle_val: u64, body_index: u32, style_json: *const c_char) -> i32 {
+    let json = unsafe { cm_cstr(style_json) };
+    if json.is_empty() {
+        set_last_error("roe_writer_set_chart_style: style_json 为空");
+        return -1;
+    }
+    cm_run_with_undo(handle_val, "roe_writer_set_chart_style", move |doc| {
+        let val: serde_json::Value = serde_json::from_str(&json)
+            .map_err(|e| format!("style JSON 解析失败: {e}"))?;
+        match doc.body.get_mut(body_index as usize) {
+            Some(BodyElement::InlineChart { model, .. }) => {
+                roe_core::chart_style::apply_chart_style(model, &val, false)?;
+                Ok(body_index as usize)
+            }
+            Some(BodyElement::InlineStatChart { model, .. }) => {
+                roe_core::chart_style::apply_stat_chart_style(model, &val, false)?;
+                Ok(body_index as usize)
+            }
+            _ => Err("该位置不是图表".to_string()),
+        }
+    })
+}
+
 // v318m: 用新的 ChartModel JSON 替换内联图表内容，保留原尺寸，计入撤销栈。
 #[no_mangle]
 pub extern "C" fn roe_writer_set_chart_json(handle_val: u64, body_index: u32, chart_json: *const c_char) -> i32 {
@@ -1333,4 +1379,54 @@ pub extern "C" fn roe_writer_insert_chart(handle_val: u64, para: u32, offset: u3
     cm_run_with_undo(handle_val, "roe_writer_insert_chart", move |doc| {
         insert_chart_core(doc, para as usize, offset as usize, &json, width_pt, height_pt, is_stat != 0)
     })
+}
+
+// ───────── Writer 统计图「编辑数据」(与 Impress 的 roe_impress_*_stat_chart_* 同一套逻辑) ─────────
+
+/// 读取内联统计图的完整 StatChartModel JSON。非统计图/失败返回 null。
+#[no_mangle]
+pub extern "C" fn roe_writer_get_stat_chart_json(handle_val: u64, body_index: u32) -> *mut c_char {
+    let result = handle::with_entry(handle_val, |entry| -> Result<String, String> {
+        let RoeDocument::Writer(doc) = &entry.doc else { return Err("非 Writer 文档".to_string()); };
+        match doc.body.get(body_index as usize) {
+            Some(BodyElement::InlineStatChart { model, .. }) => {
+                serde_json::to_string(model).map_err(|e| format!("序列化失败: {e}"))
+            }
+            _ => Err("该位置不是统计图".to_string()),
+        }
+    });
+    match result {
+        Some(Ok(s)) => match std::ffi::CString::new(s) { Ok(c) => c.into_raw(), Err(_) => std::ptr::null_mut() },
+        Some(Err(m)) => { set_last_error(format!("roe_writer_get_stat_chart_json: {m}")); std::ptr::null_mut() }
+        None => { set_last_error("roe_writer_get_stat_chart_json: 无效句柄"); std::ptr::null_mut() }
+    }
+}
+
+/// 统计图「编辑数据」回写(带撤销)。edit_json: {"categories":[[..]],"values":[..]}。
+/// 返回 -1 失败;>=0 成功,数值为被丢弃的越界 subtotals 个数。
+#[no_mangle]
+pub extern "C" fn roe_writer_set_stat_chart_data(handle_val: u64, body_index: u32, edit_json: *const c_char) -> i32 {
+    let json = unsafe { cm_cstr(edit_json) };
+    if json.is_empty() {
+        set_last_error("roe_writer_set_stat_chart_data: json 为空");
+        return -1;
+    }
+    let edit: crate::impress_chart_ops::StatDataEdit = match serde_json::from_str(&json) {
+        Ok(e) => e,
+        Err(e) => {
+            set_last_error(format!("roe_writer_set_stat_chart_data: JSON 解析失败: {e}"));
+            return -1;
+        }
+    };
+    let dropped = std::cell::Cell::new(0usize);
+    let code = cm_run_with_undo(handle_val, "roe_writer_set_stat_chart_data", |doc| {
+        match doc.body.get_mut(body_index as usize) {
+            Some(BodyElement::InlineStatChart { model, .. }) => {
+                dropped.set(crate::impress_chart_ops::apply_stat_data(model, edit)?);
+                Ok(body_index as usize)
+            }
+            _ => Err("该位置不是统计图".to_string()),
+        }
+    });
+    if code == 0 { dropped.get() as i32 } else { -1 }
 }

@@ -60,9 +60,19 @@ fn walk_col(
     }
     let r = meta.base_row + meta.filter_fields.len() as u32 + 1 + depth;
     let c = meta.base_col + meta.data_col_start + offset;
-    if !node.value.is_empty() {
-        let kind = if node.is_subtotal { PivotCellKind::Subtotal } else { PivotCellKind::ColHeader };
-        put(g, r, c, kind, &node.value);
+    if node.is_subtotal {
+        if !node.value.is_empty() {
+            let nv = meta.value_fields.len();
+            if nv > 1 && !meta.data_on_rows {
+                for (vidx, vf) in meta.value_fields.iter().enumerate() {
+                    put(g, r, c + vidx as u32, PivotCellKind::Subtotal, &subtotal_label(&node.value, Some(&vf.name)));
+                }
+            } else {
+                put(g, r, c, PivotCellKind::Subtotal, &subtotal_label(&node.value, None));
+            }
+        }
+    } else if !node.value.is_empty() {
+        put(g, r, c, PivotCellKind::ColHeader, &node.value);
     }
     let mut cursor = offset;
     for child in &node.children {
@@ -87,12 +97,38 @@ fn walk_row(
     leaves: &mut BTreeMap<u32, Vec<String>>,
 ) {
     // Outline:每个节点自占一行,全部记录查值路径;Tabular:父子共享起始行,只记叶子
-    if is_outline || node.children.is_empty() {
-        leaves.insert(offset, path.to_vec());
+    // 大纲/紧凑:小计并入上级标签行,小计节点本身不占行也不画
+    // 小计在下(subtotals_bottom)时,小计节点按普通行绘制在组末
+    let inline_subtotal = !meta.subtotals_bottom;
+    if is_outline && inline_subtotal && node.is_subtotal {
+        return;
+    }
+    // 小计在下时,带小计子节点的上级行不取值(其值由组末小计行展示,否则与小计行重复)
+    let skip_data = is_outline && !inline_subtotal && node.children.iter().any(|c| c.is_subtotal);
+    if !skip_data && (is_outline || node.children.is_empty()) {
+        let mut lp = path.to_vec();
+        if is_outline && inline_subtotal && node.children.iter().any(|c| c.is_subtotal) {
+            lp.push(String::new()); // 上级行查小计键:路径 + [""]
+        }
+        leaves.insert(offset, lp);
     }
     let r = meta.base_row + meta.data_row_start + offset;
-    let c = meta.base_col + depth;
-    let text: &str = if node.value.is_empty() && !node.is_subtotal { "(空白)" } else { &node.value };
+    let compact = meta.layout_mode == PivotLayoutMode::Compact;
+    // 紧凑:标签全放 base_col,层级靠缩进;大纲/表格:每层一列
+    let c = if compact { meta.base_col } else { meta.base_col + depth };
+    let text_owned: String = if node.is_subtotal {
+        if node.value.is_empty() { String::new() } else { subtotal_label(&node.value, None) }
+    } else if node.value.is_empty() {
+        "(空白)".to_string()
+    } else {
+        node.value.clone()
+    };
+    let text_owned: String = if compact && depth > 0 && !text_owned.is_empty() {
+        format!("{}{}", "  ".repeat(depth as usize), text_owned)
+    } else {
+        text_owned
+    };
+    let text: &str = &text_owned;
     if !text.is_empty() {
         let kind = if node.is_subtotal { PivotCellKind::Subtotal } else { PivotCellKind::RowHeader };
         put(g, r, c, kind, text);
@@ -119,7 +155,7 @@ pub fn pivot_layout(meta_in: &PivotMeta) -> PivotLayout {
     let mut g: Grid = Grid::new();
     let filter_len = meta.filter_fields.len() as u32;
     let n_values = meta.value_fields.len().max(1) as u32;
-    let is_outline = meta.layout_mode == PivotLayoutMode::Outline;
+    let is_outline = matches!(meta.layout_mode, PivotLayoutMode::Outline | PivotLayoutMode::Compact);
     let has_row = !meta.row_field_names.is_empty();
     let has_col = !meta.col_field_names.is_empty();
 
@@ -349,6 +385,32 @@ fn round_sig15(v: f64) -> f64 {
     format!("{:.14e}", v).parse::<f64>().unwrap_or(v)
 }
 
+/// 小计节点的显示标签(渲染层共用,pivot_layout 与 tile 都调它)。
+/// 有值字段名:"{节点值} {值字段名}"(对齐 OnlyOffice,如 "普通 Sales的Sum");
+/// 无值字段名(单值字段或行方向):"{节点值} Total"。
+pub fn subtotal_label(node_value: &str, value_name: Option<&str>) -> String {
+    match value_name {
+        Some(n) if !n.is_empty() => format!("{} {}", node_value, n),
+        _ => format!("{} Total", node_value),
+    }
+}
+
+#[cfg(test)]
+mod subtotal_label_tests {
+    use super::subtotal_label;
+
+    #[test]
+    fn with_value_name() {
+        assert_eq!(subtotal_label("普通", Some("Sales的Sum")), "普通 Sales的Sum");
+    }
+
+    #[test]
+    fn without_value_name_falls_back_to_total() {
+        assert_eq!(subtotal_label("East", None), "East Total");
+        assert_eq!(subtotal_label("East", Some("")), "East Total");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -381,9 +443,9 @@ mod tests {
         let leaf = |v: &str| PivotHeaderNode::new(v);
         let sub = |v: &str| PivotHeaderNode { value: v.into(), is_subtotal: true, ..Default::default() };
         let mut east = PivotHeaderNode::new("East");
-        east.children = vec![leaf("Apple"), leaf("Banana"), sub("East Total")];
+        east.children = vec![leaf("Apple"), leaf("Banana"), sub("East")];
         let mut west = PivotHeaderNode::new("West");
-        west.children = vec![leaf("Apple"), leaf("Banana"), sub("West Total")];
+        west.children = vec![leaf("Apple"), leaf("Banana"), sub("West")];
         let root = PivotHeaderNode { children: vec![east, west], ..Default::default() };
         let mut meta = PivotMeta {
             row_field_names: vec!["Region".into(), "Product".into()],
@@ -409,32 +471,117 @@ mod tests {
     }
 
     #[test]
+    fn layout_subtotals_bottom_outline() {
+        let mut m = sample_meta();
+        m.layout_mode = PivotLayoutMode::Outline;
+        m.subtotals_bottom = true;
+        // 真实数据引擎会给中间层路径出值(bridge 探针 [East]=15),此处模拟
+        m.data.insert(vec!["East".to_string()], vec![], 0, 300.0);
+        m.data.insert(vec!["West".to_string()], vec![], 0, 200.0);
+        let l = pivot_layout(&m);
+        // 行序:East 3, Apple 4, Banana 5, East 小计 6, West 7, Apple 8, Banana 9, West 小计 10, 总计 11
+        assert_eq!(text_at(&l, 3, 0).as_deref(), Some("East"));
+        assert_eq!(text_at(&l, 4, 1).as_deref(), Some("Apple"));
+        assert_eq!(text_at(&l, 5, 1).as_deref(), Some("Banana"));
+        assert!(text_at(&l, 6, 0).unwrap_or_default().contains("East"), "小计标签在组末行第 0 列");
+        assert_eq!(text_at(&l, 7, 0).as_deref(), Some("West"));
+        assert!(text_at(&l, 10, 0).unwrap_or_default().contains("West"));
+        assert_eq!(text_at(&l, 11, 0).as_deref(), Some("总计"));
+        // 数据:叶子行、小计行各有值;上级标签行不重复出值
+        assert_eq!(num_at(&l, 4, 2), Some(100.0));
+        assert_eq!(num_at(&l, 5, 2), Some(200.0));
+        assert_eq!(num_at(&l, 6, 2), Some(300.0));
+        assert_eq!(num_at(&l, 3, 2), None, "上级行在小计下沉后不应重复出小计值");
+        assert_eq!(num_at(&l, 7, 2), None);
+        assert_eq!(num_at(&l, 10, 2), Some(200.0));
+        assert_eq!(num_at(&l, 11, 2), Some(500.0));
+    }
+
+    #[test]
+    fn layout_subtotals_bottom_ignored_by_tabular() {
+        let grid = |bottom: bool| {
+            let mut m = sample_meta();
+            m.layout_mode = PivotLayoutMode::Tabular;
+            m.subtotals_bottom = bottom;
+            let l = pivot_layout(&m);
+            let mut v: Vec<(u32, u32, Option<String>, Option<f64>)> = Vec::new();
+            for r in 0..14u32 {
+                for c in 0..4u32 {
+                    v.push((r, c, text_at(&l, r, c), num_at(&l, r, c)));
+                }
+            }
+            v
+        };
+        assert_eq!(grid(false), grid(true), "表格形式小计恒在组末,不受开关影响");
+    }
+
+    #[test]
+    fn layout_compact_labels_in_col0_with_indent() {
+        let mut m = sample_meta();
+        m.layout_mode = PivotLayoutMode::Compact;
+        m.data_col_start = 1;
+        let l = pivot_layout(&m);
+        // 行序与大纲一致:East 3(带小计), Apple 4, Banana 5, West 6 ... 总计 9(小计并入上级行)
+        assert_eq!(text_at(&l, 2, 0).as_deref(), Some("Region"));
+        assert_eq!(text_at(&l, 3, 0).as_deref(), Some("East"));
+        assert_eq!(text_at(&l, 4, 0).as_deref(), Some("  Apple"));
+        assert_eq!(text_at(&l, 5, 0).as_deref(), Some("  Banana"));
+        assert_eq!(text_at(&l, 6, 0).as_deref(), Some("West"));
+        assert_eq!(text_at(&l, 9, 0).as_deref(), Some("总计"));
+        // 数据区从第 1 列起,第 0 列只有标签
+        assert_eq!(num_at(&l, 4, 1), Some(100.0));
+        assert_eq!(num_at(&l, 3, 1), Some(300.0)); // East 行带小计值
+        assert_eq!(num_at(&l, 6, 1), Some(200.0)); // West 行带小计值
+        assert!(l.cells.iter().filter(|c| c.col == 0).all(|c| !matches!(c.value, CellValue::Number(_))));
+    }
+
+    #[test]
+    fn layout_col_subtotal_per_value_field() {
+        let leaf = |v: &str| PivotHeaderNode::new(v);
+        let sub = |v: &str| PivotHeaderNode { value: v.into(), is_subtotal: true, ..Default::default() };
+        let mut east = PivotHeaderNode::new("East");
+        east.children = vec![leaf("Apple"), leaf("Banana"), sub("East")];
+        let meta = PivotMeta {
+            col_field_names: vec!["Region".into(), "Product".into()],
+            value_fields: vec![PivotFieldDef::new("S"), PivotFieldDef::new("Q")],
+            col_tree: PivotHeaderNode { children: vec![east], ..Default::default() },
+            base_row: 0,
+            base_col: 0,
+            data_row_start: 3,
+            data_col_start: 1,
+            ..Default::default()
+        };
+        let l = pivot_layout(&meta);
+        // Apple 占 c=1..2,Banana 占 c=3..4,小计占 c=5..6,行 = base_row+0+1+depth(借父=0)=1
+        assert_eq!(text_at(&l, 1, 5).as_deref(), Some("East S"));
+        assert_eq!(text_at(&l, 1, 6).as_deref(), Some("East Q"));
+    }
+
+    #[test]
     fn layout_outline_two_row_fields_with_subtotal() {
         let l = pivot_layout(&sample_meta());
         // 角落标签
         assert_eq!(text_at(&l, 2, 0).as_deref(), Some("Region"));
         assert_eq!(text_at(&l, 2, 1).as_deref(), Some("Product"));
         assert_eq!(text_at(&l, 2, 2).as_deref(), Some("SalesSum"));
-        // 行表头(Outline:East 3, Apple 4, Banana 5, East Total 6, West 7 ...)
+        // 行表头(Outline:East 3(带小计), Apple 4, Banana 5, West 6 ...,小计并入上级行)
         assert_eq!(text_at(&l, 3, 0).as_deref(), Some("East"));
         assert_eq!(text_at(&l, 4, 1).as_deref(), Some("Apple"));
         assert_eq!(text_at(&l, 5, 1).as_deref(), Some("Banana"));
-        assert_eq!(text_at(&l, 6, 0).as_deref(), Some("East Total"));
-        assert_eq!(text_at(&l, 7, 0).as_deref(), Some("West"));
-        assert_eq!(text_at(&l, 10, 0).as_deref(), Some("West Total"));
-        // 数据区(第 2 列);父节点行 East/West 无值
-        assert_eq!(num_at(&l, 3, 2), None);
+        assert_eq!(text_at(&l, 6, 0).as_deref(), Some("West"));
+        assert_eq!(text_at(&l, 7, 1).as_deref(), Some("Apple"));
+        // 数据区(第 2 列);上级行 East/West 显示小计值(键 [East,""]/[West,""])
+        assert_eq!(num_at(&l, 3, 2), Some(300.0));
         assert_eq!(num_at(&l, 4, 2), Some(100.0));
         assert_eq!(num_at(&l, 5, 2), Some(200.0));
-        assert_eq!(num_at(&l, 6, 2), Some(300.0));
-        assert_eq!(num_at(&l, 8, 2), Some(150.0));
-        assert_eq!(num_at(&l, 9, 2), Some(50.0));
-        assert_eq!(num_at(&l, 10, 2), Some(200.0));
+        assert_eq!(num_at(&l, 6, 2), Some(200.0));
+        assert_eq!(num_at(&l, 7, 2), Some(150.0));
+        assert_eq!(num_at(&l, 8, 2), Some(50.0));
         // 竖向总计
-        assert_eq!(text_at(&l, 11, 0).as_deref(), Some("总计"));
-        assert_eq!(num_at(&l, 11, 2), Some(500.0));
+        assert_eq!(text_at(&l, 9, 0).as_deref(), Some("总计"));
+        assert_eq!(num_at(&l, 9, 2), Some(500.0));
         // 无列字段:没有横向总计与右下角
-        assert_eq!(l.rect, Some((2, 0, 11, 2)));
+        assert_eq!(l.rect, Some((2, 0, 9, 2)));
     }
 
     #[test]
@@ -442,8 +589,8 @@ mod tests {
         let mut meta = sample_meta();
         meta.row_grand_totals = false;
         let l = pivot_layout(&meta);
-        assert_eq!(text_at(&l, 11, 0), None);
-        assert_eq!(num_at(&l, 11, 2), None);
+        assert_eq!(text_at(&l, 9, 0), None);
+        assert_eq!(num_at(&l, 9, 2), None);
     }
 
     #[test]
@@ -461,8 +608,8 @@ mod tests {
         assert!(n > 0);
         assert_eq!(sheet.cells.get(3, 0).to_display_string(), "East");
         assert!(matches!(sheet.cells.get(4, 2), CellValue::Number(v) if v == 100.0));
-        assert_eq!(sheet.cells.get(11, 0).to_display_string(), "总计");
-        assert_eq!(sheet.pivot.as_ref().unwrap().cells_rect, Some((2, 0, 11, 2)));
+        assert_eq!(sheet.cells.get(9, 0).to_display_string(), "总计");
+        assert_eq!(sheet.pivot.as_ref().unwrap().cells_rect, Some((2, 0, 9, 2)));
     }
 
     #[test]
@@ -470,12 +617,12 @@ mod tests {
         let mut sheet = crate::calc::Sheet::default();
         sheet.pivot = Some(sample_meta());
         materialize_pivot(&mut sheet);
-        // 关闭竖向总计后重新物化,第 11 行应被清空
+        // 关闭竖向总计后重新物化,第 9 行应被清空
         sheet.pivot.as_mut().unwrap().row_grand_totals = false;
         materialize_pivot(&mut sheet);
-        assert!(matches!(sheet.cells.get(11, 0), CellValue::Empty));
-        assert!(matches!(sheet.cells.get(11, 2), CellValue::Empty));
+        assert!(matches!(sheet.cells.get(9, 0), CellValue::Empty));
+        assert!(matches!(sheet.cells.get(9, 2), CellValue::Empty));
         assert_eq!(sheet.cells.get(3, 0).to_display_string(), "East");
-        assert_eq!(sheet.pivot.as_ref().unwrap().cells_rect, Some((2, 0, 10, 2)));
+        assert_eq!(sheet.pivot.as_ref().unwrap().cells_rect, Some((2, 0, 8, 2)));
     }
 }

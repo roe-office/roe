@@ -248,6 +248,70 @@ impl<'a> CalcTileRenderer<'a> {
         header_row_h_pt: f32,
         buf: &mut [u8],
     ) -> bool {
+        let (fr, fc) = match self.workbook.sheets.get(self.sheet_idx) {
+            Some(sh) => (sh.frozen_rows, sh.frozen_cols),
+            None => return false,
+        };
+        if fr == 0 && fc == 0 {
+            return self.render_viewport_plain(
+                scroll_x_pt, scroll_y_pt, vw, vh, zoom_pct, header_col_w_pt, header_row_h_pt, buf,
+            );
+        }
+        // 冻结窗格（语义A：scroll 为滚动区相对量，原路径即给出正确滚动区）。
+        // 先整幅渲染，再用 scroll=0 的渲染覆盖冻结区矩形。
+        let expected = (vw as usize) * (vh as usize) * 4;
+        if buf.len() != expected { return false; }
+        if !self.render_viewport_plain(
+            scroll_x_pt, scroll_y_pt, vw, vh, zoom_pct, header_col_w_pt, header_row_h_pt, buf,
+        ) { return false; }
+        let scale = (zoom_pct.max(100) as f32) / 100.0;
+        let (fw_px, fh_px) = {
+            let sheet = &self.workbook.sheets[self.sheet_idx];
+            let cfg = &self.config;
+            (
+                crate::tile_geometry::col_x_px(sheet, fc, cfg) * scale,
+                crate::tile_geometry::row_y_px(sheet, fr, cfg) * scale,
+            )
+        };
+        let xs = (((header_col_w_pt * scale) as i32) as f32 + fw_px).round().max(0.0) as u32;
+        let ys = (((header_row_h_pt * scale) as i32) as f32 + fh_px).round().max(0.0) as u32;
+        let xs = xs.min(vw);
+        let ys = ys.min(vh);
+        let mut tmp = vec![0u8; expected];
+        let row_bytes = (vw as usize) * 4;
+        // 角：scroll=(0,0)，覆盖 x∈[0,xs) y∈[0,ys)
+        // 上右：scroll=(sx,0)，覆盖 x∈[xs,vw) y∈[0,ys)
+        // 下左：scroll=(0,sy)，覆盖 x∈[0,xs) y∈[ys,vh)
+        let passes: [(f32, f32, (u32, u32), (u32, u32)); 3] = [
+            (0.0, 0.0, (0, xs), (0, ys)),
+            (scroll_x_pt, 0.0, (xs, vw), (0, ys)),
+            (0.0, scroll_y_pt, (0, xs), (ys, vh)),
+        ];
+        for (sx, sy, (x0, x1), (y0, y1)) in passes {
+            if x0 >= x1 || y0 >= y1 { continue; }
+            if !self.render_viewport_plain(
+                sx, sy, vw, vh, zoom_pct, header_col_w_pt, header_row_h_pt, &mut tmp,
+            ) { return false; }
+            for y in y0..y1 {
+                let a = (y as usize) * row_bytes + (x0 as usize) * 4;
+                let b = (y as usize) * row_bytes + (x1 as usize) * 4;
+                buf[a..b].copy_from_slice(&tmp[a..b]);
+            }
+        }
+        true
+    }
+
+    fn render_viewport_plain(
+        &mut self,
+        scroll_x_pt: f32,
+        scroll_y_pt: f32,
+        vw: u32,
+        vh: u32,
+        zoom_pct: u32,
+        header_col_w_pt: f32,
+        header_row_h_pt: f32,
+        buf: &mut [u8],
+    ) -> bool {
         let expected = (vw as usize) * (vh as usize) * 4;
         if buf.len() != expected { return false; }
         let mut pixmap = match tiny_skia::PixmapMut::from_bytes(buf, vw, vh) {
@@ -531,6 +595,53 @@ impl<'a> CalcTileRenderer<'a> {
 
         // 物化后的真实包围盒(含端点):区域内的普通格一律由透视 meta 绘制,这里跳过避免叠字
         let pivot_cells_rect: Option<(u32, u32, u32, u32)> = sheet.pivot.as_ref().and_then(|p| p.cells_rect);
+
+        // v319: 无值但有样式的空格(<c s=".."/>)不在 cells 里,原值循环遍历不到,
+        // 背景色漏画。这里补画:cell_formats 有 bg_color 且不在任何 cells 块范围内的格子。
+        // (在块范围内的格子仍由下方值循环负责,避免重复绘制。)
+        for (&(row_idx, col_idx), f) in sheet.cell_formats.iter() {
+            if row_idx < row_start || row_idx >= row_end || col_idx < col_start || col_idx >= col_end { continue; }
+            let bg = match f.bg_color.as_deref().and_then(parse_hex_color) { Some(b) => b, None => continue };
+            if sheet.row_hidden.get(row_idx as usize).copied().unwrap_or(false) { continue; }
+            if sheet.col_hidden.get(col_idx as usize).copied().unwrap_or(false) { continue; }
+            let in_block = sheet.cells.cols.get(&col_idx).map_or(false, |sc| {
+                sc.blocks.iter().any(|b| row_idx >= b.start_row && row_idx < b.start_row + b.values.len() as u32)
+            });
+            if in_block { continue; }
+            if let Some((r1, c1, r2, c2)) = pivot_cells_rect {
+                if row_idx >= r1 && row_idx <= r2 && col_idx >= c1 && col_idx <= c2 { continue; }
+            }
+            if let Some((br, bc, lr, lc)) = pivot_occupied_region {
+                if row_idx >= br && row_idx < lr && col_idx >= bc && col_idx < lc { continue; }
+            }
+            if let Some((br, bc, lr, lc)) = pivot_row_header_region {
+                if row_idx >= br && row_idx < lr && col_idx >= bc && col_idx < lc { continue; }
+            }
+            if let Some((br, bc, lr, lc)) = pivot_data_region {
+                if row_idx >= br && row_idx < lr && col_idx >= bc && col_idx < lc { continue; }
+            }
+            // 合并区内只处理左上角格
+            if sheet.merged_cells.iter().any(|m| row_idx >= m.r1 && row_idx <= m.r2 && col_idx >= m.c1 && col_idx <= m.c2
+                && !(row_idx == m.r1 && col_idx == m.c1)) { continue; }
+            let covered = sheet.cond_formats.iter().any(|rule| {
+                matches!(&rule.kind,
+                    roe_model::calc::ConditionalFormatKind::DataBar { .. }
+                        | roe_model::calc::ConditionalFormatKind::ColorScale { .. })
+                    && row_idx >= rule.range.start.0 && row_idx <= rule.range.end.0
+                    && col_idx >= rule.range.start.1 && col_idx <= rule.range.end.1
+            });
+            if covered { continue; }
+            let mut paint = tiny_skia::Paint::default();
+            paint.set_color_rgba8(bg[0], bg[1], bg[2], bg[3]);
+            let x = col_x_px(sheet, col_idx, cfg) + 1.0;
+            let y = row_y_px(sheet, row_idx, cfg) + 1.0;
+            let w = (col_width_at_px(sheet, col_idx, cfg) - 2.0).max(0.0);
+            let h = (row_height_at_px(sheet, row_idx, cfg) - 2.0).max(0.0);
+            if let Some(rect) = tiny_skia::Rect::from_xywh(x, y, w, h) {
+                let path = tiny_skia::PathBuilder::from_rect(rect);
+                pixmap.fill_path(&path, &paint, tiny_skia::FillRule::Winding, tx, None);
+            }
+        }
 
         for col_idx in col_start..col_end {
             if let Some(sc) = sheet.cells.cols.get(&col_idx) {
@@ -1146,7 +1257,33 @@ impl<'a> CalcTileRenderer<'a> {
                         }
                         // 边框（外框）
                         // 文字（非小计节点才显示）
-                        if !item.node.value.is_empty() {
+                        let col_text_single: String = if item.node.is_subtotal {
+                            roe_model::pivot_layout::subtotal_label(&item.node.value, None)
+                        } else {
+                            item.node.value.clone()
+                        };
+                        let multi_sub = item.node.is_subtotal
+                            && pivot.value_fields.len() > 1
+                            && !pivot.data_on_rows;
+                        if multi_sub {
+                            if !item.node.value.is_empty() {
+                                for (vidx, vf) in pivot.value_fields.iter().enumerate() {
+                                    let lbl = roe_model::pivot_layout::subtotal_label(&item.node.value, Some(&vf.name));
+                                    let lx = col_x(sheet, sheet_col_start + vidx as u32, cfg);
+                                    let ly = row_y(sheet, sheet_row, cfg);
+                                    let lw = col_width_at(sheet, sheet_col_start + vidx as u32, cfg);
+                                    let lh = row_height_at(sheet, sheet_row, cfg);
+                                    draw_cell_text(
+                                        &mut self.font_context, &mut self.layout_context, &mut pixmap,
+                                        &lbl, lx, ly, lw, lh,
+                                        scroll_x_pt / PT_TO_PX, scroll_y_pt / PT_TO_PX, header_col_w_pt * scale, header_row_h_pt * scale, scale * PT_TO_PX, scale,[0x20, 0x20, 0x20], true, false,
+                                        10.0,
+                                        "Carlito",
+                                        "", "", lw,
+                                    );
+                                }
+                            }
+                        } else if !item.node.value.is_empty() {
                             let text_cell_x = col_x(sheet, sheet_col_start, cfg);
                             let text_cell_y = row_y(sheet, sheet_row, cfg);
                             let text_avail_w: f32 = (0..item.node.cached_span)
@@ -1155,8 +1292,8 @@ impl<'a> CalcTileRenderer<'a> {
                             let text_cell_h = row_height_at(sheet, sheet_row, cfg);
                             draw_cell_text(
                                 &mut self.font_context, &mut self.layout_context, &mut pixmap,
-                                &item.node.value, text_cell_x, text_cell_y, text_avail_w, text_cell_h,
-                                scroll_x_pt / PT_TO_PX, scroll_y_pt / PT_TO_PX, header_col_w_pt * scale, header_row_h_pt * scale, scale * PT_TO_PX, scale,[0x20, 0x20, 0x20], false, false,
+                                &col_text_single, text_cell_x, text_cell_y, text_avail_w, text_cell_h,
+                                scroll_x_pt / PT_TO_PX, scroll_y_pt / PT_TO_PX, header_col_w_pt * scale, header_row_h_pt * scale, scale * PT_TO_PX, scale,[0x20, 0x20, 0x20], item.node.is_subtotal, false,
                                 10.0,
                                 "Carlito",
                                 "", "", text_avail_w,
@@ -1187,7 +1324,10 @@ impl<'a> CalcTileRenderer<'a> {
             // 支持两种模式：Outline（父节点独占一行，子节点另起一行）
             // 和 Tabular（父节点与子节点共享纵向空间，原有逻辑不变）。
             {
-                let is_outline = pivot.layout_mode == roe_model::calc::PivotLayoutMode::Outline;
+                let is_compact = pivot.layout_mode == roe_model::calc::PivotLayoutMode::Compact;
+                let is_outline = pivot.layout_mode == roe_model::calc::PivotLayoutMode::Outline || is_compact;
+                // 小计在下(subtotals_bottom)时,小计节点按普通行绘制在组末
+                let inline_subtotal = !pivot.subtotals_bottom;
 
                 struct RowItem<'a> {
                     node: &'a roe_model::calc::PivotHeaderNode,
@@ -1218,8 +1358,21 @@ impl<'a> CalcTileRenderer<'a> {
                     // 注释；col_fields非空场景经xlsx静态缓存值验证，中间层本来就不显示
                     // 数值，此处依然照常收集路径去查，若矩阵里没有对应key，
                     // pivot.data.get()会返回None，渲染层自然跳过不画，行为保持正确）。
-                    row_leaf_paths.insert(item.row_offset, item.path.clone());
-                    let sheet_col = pivot.base_col + item.depth; // 行表头：第0层在第0列，第1层在第1列...
+                    // 大纲/紧凑:小计并入上级标签行,小计节点本身不占行也不画
+                    if is_outline && inline_subtotal && item.node.is_subtotal {
+                        continue;
+                    }
+                    let mut lp = item.path.clone();
+                    if is_outline && inline_subtotal && item.node.children.iter().any(|c| c.is_subtotal) {
+                        lp.push(String::new());
+                    }
+                    // 小计在下时,带小计子节点的上级行不取值(其值由组末小计行展示,避免重复)
+                    let skip_data = is_outline && !inline_subtotal && item.node.children.iter().any(|c| c.is_subtotal);
+                    if !skip_data {
+                        row_leaf_paths.insert(item.row_offset, lp);
+                    }
+                    // 行表头：大纲/表格第0层在第0列、第1层在第1列...;紧凑全部落在第0列(层级靠缩进)
+                    let sheet_col = if is_compact { pivot.base_col } else { pivot.base_col + item.depth };
                     let sheet_row_start = pivot.base_row + pivot.data_row_start + item.row_offset;
                     // 该节点自身标题格占用的物理行数：
                     // Outline 模式下有子节点的父节点只占1行（标题独立），叶节点占1行；
@@ -1229,8 +1382,10 @@ impl<'a> CalcTileRenderer<'a> {
                     } else {
                         item.node.cached_span
                     };
+                    // 标签格视觉上只占首行(表格形式下不跨行盖住网格线);own_rows 仍用于子节点起始偏移
+                    let label_rows: u32 = 1;
                     if let Some((px, py, pw, _)) = cell_rect_px(sheet_row_start, sheet_col) {
-                        let total_h: f32 = (0..own_rows)
+                        let total_h: f32 = (0..label_rows)
                             .map(|k| row_height_at(sheet, sheet_row_start + k, cfg) * scale)
                             .sum();
                         let bg = if item.node.is_subtotal { subtotal_bg } else { header_bg };
@@ -1244,22 +1399,34 @@ impl<'a> CalcTileRenderer<'a> {
                         // row_path/col_path key 依赖它与 roe-polars-bridge 里 null 值转换结果
                         // 逐字一致，见 pivot.rs 的 ROOT-062 注释），这里仅在绘制文字时替换显示
                         // 文案为"(空白)"，不回写 item.node.value，不影响后续数据查值路径。
-                        let display_text: &str = if item.node.value.is_empty() && !item.node.is_subtotal {
-                            "(空白)"
+                        let display_owned: String = if item.node.is_subtotal {
+                            if item.node.value.is_empty() {
+                                String::new()
+                            } else {
+                                roe_model::pivot_layout::subtotal_label(&item.node.value, None)
+                            }
+                        } else if item.node.value.is_empty() {
+                            "(空白)".to_string()
                         } else {
-                            &item.node.value
+                            item.node.value.clone()
                         };
+                        let display_owned: String = if is_compact && item.depth > 0 && !display_owned.is_empty() {
+                            format!("{}{}", "  ".repeat(item.depth as usize), display_owned)
+                        } else {
+                            display_owned
+                        };
+                        let display_text: &str = &display_owned;
                         if !display_text.is_empty() {
                             let text_cell_x = col_x(sheet, sheet_col, cfg);
                             let text_cell_y = row_y(sheet, sheet_row_start, cfg);
                             let text_avail_w = col_width_at(sheet, sheet_col, cfg);
-                            let text_cell_h: f32 = (0..own_rows)
+                            let text_cell_h: f32 = (0..label_rows)
                                 .map(|k| row_height_at(sheet, sheet_row_start + k, cfg))
                                 .sum();
                             draw_cell_text(
                                 &mut self.font_context, &mut self.layout_context, &mut pixmap,
                                 display_text, text_cell_x, text_cell_y, text_avail_w, text_cell_h,
-                                scroll_x_pt / PT_TO_PX, scroll_y_pt / PT_TO_PX, header_col_w_pt * scale, header_row_h_pt * scale, scale * PT_TO_PX, scale,[0x20, 0x20, 0x20], false, false,
+                                scroll_x_pt / PT_TO_PX, scroll_y_pt / PT_TO_PX, header_col_w_pt * scale, header_row_h_pt * scale, scale * PT_TO_PX, scale,[0x20, 0x20, 0x20], item.node.is_subtotal || (is_outline && inline_subtotal && item.node.children.iter().any(|c| c.is_subtotal)), false,
                                 10.0,
                                 "Carlito",
                                 "", "", text_avail_w,
@@ -1327,10 +1494,11 @@ impl<'a> CalcTileRenderer<'a> {
                                 let text_avail_w = col_width_at(sheet, sheet_col, cfg);
                                 let text_cell_h = row_height_at(sheet, sheet_row, cfg);
                                 let text = format!("{:.2}", val);
+                                let is_sum_cell = row_path.iter().any(|x| x.is_empty()) || col_path.iter().any(|x| x.is_empty()) || row_path.is_empty() && !row_leaf_paths.is_empty() || col_path.is_empty() && !col_leaf_paths.is_empty();
                                 draw_cell_text(
                                     &mut self.font_context, &mut self.layout_context, &mut pixmap,
                                     &text, text_cell_x, text_cell_y, text_avail_w, text_cell_h,
-                                    scroll_x_pt / PT_TO_PX, scroll_y_pt / PT_TO_PX, header_col_w_pt * scale, header_row_h_pt * scale, scale * PT_TO_PX, scale,[0x20, 0x20, 0x20], false, false,
+                                    scroll_x_pt / PT_TO_PX, scroll_y_pt / PT_TO_PX, header_col_w_pt * scale, header_row_h_pt * scale, scale * PT_TO_PX, scale,[0x20, 0x20, 0x20], is_sum_cell, false,
                                     10.0,
                                     "Carlito",
                                     "", "", text_avail_w,
@@ -1386,7 +1554,7 @@ impl<'a> CalcTileRenderer<'a> {
                             draw_cell_text(
                                 &mut self.font_context, &mut self.layout_context, &mut pixmap,
                                 &label_text, text_cell_x, text_cell_y, text_avail_w, text_cell_h,
-                                scroll_x_pt / PT_TO_PX, scroll_y_pt / PT_TO_PX, header_col_w_pt * scale, header_row_h_pt * scale, scale * PT_TO_PX, scale,[0x20, 0x20, 0x20], false, false,
+                                scroll_x_pt / PT_TO_PX, scroll_y_pt / PT_TO_PX, header_col_w_pt * scale, header_row_h_pt * scale, scale * PT_TO_PX, scale,[0x20, 0x20, 0x20], true, false,
                                 10.0,
                                 "Carlito",
                                 "", "", text_avail_w,
@@ -1415,7 +1583,7 @@ impl<'a> CalcTileRenderer<'a> {
                                     draw_cell_text(
                                         &mut self.font_context, &mut self.layout_context, &mut pixmap,
                                         &text, text_cell_x, text_cell_y, text_avail_w, text_cell_h,
-                                        scroll_x_pt / PT_TO_PX, scroll_y_pt / PT_TO_PX, header_col_w_pt * scale, header_row_h_pt * scale, scale * PT_TO_PX, scale,[0x20, 0x20, 0x20], false, false,
+                                        scroll_x_pt / PT_TO_PX, scroll_y_pt / PT_TO_PX, header_col_w_pt * scale, header_row_h_pt * scale, scale * PT_TO_PX, scale,[0x20, 0x20, 0x20], true, false,
                                         10.0,
                                         "Carlito",
                                         "", "", text_avail_w,
@@ -1438,7 +1606,7 @@ impl<'a> CalcTileRenderer<'a> {
                         draw_cell_text(
                             &mut self.font_context, &mut self.layout_context, &mut pixmap,
                             total_label, text_cell_x, text_cell_y, text_avail_w, text_cell_h,
-                            scroll_x_pt / PT_TO_PX, scroll_y_pt / PT_TO_PX, header_col_w_pt * scale, header_row_h_pt * scale, scale * PT_TO_PX, scale,[0x20, 0x20, 0x20], false, false,
+                            scroll_x_pt / PT_TO_PX, scroll_y_pt / PT_TO_PX, header_col_w_pt * scale, header_row_h_pt * scale, scale * PT_TO_PX, scale,[0x20, 0x20, 0x20], true, false,
                             10.0,
                             "Carlito",
                             "", "", text_avail_w,
@@ -1468,7 +1636,7 @@ impl<'a> CalcTileRenderer<'a> {
                                     draw_cell_text(
                                         &mut self.font_context, &mut self.layout_context, &mut pixmap,
                                         &text, text_cell_x, text_cell_y, text_avail_w, text_cell_h,
-                                        scroll_x_pt / PT_TO_PX, scroll_y_pt / PT_TO_PX, header_col_w_pt * scale, header_row_h_pt * scale, scale * PT_TO_PX, scale,[0x20, 0x20, 0x20], false, false,
+                                        scroll_x_pt / PT_TO_PX, scroll_y_pt / PT_TO_PX, header_col_w_pt * scale, header_row_h_pt * scale, scale * PT_TO_PX, scale,[0x20, 0x20, 0x20], true, false,
                                         10.0,
                                         "Carlito",
                                         "", "", text_avail_w,
@@ -1503,7 +1671,7 @@ impl<'a> CalcTileRenderer<'a> {
                                     draw_cell_text(
                                         &mut self.font_context, &mut self.layout_context, &mut pixmap,
                                         &text, text_cell_x, text_cell_y, text_avail_w, text_cell_h,
-                                        scroll_x_pt / PT_TO_PX, scroll_y_pt / PT_TO_PX, header_col_w_pt * scale, header_row_h_pt * scale, scale * PT_TO_PX, scale,[0x20, 0x20, 0x20], false, false,
+                                        scroll_x_pt / PT_TO_PX, scroll_y_pt / PT_TO_PX, header_col_w_pt * scale, header_row_h_pt * scale, scale * PT_TO_PX, scale,[0x20, 0x20, 0x20], true, false,
                                         10.0,
                                         "Carlito",
                                         "", "", text_avail_w,
@@ -1808,7 +1976,7 @@ impl<'a> CalcTileRenderer<'a> {
 
                         let col_offset = c - af.header_col;
                         if af.hidden_buttons.contains(&col_offset) { continue; }
-                        let is_filtered = af.col_filters.contains_key(&col_offset);
+                        let is_filtered = af.col_filters.contains_key(&col_offset) || af.other_filtered_cols.contains(&col_offset);
                         draw_field_dropdown_btn(pixmap, sheet, cfg, tx, c, af.header_row, is_filtered);
                     }
                 }
@@ -2030,7 +2198,7 @@ mod tests {
                 name: "S1".to_string(),
                 data: vec![10.0, 20.0],
                 color: None,
-                as_line: false, trendline: false,
+                as_line: false, trendline: false, x_values: None, sizes: None,
             }],
             x_pt: 0.0,
             y_pt: 0.0,
@@ -2047,7 +2215,7 @@ mod tests {
             grouping: roe_model::impress::ChartGrouping::Standard,
             hole_size_pct: None,
             data_labels: Default::default(),
-            slice_border_color: None,
+            slice_border_color: None, legend_pos: None,
         });
         wb
     }
@@ -2858,7 +3026,7 @@ mod tests {
                 name: "S1".to_string(),
                 data: vec![10.0, 20.0],
                 color: None,
-                as_line: false, trendline: false,
+                as_line: false, trendline: false, x_values: None, sizes: None,
             }],
             x_pt: 0.0,
             y_pt: 0.0,
@@ -2875,7 +3043,7 @@ mod tests {
             grouping: roe_model::impress::ChartGrouping::Standard,
             hole_size_pct: None,
             data_labels: Default::default(),
-            slice_border_color: None,
+            slice_border_color: None, legend_pos: None,
         };
         let no_border = render_chart_model_to_rgba(&model, 200, 150)
             .expect("render_chart_model_to_rgba should succeed");
@@ -2902,7 +3070,7 @@ mod tests {
                 name: "S1".to_string(),
                 data: vec![10.0, 20.0],
                 color: None,
-                as_line: false, trendline: false,
+                as_line: false, trendline: false, x_values: None, sizes: None,
             }],
             x_pt: 0.0,
             y_pt: 0.0,
@@ -2919,7 +3087,7 @@ mod tests {
             grouping: roe_model::impress::ChartGrouping::Standard,
             hole_size_pct: None,
             data_labels: Default::default(),
-            slice_border_color: None,
+            slice_border_color: None, legend_pos: None,
         };
         let legend_on = render_chart_model_to_rgba(&model, 200, 150)
             .expect("render_chart_model_to_rgba should succeed");
@@ -3222,5 +3390,116 @@ mod scroll_consistency_tests {
         eprintln!("[T3] scroll=0 标题栏线 {} 条, 数据网格线 {} 条, 最大偏差 {:.1}px\n{}", hdr.len(), data.len(), worst, log);
         assert!(!hdr.is_empty() && !data.is_empty());
         assert!(worst <= 2.5, "scroll=0 下标题栏线与网格线仍有偏差 {:.1}px，可能是逐行累计", worst);
+    }
+}
+
+
+#[cfg(test)]
+mod frozen_render_tests {
+    use super::*;
+    use roe_model::calc::*;
+    use smallvec::smallvec;
+    use crate::tile_geometry::{col_x_px, row_y_px};
+
+    const VW: u32 = 600;
+    const VH: u32 = 400;
+    const HW: f32 = 30.0; // 逻辑 pt，与前台 60/2 一致
+    const HH: f32 = 18.0; // 逻辑 pt，与前台 36/2 一致
+    const SCALE: f32 = 2.0; // zoom_pct=200
+
+    fn make(fr: u32, fc: u32) -> Workbook {
+        let mut wb = super::tests::make_workbook();
+        let mut grid = SparseGrid::default();
+        for c in 0..10u32 {
+            grid.cols.insert(c, SparseColumn {
+                blocks: smallvec![CellBlock {
+                    start_row: 0,
+                    values: (0..20u32)
+                        .map(|r| CellValue::Text(format!("r{}c{}", r, c).into()))
+                        .collect(),
+                }],
+            });
+        }
+        wb.sheets[0].cells = grid;
+        wb.sheets[0].frozen_rows = fr;
+        wb.sheets[0].frozen_cols = fc;
+        wb
+    }
+
+    fn render(wb: &Workbook, sx: f32, sy: f32) -> Vec<u8> {
+        let mut r = CalcTileRenderer::new(wb);
+        r.sheet_idx = 0;
+        let mut buf = vec![0u8; (VW * VH * 4) as usize];
+        assert!(r.render_viewport_into(sx, sy, VW, VH, 200, HW, HH, &mut buf), "render 失败");
+        buf
+    }
+
+    /// 同缓冲坐标比较，区域 x∈[x0,x1) y∈[y0,y1)，返回不一致像素数。
+    fn mismatches(a: &[u8], b: &[u8], x0: u32, x1: u32, y0: u32, y1: u32) -> usize {
+        let mut n = 0;
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let i = ((y * VW + x) * 4) as usize;
+                if a[i..i + 4] != b[i..i + 4] { n += 1; }
+            }
+        }
+        n
+    }
+
+    fn nonwhite(b: &[u8], x0: u32, x1: u32, y0: u32, y1: u32) -> usize {
+        let mut n = 0;
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let i = ((y * VW + x) * 4) as usize;
+                if b[i] < 250 || b[i + 1] < 250 || b[i + 2] < 250 { n += 1; }
+            }
+        }
+        n
+    }
+
+    /// 守卫：scroll=0 时冻结区与滚动区连续，整图应与不冻结逐像素相同。
+    #[test]
+    fn frozen_scroll_zero_equals_unfrozen() {
+        let f = render(&make(2, 1), 0.0, 0.0);
+        let u = render(&make(0, 0), 0.0, 0.0);
+        let n = mismatches(&f, &u, 0, VW, 0, VH);
+        assert_eq!(n, 0, "scroll=0 时冻结与不冻结应逐像素一致，不一致 {n} 个");
+    }
+
+    /// 语义A（滚动区相对滚动量，等价于原路径 scroll=(sx,sy) 的滚动区）：
+    /// 冻结区固定在 scroll=0 的内容，其余区域随滚动。全部同坐标比较，无平移。
+    /// 角=不冻结(0,0)；上右=不冻结(sx,0)；下左=不冻结(0,sy)；下右=不冻结(sx,sy)。
+    #[test]
+    fn frozen_scrolled_quadrants_match_unfrozen() {
+        let (sx, sy) = (100.0f32, 60.0f32);
+        let plain = make(0, 0);
+        let cfg = CalcRenderConfig::default();
+        let fw_f = col_x_px(&plain.sheets[0], 1, &cfg) * SCALE;
+        let fh_f = row_y_px(&plain.sheets[0], 2, &cfg) * SCALE;
+        assert!(fw_f.fract().abs() < 1e-3 && fh_f.fract().abs() < 1e-3,
+            "前提不成立：冻结物理像素非整数 fw={fw_f} fh={fh_f}");
+        let xs = (HW * SCALE) as u32 + fw_f as u32;
+        let ys = (HH * SCALE) as u32 + fh_f as u32;
+        assert!(xs < VW && ys < VH, "冻结区超出视口");
+
+        let frozen = render(&make(2, 1), sx, sy);
+        let r00 = render(&plain, 0.0, 0.0);
+        let r10 = render(&plain, sx, 0.0);
+        let r01 = render(&plain, 0.0, sy);
+        let r11 = render(&plain, sx, sy);
+
+        // 参照区域必须有内容，否则断言无判别力
+        assert!(nonwhite(&r00, 0, xs, 0, ys) > 100, "角参照近乎空白");
+        assert!(nonwhite(&r10, xs, VW, 0, ys) > 100, "上右参照近乎空白");
+        assert!(nonwhite(&r01, 0, xs, ys, VH) > 100, "下左参照近乎空白");
+        assert!(nonwhite(&r11, xs, VW, ys, VH) > 100, "下右参照近乎空白");
+
+        let corner = mismatches(&frozen, &r00, 0, xs, 0, ys);
+        let topright = mismatches(&frozen, &r10, xs, VW, 0, ys);
+        let botleft = mismatches(&frozen, &r01, 0, xs, ys, VH);
+        let botright = mismatches(&frozen, &r11, xs, VW, ys, VH);
+        eprintln!("[FZ] xs={xs} ys={ys} 不一致像素 角={corner} 上右={topright} 下左={botleft} 下右={botright}");
+        assert_eq!(corner + topright + botleft + botright, 0,
+            "象限不一致: 角={corner} 上右={topright} 下左={botleft} 下右={botright}");
     }
 }

@@ -45,7 +45,12 @@ pub extern "C" fn roe_pivot_sheet(
             set_last_error("roe_pivot_sheet: 非 Calc 文档");
             return u32::MAX;
         };
-        match roe_polars_bridge::pivot_sheet_into_workbook_v2(wb, sheet_idx as usize, &cfg, result_name) {
+        // 用户新建的透视表默认关闭行/列小计（界面清爽），总计默认保留；
+        // 需要更细粒度时由前台开关（roe_pivot_set_subtotals）打开。
+        match roe_polars_bridge::pivot_sheet_into_workbook_v2_opt(
+            wb, sheet_idx as usize, &cfg, result_name, &[],
+            roe_polars_bridge::PivotOpts { row_subtotals: false, col_subtotals: false },
+        ) {
             Ok(idx) => idx as u32,
             Err(e) => { set_last_error(format!("roe_pivot_sheet: {e}")); u32::MAX }
         }
@@ -286,6 +291,87 @@ pub extern "C" fn roe_pivot_set_sort(
     }
 }
 
+/// 开关透视表的总计并就地刷新。bottom_row!=0 显示最下面一行总计，
+/// right_col!=0 显示最右边一列总计。
+/// 不做撤销快照,调用方用 roe_begin_edit/roe_commit_edit 包住。
+/// 返回 0=成功,-1=失败(见 roe_last_error_message)。失败时 sheet 不变。
+#[no_mangle]
+pub extern "C" fn roe_pivot_set_grand_totals(handle: u64, sheet_idx: u32, bottom_row: i32, right_col: i32) -> i32 {
+    let r = handle::with_entry(handle, |entry| -> Result<(), String> {
+        let RoeDocument::Calc(wb) = &mut entry.doc else { return Err("非 Calc 文档".into()); };
+        roe_polars_bridge::pivot_set_grand_totals_in_place(wb, sheet_idx as usize, bottom_row != 0, right_col != 0)
+            .map_err(|e| format!("{e}"))
+    });
+    match r {
+        Some(Ok(())) => 0,
+        Some(Err(e)) => { set_last_error(format!("roe_pivot_set_grand_totals: {e}")); -1 }
+        None => { set_last_error("roe_pivot_set_grand_totals: 无效句柄"); -1 }
+    }
+}
+
+/// 切换透视表布局形态并就地刷新。mode: 0=大纲(outline) 1=紧凑(compact) 2=表格(tabular)。
+/// 不做撤销快照,调用方用 roe_begin_edit/roe_commit_edit 包住。
+/// 返回 0=成功,-1=失败(含非法 mode,见 roe_last_error_message)。失败时 sheet 不变。
+#[no_mangle]
+pub extern "C" fn roe_pivot_set_layout(handle: u64, sheet_idx: u32, mode: i32) -> i32 {
+    use roe_model::calc::PivotLayoutMode as M;
+    let m = match mode {
+        0 => M::Outline,
+        1 => M::Compact,
+        2 => M::Tabular,
+        _ => { set_last_error(format!("roe_pivot_set_layout: 非法 mode={mode}")); return -1; }
+    };
+    let r = handle::with_entry(handle, |entry| -> Result<(), String> {
+        let RoeDocument::Calc(wb) = &mut entry.doc else { return Err("非 Calc 文档".into()); };
+        roe_polars_bridge::pivot_set_layout_in_place(wb, sheet_idx as usize, m)
+            .map_err(|e| format!("{e}"))
+    });
+    match r {
+        Some(Ok(())) => 0,
+        Some(Err(e)) => { set_last_error(format!("roe_pivot_set_layout: {e}")); -1 }
+        None => { set_last_error("roe_pivot_set_layout: 无效句柄"); -1 }
+    }
+}
+
+/// 开关透视表的分类小计并就地刷新。row_on/col_on != 0 显示（默认），==0 隐藏。
+/// 不做撤销快照,调用方用 roe_begin_edit/roe_commit_edit 包住。
+/// 返回 0=成功,-1=失败(见 roe_last_error_message)。失败时 sheet 不变。
+#[no_mangle]
+pub extern "C" fn roe_pivot_set_subtotals(handle: u64, sheet_idx: u32, row_on: i32, col_on: i32) -> i32 {
+    let r = handle::with_entry(handle, |entry| -> Result<(), String> {
+        let RoeDocument::Calc(wb) = &mut entry.doc else { return Err("非 Calc 文档".into()); };
+        roe_polars_bridge::pivot_set_subtotals_in_place(wb, sheet_idx as usize, row_on != 0, col_on != 0)
+            .map_err(|e| format!("{e}"))
+    });
+    match r {
+        Some(Ok(())) => 0,
+        Some(Err(e)) => { set_last_error(format!("roe_pivot_set_subtotals: {e}")); -1 }
+        None => { set_last_error("roe_pivot_set_subtotals: 无效句柄"); -1 }
+    }
+}
+
+/// 设置大纲/紧凑形式下小计位置并就地刷新。top: 1=小计在上(默认,并入上级行) 0=小计在组底。
+/// 表格形式恒在组末,不受影响。不做撤销快照,调用方用 roe_begin_edit/roe_commit_edit 包住。
+/// 返回 0=成功,-1=失败(含非法 top,见 roe_last_error_message)。失败时 sheet 不变。
+#[no_mangle]
+pub extern "C" fn roe_pivot_set_subtotals_top(handle: u64, sheet_idx: u32, top: i32) -> i32 {
+    let t = match top {
+        0 => false,
+        1 => true,
+        _ => { set_last_error(format!("roe_pivot_set_subtotals_top: 非法 top={top}")); return -1; }
+    };
+    let r = handle::with_entry(handle, |entry| -> Result<(), String> {
+        let RoeDocument::Calc(wb) = &mut entry.doc else { return Err("非 Calc 文档".into()); };
+        roe_polars_bridge::pivot_set_subtotals_position_in_place(wb, sheet_idx as usize, t)
+            .map_err(|e| format!("{e}"))
+    });
+    match r {
+        Some(Ok(())) => 0,
+        Some(Err(e)) => { set_last_error(format!("roe_pivot_set_subtotals_top: {e}")); -1 }
+        None => { set_last_error("roe_pivot_set_subtotals_top: 无效句柄"); -1 }
+    }
+}
+
 /// 返回透视表当前配置 JSON:
 /// {"rows":[..],"cols":[..],"values":[..],"filters":[..],"source_idx":N,"fields":[数据源全部列名]}
 /// values 为值字段的真实源列名;source_idx 找不到为 -1。失败返回 null。
@@ -517,6 +603,64 @@ mod pivot_set_filter_sort_tests {
         assert_eq!(roe_pivot_set_filter(h, idx, f.as_ptr(), v.as_ptr()), -1);
         assert_eq!(roe_pivot_set_sort(h, idx, f.as_ptr(), 0), -1);
         assert_eq!(rows(h, idx), vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn set_subtotals_toggles_flag() {
+        let (h, idx) = make_pivot();
+        // 返回 (hide_row_subtotals, hide_col_subtotals)
+        let hidden = |h: u64, idx: u32| handle::with_entry(h, |e| {
+            let RoeDocument::Calc(wb) = &e.doc else { panic!() };
+            let m = wb.sheets[idx as usize].pivot.as_ref().unwrap();
+            (m.hide_row_subtotals, m.hide_col_subtotals)
+        }).unwrap();
+        // roe_pivot_sheet 新建的透视表默认关闭行/列小计
+        assert_eq!(hidden(h, idx), (true, true), "新建默认隐藏小计");
+        assert_eq!(roe_pivot_set_subtotals(h, idx, 1, 0), 0);
+        assert_eq!(hidden(h, idx), (false, true));
+        assert_eq!(roe_pivot_set_subtotals(h, idx, 0, 1), 0);
+        assert_eq!(hidden(h, idx), (true, false));
+        assert_eq!(roe_pivot_set_subtotals(h, idx, 1, 1), 0);
+        assert_eq!(hidden(h, idx), (false, false));
+        assert_eq!(roe_pivot_set_subtotals(h, idx, 0, 0), 0);
+        assert_eq!(hidden(h, idx), (true, true));
+        assert_eq!(roe_pivot_set_subtotals(h, 999, 0, 0), -1, "越界 sheet");
+        assert_eq!(roe_pivot_set_subtotals(0, 0, 1, 1), -1, "无效句柄");
+    }
+
+    #[test]
+    fn set_subtotals_top_toggles_flag() {
+        let (h, idx) = make_pivot();
+        let bottom = |h: u64, idx: u32| handle::with_entry(h, |e| {
+            let RoeDocument::Calc(wb) = &e.doc else { panic!() };
+            wb.sheets[idx as usize].pivot.as_ref().unwrap().subtotals_bottom
+        }).unwrap();
+        assert!(!bottom(h, idx), "默认小计在上");
+        assert_eq!(roe_pivot_set_subtotals_top(h, idx, 0), 0);
+        assert!(bottom(h, idx));
+        assert_eq!(roe_pivot_set_subtotals_top(h, idx, 1), 0);
+        assert!(!bottom(h, idx));
+        assert_eq!(roe_pivot_set_subtotals_top(h, idx, 2), -1, "非法 top");
+        assert!(!bottom(h, idx), "失败不改状态");
+        assert_eq!(roe_pivot_set_subtotals_top(h, 999, 0), -1, "越界 sheet");
+        assert_eq!(roe_pivot_set_subtotals_top(0, 0, 1), -1, "无效句柄");
+    }
+
+    #[test]
+    fn set_grand_totals_toggles_flags() {
+        let (h, idx) = make_pivot();
+        let flags = |h: u64, idx: u32| handle::with_entry(h, |e| {
+            let RoeDocument::Calc(wb) = &e.doc else { panic!() };
+            let m = wb.sheets[idx as usize].pivot.as_ref().unwrap();
+            (m.row_grand_totals, m.col_grand_totals)
+        }).unwrap();
+        assert_eq!(flags(h, idx), (true, true));
+        assert_eq!(roe_pivot_set_grand_totals(h, idx, 0, 1), 0);
+        assert_eq!(flags(h, idx), (false, true));
+        assert_eq!(roe_pivot_set_grand_totals(h, idx, 1, 0), 0);
+        assert_eq!(flags(h, idx), (true, false));
+        assert_eq!(roe_pivot_set_grand_totals(h, 999, 1, 1), -1, "越界 sheet");
+        assert_eq!(roe_pivot_set_grand_totals(0, 0, 1, 1), -1, "无效句柄");
     }
 
     #[test]

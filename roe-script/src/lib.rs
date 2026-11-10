@@ -28,6 +28,7 @@ pub mod calc_df_api;
 pub mod writer_api;
 pub mod impress_api;
 pub mod media_context;
+pub mod export_queue;
 pub mod index;
 pub mod engine;
 

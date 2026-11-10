@@ -16,10 +16,10 @@
 //! - master_slides：母版/版式的形状和背景由 write_masters_and_layouts 从内存模型
 //!   写回（v320i 往返探针 roundtrip_master_edit 验证）；早期"只写固定最小占位
 //!   master"的说法已过时
-//! - ShapeStyle.shadow：parser 不读
-//! - FillStyle::Gradient：parser 只读 srgbClr（→Solid）和 noFill（→None），
-//!   不解析渐变；写出时如果遇到 Gradient 变体，退化为写 noFill（保底，
-//!   不报错，但提示性的从根本上说这属于"超出当前 parser 表达能力"的输入）
+//! - ShapeStyle.shadow：v316 起读写 outerShdw（颜色/alpha/偏移/模糊；algn 不保留）
+//! - FillStyle::Gradient/Pattern：背景与形状均已支持写出和读取（v315 起），
+//!   见 write_fill_xml_for_shape 与背景写出段；PictureTiled 背景已写出，
+//!   形状级 Picture/PictureTiled 仍写 noFill（三期）
 //! - Paragraph 除 runs[].text 外的字段（alignment等）：parser 不读
 //! - Run 除 text 外的字段（bold/italic/font_size等）：parser 不读
 //! - stroke 颜色：parser 读 stroke 时颜色硬编码黑色（pptx.rs 第429行
@@ -372,7 +372,7 @@ fn write_slide_xml(
     let mut images: Vec<(String, Vec<u8>)> = Vec::new();
     let mut rid_counter: u32 = 1;
 
-    // v318p: 幻灯片背景写出（纯色 / 图片）。渐变与平铺暂不写，保持无 <p:bg>。
+    // 幻灯片背景写出：纯色 / 图片 / 渐变 / 图案 / 平铺。None 时不写 <p:bg>。
     let mut bg_xml = String::new();
     match &slide.background {
         Some(FillStyle::Solid(c)) => {
@@ -393,30 +393,79 @@ fn write_slide_xml(
                 r#"<p:bg><p:bgPr><a:blipFill dpi="0" rotWithShape="1"><a:blip r:embed="{rid}"/><a:srcRect/><a:stretch><a:fillRect/></a:stretch></a:blipFill><a:effectLst/></p:bgPr></p:bg>"#
             );
         }
+        Some(FillStyle::PictureTiled { image, tile_offset_x, tile_offset_y, tile_scale_x, tile_scale_y, tile_align }) => {
+            // v315: 平铺背景写出 <a:blipFill><a:blip/><a:srcRect/><a:tile/></a:blipFill>
+            let ext = mime_to_ext(&image.mime);
+            let filename = format!("image{}.{}", *media_counter, ext);
+            *media_counter += 1;
+            let rid = format!("rId{rid_counter}");
+            rid_counter += 1;
+            images.push((format!("ppt/media/{filename}"), image.data.clone()));
+            image_rels.push((rid.clone(), filename));
+            let algn = match tile_align.as_str() {
+                "tl" | "t" | "tr" | "l" | "ctr" | "r" | "bl" | "b" | "br" => tile_align.as_str(),
+                _ => "tl",
+            };
+            let tx = (*tile_offset_x as f64 * 12700.0).round() as i64;
+            let ty = (*tile_offset_y as f64 * 12700.0).round() as i64;
+            let sx = (*tile_scale_x as f64 * 100000.0).round() as i64;
+            let sy = (*tile_scale_y as f64 * 100000.0).round() as i64;
+            bg_xml = format!(
+                r#"<p:bg><p:bgPr><a:blipFill dpi="0" rotWithShape="1"><a:blip r:embed="{rid}"/><a:srcRect/><a:tile tx="{tx}" ty="{ty}" sx="{sx}" sy="{sy}" flip="none" algn="{algn}"/></a:blipFill><a:effectLst/></p:bgPr></p:bg>"#
+            );
+        }
         Some(FillStyle::Gradient { stops, kind, .. }) if !stops.is_empty() => {
             // v318p: 渐变背景写出，角度 = 度数 × 60000
             let mut gs = String::new();
             for s in stops {
-                gs.push_str(&format!(
-                    r#"<a:gs pos="{}"><a:srgbClr val="{:02X}{:02X}{:02X}"/></a:gs>"#,
-                    (s.pos.clamp(0.0, 1.0) * 100000.0).round() as i32,
-                    s.color.r, s.color.g, s.color.b
-                ));
+                let pos = (s.pos.clamp(0.0, 1.0) * 100000.0).round() as i32;
+                if s.color.a < 255 {
+                    gs.push_str(&format!(
+                        r#"<a:gs pos="{}"><a:srgbClr val="{:02X}{:02X}{:02X}"><a:alpha val="{}"/></a:srgbClr></a:gs>"#,
+                        pos, s.color.r, s.color.g, s.color.b,
+                        (s.color.a as u32) * 100000 / 255
+                    ));
+                } else {
+                    gs.push_str(&format!(
+                        r#"<a:gs pos="{}"><a:srgbClr val="{:02X}{:02X}{:02X}"/></a:gs>"#,
+                        pos, s.color.r, s.color.g, s.color.b
+                    ));
+                }
             }
             let shade = match kind {
                 roe_model::common::GradientKind::Linear { angle } => format!(
                     r#"<a:lin ang="{}" scaled="0"/>"#,
                     (angle.rem_euclid(360.0) * 60000.0).round() as i32
                 ),
-                roe_model::common::GradientKind::Radial => {
-                    r#"<a:path path="circle"><a:fillToRect l="50000" t="50000" r="50000" b="50000"/></a:path>"#.to_string()
+                roe_model::common::GradientKind::Radial { cx, cy } => {
+                    let (l, t, r, b) = fill_to_rect_from_center(*cx, *cy);
+                    format!(r#"<a:path path="circle"><a:fillToRect l="{l}" t="{t}" r="{r}" b="{b}"/></a:path>"#)
                 }
-                roe_model::common::GradientKind::Rect => {
-                    r#"<a:path path="rect"><a:fillToRect l="50000" t="50000" r="50000" b="50000"/></a:path>"#.to_string()
+                roe_model::common::GradientKind::Rect { cx, cy } => {
+                    let (l, t, r, b) = fill_to_rect_from_center(*cx, *cy);
+                    format!(r#"<a:path path="rect"><a:fillToRect l="{l}" t="{t}" r="{r}" b="{b}"/></a:path>"#)
                 }
             };
             bg_xml = format!(
                 r#"<p:bg><p:bgPr><a:gradFill rotWithShape="1"><a:gsLst>{gs}</a:gsLst>{shade}</a:gradFill><a:effectLst/></p:bgPr></p:bg>"#
+            );
+        }
+        Some(FillStyle::Pattern { preset, fg, bg }) => {
+            // v315: 图案背景写出 <a:pattFill prst><a:fgClr/><a:bgClr/></a:pattFill>
+            let clr = |c: &roe_model::common::Color| -> String {
+                if c.a < 255 {
+                    format!(
+                        r#"<a:srgbClr val="{:02X}{:02X}{:02X}"><a:alpha val="{}"/></a:srgbClr>"#,
+                        c.r, c.g, c.b, (c.a as u32) * 100000 / 255
+                    )
+                } else {
+                    format!(r#"<a:srgbClr val="{:02X}{:02X}{:02X}"/>"#, c.r, c.g, c.b)
+                }
+            };
+            let prst: String = preset.chars().filter(|ch| ch.is_ascii_alphanumeric()).collect();
+            bg_xml = format!(
+                r#"<p:bg><p:bgPr><a:pattFill prst="{prst}"><a:fgClr>{}</a:fgClr><a:bgClr>{}</a:bgClr></a:pattFill><a:effectLst/></p:bgPr></p:bg>"#,
+                clr(fg), clr(bg)
             );
         }
         _ => {}
@@ -583,8 +632,10 @@ fn write_grp_sp_xml(
 
 fn write_sp_xml(shape: &Shape) -> String {
     let (off_ext, prst) = write_xfrm_and_geom(&shape.position, &shape.geometry);
-    let fill_xml = write_fill_xml(&shape.style.fill);
+    let fill_xml = write_fill_xml_for_shape(&shape.style.fill, &shape.position);
     let stroke_xml = write_stroke_xml(&shape.style.stroke);
+    let effect_xml = write_shadow_xml_v316(&shape.style.shadow);
+    let av_xml = geometry_av_xml_v316(&shape.geometry);
     let tx_body = write_tx_body(&shape.content, &shape.text_body);
     // v320c2: write placeholder identity
     let nv_pr = match &shape.placeholder {
@@ -600,7 +651,7 @@ fn write_sp_xml(shape: &Shape) -> String {
     format!(
         r#"<p:sp>
 <p:nvSpPr><p:cNvPr id="{}" name="Shape {}"/><p:cNvSpPr/>{nv_pr}</p:nvSpPr>
-<p:spPr>{off_ext}<a:prstGeom prst="{prst}"/>{fill_xml}{stroke_xml}</p:spPr>
+<p:spPr>{off_ext}<a:prstGeom prst="{prst}">{av_xml}</a:prstGeom>{fill_xml}{stroke_xml}{effect_xml}</p:spPr>
 {tx_body}</p:sp>
 "#,
         shape.id, shape.id
@@ -755,19 +806,122 @@ fn geometry_to_prst(geometry: &ShapeGeometry) -> String {
         ShapeGeometry::Triangle => "triangle".to_string(),
         ShapeGeometry::Line => "line".to_string(),
         ShapeGeometry::Custom(s) => s.clone(),
+        // v316: 预设形状写回 prst 名字；名字为空的 custGeom 暂仍写 custom（遗留）
+        ShapeGeometry::PresetPath(d) if !d.preset_name.is_empty() => d.preset_name.clone(),
         ShapeGeometry::PresetPath(_) => "custom".to_string(),
     }
 }
 
 // ─── Fill ──────────────────────────────────────────────────────────────────
 
+/// v315: 渐变中心点(0~1) → fillToRect 的 l/t/r/b（十万分之一）。
+fn fill_to_rect_from_center(cx: f32, cy: f32) -> (i32, i32, i32, i32) {
+    let cx = cx.clamp(0.0, 1.0);
+    let cy = cy.clamp(0.0, 1.0);
+    (
+        (cx * 100000.0).round() as i32,
+        (cy * 100000.0).round() as i32,
+        ((1.0 - cx) * 100000.0).round() as i32,
+        ((1.0 - cy) * 100000.0).round() as i32,
+    )
+}
+
+/// v316: 预设几何的 <a:avLst>（adj 覆盖值）。无覆盖时写空 avLst。
+fn geometry_av_xml_v316(geometry: &ShapeGeometry) -> String {
+    match geometry {
+        ShapeGeometry::PresetPath(d) if !d.preset_name.is_empty() && !d.adj_overrides.is_empty() => {
+            let mut gd = String::new();
+            for (name, val) in &d.adj_overrides {
+                let n: String = name.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+                gd.push_str(&format!(r#"<a:gd name="{}" fmla="val {}"/>"#, n, val.round() as i64));
+            }
+            format!("<a:avLst>{gd}</a:avLst>")
+        }
+        _ => "<a:avLst/>".to_string(),
+    }
+}
+
+/// v316: 形状外阴影写出。offset_x/offset_y(pt) 反算 dist(EMU)/dir(1/60000 度)。
+fn write_shadow_xml_v316(shadow: &Option<roe_model::common::ShadowStyle>) -> String {
+    let sd = match shadow {
+        Some(sd) => sd,
+        None => return String::new(),
+    };
+    let dist = ((sd.offset_x as f64).hypot(sd.offset_y as f64) * 12700.0).round() as i64;
+    let deg = (sd.offset_y as f64).atan2(sd.offset_x as f64).to_degrees();
+    let dir = ((deg * 60000.0).round() as i64).rem_euclid(21_600_000);
+    let blur = ((sd.blur as f64) * 12700.0).round().max(0.0) as i64;
+    format!(
+        r#"<a:effectLst><a:outerShdw blurRad="{blur}" dist="{dist}" dir="{dir}" algn="ctr" rotWithShape="0">{}</a:outerShdw></a:effectLst>"#,
+        color_xml_v315(&sd.color)
+    )
+}
+
+/// v315: 颜色 → srgbClr（带 alpha 时写子元素）。
+fn color_xml_v315(c: &roe_model::common::Color) -> String {
+    if c.a < 255 {
+        format!(
+            r#"<a:srgbClr val="{:02X}{:02X}{:02X}"><a:alpha val="{}"/></a:srgbClr>"#,
+            c.r, c.g, c.b, (c.a as u32) * 100000 / 255
+        )
+    } else {
+        format!(r#"<a:srgbClr val="{:02X}{:02X}{:02X}"/>"#, c.r, c.g, c.b)
+    }
+}
+
+/// v315: 形状级填充写出。渐变需要形状的旋转/flip 来反向还原线性角度
+/// （读取公式见 pptx.rs raw_to_shape：flipH → 180°-a；flipV → -a；
+/// rotWithShape 时 + rot；写出按相反顺序还原）。其余填充走 write_fill_xml。
+fn write_fill_xml_for_shape(fill: &Option<FillStyle>, pos: &roe_model::common::Transform) -> String {
+    match fill {
+        Some(FillStyle::Gradient { stops, kind, rotate_with_shape }) if !stops.is_empty() => {
+            let mut gs = String::new();
+            for s in stops {
+                gs.push_str(&format!(
+                    r#"<a:gs pos="{}">{}</a:gs>"#,
+                    (s.pos.clamp(0.0, 1.0) * 100000.0).round() as i32,
+                    color_xml_v315(&s.color)
+                ));
+            }
+            let shade = match kind {
+                roe_model::common::GradientKind::Linear { angle } => {
+                    let mut a = (*angle as f64) * 60000.0;
+                    if *rotate_with_shape {
+                        a -= (pos.rotation.unwrap_or(0.0) as f64) * 60000.0;
+                    }
+                    if pos.flip_v.unwrap_or(false) { a = -a; }
+                    if pos.flip_h.unwrap_or(false) { a = 180.0 * 60000.0 - a; }
+                    let raw = (a.round() as i64).rem_euclid(21_600_000) as i32;
+                    format!(r#"<a:lin ang="{raw}" scaled="0"/>"#)
+                }
+                roe_model::common::GradientKind::Radial { cx, cy } => {
+                    let (l, t, r, b) = fill_to_rect_from_center(*cx, *cy);
+                    format!(r#"<a:path path="circle"><a:fillToRect l="{l}" t="{t}" r="{r}" b="{b}"/></a:path>"#)
+                }
+                roe_model::common::GradientKind::Rect { cx, cy } => {
+                    let (l, t, r, b) = fill_to_rect_from_center(*cx, *cy);
+                    format!(r#"<a:path path="rect"><a:fillToRect l="{l}" t="{t}" r="{r}" b="{b}"/></a:path>"#)
+                }
+            };
+            let rws = if *rotate_with_shape { "1" } else { "0" };
+            format!(r#"<a:gradFill rotWithShape="{rws}"><a:gsLst>{gs}</a:gsLst>{shade}</a:gradFill>"#)
+        }
+        Some(FillStyle::Pattern { preset, fg, bg }) => {
+            let prst: String = preset.chars().filter(|ch| ch.is_ascii_alphanumeric()).collect();
+            format!(
+                r#"<a:pattFill prst="{prst}"><a:fgClr>{}</a:fgClr><a:bgClr>{}</a:bgClr></a:pattFill>"#,
+                color_xml_v315(fg), color_xml_v315(bg)
+            )
+        }
+        _ => write_fill_xml(fill),
+    }
+}
+
 fn write_fill_xml(fill: &Option<FillStyle>) -> String {
     match fill {
         Some(FillStyle::Solid(c)) => {
-            format!(
-                r#"<a:solidFill><a:srgbClr val="{:02X}{:02X}{:02X}"/></a:solidFill>"#,
-                c.r, c.g, c.b
-            )
+            // v316: 带 alpha 时写 <a:alpha/> 子元素
+            format!(r#"<a:solidFill>{}</a:solidFill>"#, color_xml_v315(c))
         }
         // None 变体 与 fill 字段本身是 Option::None 都写 noFill：
         // parser 读 noFill 标签时产出 Some(FillStyle::None)，不是 Option::None
@@ -777,7 +931,7 @@ fn write_fill_xml(fill: &Option<FillStyle>) -> String {
         // 区分"完全没写 spPr 填充标签"和"显式写了 noFill"，统一按 noFill 处理
         // 更安全（不会让 PowerPoint 默认填充意外出现）。
         Some(FillStyle::None) | None => "<a:noFill/>".to_string(),
-        // Gradient：parser 不支持解析，写出时退化为 noFill（保底，不报错）。
+        // Gradient：此处是旧的简易填充函数的保底分支；形状渐变走 write_fill_xml_for_shape。
         Some(FillStyle::Gradient { .. }) => "<a:noFill/>".to_string(),
         // PROOT-005: FillStyle::Picture 目前只会出现在 Slide/MasterSlide.background
         // （<p:bg> 场景），本函数是普通 shape 的 <p:spPr> 填充写出，不会实际遇到
@@ -790,6 +944,8 @@ fn write_fill_xml(fill: &Option<FillStyle>) -> String {
         // 未实现（本次任务只做读取解析+渲染显示），降级为 noFill 保底，
         // 不报错，与 Picture 分支保持同样处理方式。
         Some(FillStyle::PictureTiled { .. }) => "<a:noFill/>".to_string(),
+        // Pattern：同上，形状图案走 write_fill_xml_for_shape，此处保底 noFill。
+        Some(FillStyle::Pattern { .. }) => "<a:noFill/>".to_string(),
     }
 }
 
@@ -807,7 +963,8 @@ fn write_stroke_xml(stroke: &Option<roe_model::impress::StrokeStyle>) -> String 
             // 颜色子元素本就去掉：parser 读 stroke 颜色硬编码黑色
             // （pptx.rs 第429行），写真实颜色没有验证意义，且写成子元素
             // 还会把 <a:ln> 变成展开标签，反而读不到宽度，因小失大。
-            format!(r#"<a:ln w="{w}"/>"#)
+            // v316: 展开形式写出描边颜色（含 alpha），解析器 Start 分支已支持
+            format!(r#"<a:ln w="{w}"><a:solidFill>{}</a:solidFill></a:ln>"#, color_xml_v315(&s.color))
         }
         None => String::new(),
     }
@@ -1112,7 +1269,7 @@ mod tests {
                 roe_model::common::GradientStop { pos: 0.0, color: Color { r: 1, g: 2, b: 3, a: 255 } },
                 roe_model::common::GradientStop { pos: 1.0, color: Color { r: 4, g: 5, b: 6, a: 255 } },
             ],
-            kind: roe_model::common::GradientKind::Radial,
+            kind: roe_model::common::GradientKind::Radial { cx: 0.5, cy: 0.5 },
             rotate_with_shape: true,
         });
         let prs = make_presentation(vec![slide]);
@@ -1120,9 +1277,573 @@ mod tests {
         let parsed = PptxParser::parse(&bytes).expect("roundtrip parse failed");
         match &parsed.slides[0].background {
             Some(FillStyle::Gradient { kind, .. }) => {
-                assert!(matches!(kind, roe_model::common::GradientKind::Radial));
+                assert!(matches!(kind, roe_model::common::GradientKind::Radial { .. }));
             }
             other => panic!("expected gradient background, got is_some={}", other.is_some()),
+        }
+    }
+
+    // v315: 渐变背景 中心点 + 色标 alpha 往返
+    #[test]
+    fn test_roundtrip_slide_background_gradient_center_alpha() {
+        let mut slide = make_slide(vec![make_text_shape(1, "bg")]);
+        slide.background = Some(FillStyle::Gradient {
+            stops: vec![
+                roe_model::common::GradientStop { pos: 0.0, color: Color { r: 1, g: 2, b: 3, a: 128 } },
+                roe_model::common::GradientStop { pos: 1.0, color: Color { r: 4, g: 5, b: 6, a: 255 } },
+            ],
+            kind: roe_model::common::GradientKind::Radial { cx: 0.25, cy: 0.75 },
+            rotate_with_shape: true,
+        });
+        let prs = make_presentation(vec![slide]);
+        let bytes = PptxWriter::write(&prs).expect("write failed");
+        let parsed = PptxParser::parse(&bytes).expect("roundtrip parse failed");
+        match &parsed.slides[0].background {
+            Some(FillStyle::Gradient { stops, kind, .. }) => {
+                assert_eq!(stops[0].color.a, 128, "色标 alpha 应还原");
+                assert_eq!(stops[1].color.a, 255);
+                match kind {
+                    roe_model::common::GradientKind::Radial { cx, cy } => {
+                        assert!((cx - 0.25).abs() < 0.001, "cx={}", cx);
+                        assert!((cy - 0.75).abs() < 0.001, "cy={}", cy);
+                    }
+                    _ => panic!("expected radial"),
+                }
+            }
+            other => panic!("expected gradient, got {:?}", other),
+        }
+    }
+
+    // v315: 形状级线性渐变往返（带旋转 + flipH；以及 rotate_with_shape=false）
+    #[test]
+    fn test_roundtrip_shape_gradient_linear_rot_flip() {
+        for (rws, flip_h, flip_v) in [(true, true, false), (true, false, true), (false, true, true)] {
+            let mut sh = make_text_shape(1, "g");
+            sh.style.fill = Some(FillStyle::Gradient {
+                stops: vec![
+                    roe_model::common::GradientStop { pos: 0.0, color: Color { r: 10, g: 20, b: 30, a: 255 } },
+                    roe_model::common::GradientStop { pos: 1.0, color: Color { r: 200, g: 100, b: 50, a: 255 } },
+                ],
+                kind: roe_model::common::GradientKind::Linear { angle: 90.0 },
+                rotate_with_shape: rws,
+            });
+            sh.position.rotation = Some(30.0);
+            sh.position.flip_h = if flip_h { Some(true) } else { None };
+            sh.position.flip_v = if flip_v { Some(true) } else { None };
+            let prs = make_presentation(vec![make_slide(vec![sh])]);
+            let bytes = PptxWriter::write(&prs).expect("write failed");
+            let parsed = PptxParser::parse(&bytes).expect("parse failed");
+            let got = &parsed.slides[0].shapes[0];
+            match &got.style.fill {
+                Some(FillStyle::Gradient { stops, kind, rotate_with_shape }) => {
+                    assert_eq!(stops.len(), 2);
+                    assert_eq!(*rotate_with_shape, rws);
+                    match kind {
+                        roe_model::common::GradientKind::Linear { angle } => {
+                            assert!((angle - 90.0).abs() < 0.01,
+                                "rws={rws} flip_h={flip_h} flip_v={flip_v} angle={angle}");
+                        }
+                        _ => panic!("expected linear"),
+                    }
+                }
+                other => panic!("expected gradient, got {:?}", other),
+            }
+        }
+    }
+
+    // v316: 形状纯色填充 alpha 往返（A：srgbClr 带 alpha 子元素）
+    #[test]
+    fn test_v316_shape_solid_fill_alpha_roundtrip() {
+        let mut sh = make_text_shape(1, "a");
+        sh.style.fill = Some(FillStyle::Solid(Color { r: 255, g: 0, b: 0, a: 128 }));
+        let prs = make_presentation(vec![make_slide(vec![sh])]);
+        let bytes = PptxWriter::write(&prs).expect("write failed");
+        let parsed = PptxParser::parse(&bytes).expect("parse failed");
+        match &parsed.slides[0].shapes[0].style.fill {
+            Some(FillStyle::Solid(c)) => {
+                assert_eq!((c.r, c.g, c.b), (255, 0, 0), "填充颜色应还原");
+                assert_eq!(c.a, 128, "填充 alpha 应还原");
+            }
+            other => panic!("expected solid fill, got {:?}", other),
+        }
+    }
+
+    // v316: 形状外阴影往返（B：颜色+alpha、偏移、模糊）
+    #[test]
+    fn test_v316_shape_outer_shadow_roundtrip() {
+        let mut sh = make_text_shape(1, "b");
+        sh.style.fill = Some(FillStyle::Solid(Color { r: 0, g: 0, b: 255, a: 255 }));
+        sh.style.shadow = Some(roe_model::common::ShadowStyle {
+            color: Color { r: 0, g: 128, b: 0, a: 102 },
+            offset_x: 3.0,
+            offset_y: 4.0,
+            blur: 6.0,
+        });
+        let prs = make_presentation(vec![make_slide(vec![sh])]);
+        let bytes = PptxWriter::write(&prs).expect("write failed");
+        let parsed = PptxParser::parse(&bytes).expect("parse failed");
+        let st = &parsed.slides[0].shapes[0].style;
+        match &st.fill {
+            Some(FillStyle::Solid(c)) => assert_eq!((c.r, c.g, c.b), (0, 0, 255), "阴影色不应污染形状填充"),
+            other => panic!("expected solid fill, got {:?}", other),
+        }
+        let sd = st.shadow.as_ref().expect("阴影不应丢失");
+        assert_eq!((sd.color.r, sd.color.g, sd.color.b), (0, 128, 0), "阴影颜色");
+        assert_eq!(sd.color.a, 102, "阴影 alpha");
+        assert!((sd.offset_x - 3.0).abs() < 0.05, "offset_x={}", sd.offset_x);
+        assert!((sd.offset_y - 4.0).abs() < 0.05, "offset_y={}", sd.offset_y);
+        assert!((sd.blur - 6.0).abs() < 0.05, "blur={}", sd.blur);
+    }
+
+    // v316: 预设几何 prst 名字写出再读回不能变 custom
+    #[test]
+    fn test_v316_preset_geometry_name_roundtrip() {
+        for name in ["rect", "heart"] {
+            let mut sh = make_text_shape(1, "g");
+            sh.geometry = ShapeGeometry::Custom(name.to_string());
+            let prs = make_presentation(vec![make_slide(vec![sh])]);
+            let b1 = PptxWriter::write(&prs).expect("write1");
+            let p1 = PptxParser::parse(&b1).expect("parse1");
+            let b2 = PptxWriter::write(&p1).expect("write2");
+            let p2 = PptxParser::parse(&b2).expect("parse2");
+            match &p2.slides[0].shapes[0].geometry {
+                ShapeGeometry::PresetPath(d) => assert_eq!(d.preset_name, name),
+                other => panic!("{name}: expected PresetPath, got {:?}", other),
+            }
+        }
+    }
+
+    // v316: 预设几何 adj 覆盖值往返（star5 的 adj）
+    #[test]
+    fn test_v316_preset_geometry_adj_roundtrip() {
+        let mut sh = make_text_shape(1, "g");
+        sh.geometry = ShapeGeometry::Custom("star5".to_string());
+        let prs = make_presentation(vec![make_slide(vec![sh])]);
+        let b1 = PptxWriter::write(&prs).expect("write1");
+        let av = r#"<a:prstGeom prst="star5"><a:avLst><a:gd name="adj" fmla="val 30000"/></a:avLst></a:prstGeom>"#;
+        let b1 = rewrite_slide1_v315(b1, |x| {
+            x.replace(r#"<a:prstGeom prst="star5"/>"#, av)
+             .replace(r#"<a:prstGeom prst="star5"><a:avLst/></a:prstGeom>"#, av)
+        });
+        let p1 = PptxParser::parse(&b1).expect("parse1");
+        let b2 = PptxWriter::write(&p1).expect("write2");
+        let p2 = PptxParser::parse(&b2).expect("parse2");
+        match &p2.slides[0].shapes[0].geometry {
+            ShapeGeometry::PresetPath(d) => {
+                assert_eq!(d.preset_name, "star5");
+                assert!(
+                    d.adj_overrides.iter().any(|(n, v)| n == "adj" && (*v - 30000.0).abs() < 0.5),
+                    "adj 应保留: {:?}", d.adj_overrides
+                );
+            }
+            other => panic!("expected PresetPath, got {:?}", other),
+        }
+    }
+
+    // v316: 描边颜色+宽度+alpha 往返
+    #[test]
+    fn test_v316_stroke_color_width_roundtrip() {
+        let mut sh = make_text_shape(1, "s");
+        sh.style.stroke = Some(roe_model::impress::StrokeStyle {
+            color: Color { r: 0x4a, g: 0x7e, b: 0xbc, a: 128 },
+            width: 4.0,
+        });
+        let prs = make_presentation(vec![make_slide(vec![sh])]);
+        let bytes = PptxWriter::write(&prs).expect("write failed");
+        let parsed = PptxParser::parse(&bytes).expect("parse failed");
+        let st = parsed.slides[0].shapes[0].style.stroke.as_ref().expect("描边不应丢失");
+        assert_eq!((st.color.r, st.color.g, st.color.b), (0x4a, 0x7e, 0xbc), "描边颜色");
+        assert_eq!(st.color.a, 128, "描边 alpha");
+        assert!((st.width - 4.0).abs() < 0.01, "width={}", st.width);
+    }
+
+    // v316: 无描边（stroke=None）写出后读回仍为 None
+    #[test]
+    fn test_v316_no_stroke_roundtrip() {
+        let mut sh = make_text_shape(1, "n");
+        sh.style.stroke = None;
+        let prs = make_presentation(vec![make_slide(vec![sh])]);
+        let bytes = PptxWriter::write(&prs).expect("write failed");
+        let parsed = PptxParser::parse(&bytes).expect("parse failed");
+        assert!(parsed.slides[0].shapes[0].style.stroke.is_none(),
+            "无描边不应冒出描边: {:?}", parsed.slides[0].shapes[0].style.stroke);
+    }
+
+    // v316: 有 p:style lnRef 但显式 <a:ln><a:noFill/> 的形状，读回 stroke 必须为 None
+    #[test]
+    fn test_v316_ln_nofill_beats_lnref() {
+        let sh = make_text_shape(1, "r");
+        let prs = make_presentation(vec![make_slide(vec![sh])]);
+        let bytes = PptxWriter::write(&prs).expect("write failed");
+        let bytes = rewrite_slide1_v315(bytes, |x| {
+            let x = x.replace("<a:ln/>", "").replace(r#"<a:ln w="9525"/>"#, "");
+            let x = x.replace("</p:spPr>", "<a:ln><a:noFill/></a:ln></p:spPr>");
+            x.replacen("</p:spPr>", r#"</p:spPr><p:style><a:lnRef idx="1"><a:schemeClr val="accent1"/></a:lnRef><a:fillRef idx="0"><a:schemeClr val="accent1"/></a:fillRef><a:effectRef idx="0"><a:schemeClr val="accent1"/></a:effectRef><a:fontRef idx="minor"><a:schemeClr val="lt1"/></a:fontRef></p:style>"#, 1)
+        });
+        let parsed = PptxParser::parse(&bytes).expect("parse failed");
+        assert!(parsed.slides[0].shapes[0].style.stroke.is_none(),
+            "显式 noFill 不应被 lnRef 覆盖: {:?}", parsed.slides[0].shapes[0].style.stroke);
+    }
+
+    // v315: 形状级径向渐变 中心点 + 色标 alpha 往返
+    #[test]
+    fn test_roundtrip_shape_gradient_center_alpha() {
+        let mut sh = make_text_shape(1, "g");
+        sh.style.fill = Some(FillStyle::Gradient {
+            stops: vec![
+                roe_model::common::GradientStop { pos: 0.0, color: Color { r: 1, g: 2, b: 3, a: 128 } },
+                roe_model::common::GradientStop { pos: 1.0, color: Color { r: 4, g: 5, b: 6, a: 255 } },
+            ],
+            kind: roe_model::common::GradientKind::Radial { cx: 0.25, cy: 0.75 },
+            rotate_with_shape: true,
+        });
+        let prs = make_presentation(vec![make_slide(vec![sh])]);
+        let bytes = PptxWriter::write(&prs).expect("write failed");
+        let parsed = PptxParser::parse(&bytes).expect("parse failed");
+        match &parsed.slides[0].shapes[0].style.fill {
+            Some(FillStyle::Gradient { stops, kind, .. }) => {
+                assert_eq!(stops.len(), 2, "带 alpha 的色标不应丢失");
+                assert_eq!(stops[0].color.a, 128);
+                assert_eq!(stops[1].color.a, 255);
+                match kind {
+                    roe_model::common::GradientKind::Radial { cx, cy } => {
+                        assert!((cx - 0.25).abs() < 0.001 && (cy - 0.75).abs() < 0.001, "cx={cx} cy={cy}");
+                    }
+                    _ => panic!("expected radial"),
+                }
+            }
+            other => panic!("expected gradient, got {:?}", other),
+        }
+    }
+
+    // v315: 形状级图案往返
+    #[test]
+    fn test_roundtrip_shape_pattern() {
+        let mut sh = make_text_shape(1, "p");
+        sh.style.fill = Some(FillStyle::Pattern {
+            preset: "pct50".to_string(),
+            fg: Color { r: 0xFF, g: 0, b: 0, a: 255 },
+            bg: Color { r: 0, g: 0xFF, b: 0, a: 128 },
+        });
+        let prs = make_presentation(vec![make_slide(vec![sh])]);
+        let bytes = PptxWriter::write(&prs).expect("write failed");
+        let parsed = PptxParser::parse(&bytes).expect("parse failed");
+        match &parsed.slides[0].shapes[0].style.fill {
+            Some(FillStyle::Pattern { preset, fg, bg }) => {
+                assert_eq!(preset, "pct50");
+                assert_eq!((fg.r, fg.g, fg.b, fg.a), (0xFF, 0, 0, 255));
+                assert_eq!((bg.r, bg.g, bg.b, bg.a), (0, 0xFF, 0, 128));
+            }
+            other => panic!("expected pattern, got {:?}", other),
+        }
+    }
+
+    // v315: 渐变色标用主题色 + mods（PowerPoint 自带模板写法），色标不能丢
+    #[test]
+    fn test_parse_shape_gradient_scheme_clr_stops() {
+        use std::io::{Read, Write};
+        let mut sh = make_text_shape(1, "g");
+        sh.style.fill = Some(FillStyle::Gradient {
+            stops: vec![
+                roe_model::common::GradientStop { pos: 0.0, color: Color { r: 10, g: 20, b: 30, a: 255 } },
+                roe_model::common::GradientStop { pos: 1.0, color: Color { r: 200, g: 100, b: 50, a: 255 } },
+            ],
+            kind: roe_model::common::GradientKind::Linear { angle: 90.0 },
+            rotate_with_shape: true,
+        });
+        let prs = make_presentation(vec![make_slide(vec![sh])]);
+        let bytes = PptxWriter::write(&prs).expect("write failed");
+
+        let mut zin = zip::ZipArchive::new(std::io::Cursor::new(bytes)).expect("not a zip");
+        let mut out: Vec<u8> = Vec::new();
+        {
+            let mut zw = zip::ZipWriter::new(std::io::Cursor::new(&mut out));
+            for i in 0..zin.len() {
+                let mut f = zin.by_index(i).unwrap();
+                let name = f.name().to_string();
+                if name.ends_with('/') { continue; }
+                let mut buf = Vec::new();
+                f.read_to_end(&mut buf).unwrap();
+                if name == "ppt/slides/slide1.xml" {
+                    let t = String::from_utf8(buf).unwrap();
+                    let o1 = r#"<a:srgbClr val="0A141E"/>"#;
+                    let o2 = r#"<a:srgbClr val="C86432"/>"#;
+                    assert!(t.contains(o1) && t.contains(o2), "xml={}", t);
+                    let t = t.replacen(o1, r#"<a:schemeClr val="accent1"><a:lumMod val="50000"/></a:schemeClr>"#, 1)
+                             .replacen(o2, r#"<a:schemeClr val="accent2"><a:lumMod val="75000"/><a:alpha val="50000"/></a:schemeClr>"#, 1);
+                    buf = t.into_bytes();
+                }
+                zw.start_file(name, zip::write::SimpleFileOptions::default()).unwrap();
+                zw.write_all(&buf).unwrap();
+            }
+            zw.finish().unwrap();
+        }
+        let parsed = PptxParser::parse(&out).expect("parse failed");
+        match &parsed.slides[0].shapes[0].style.fill {
+            Some(FillStyle::Gradient { stops, .. }) => {
+                assert_eq!(stops.len(), 2, "主题色色标不应丢失");
+                assert_eq!(stops[1].color.a, 128, "主题色色标 alpha");
+            }
+            other => panic!("expected gradient, got {:?}", other),
+        }
+    }
+
+    // v315 测试辅助：改写保存出的 slide1.xml 再返回新的 pptx 字节
+    fn rewrite_slide1_v315(bytes: Vec<u8>, f: impl Fn(String) -> String) -> Vec<u8> {
+        use std::io::{Read, Write};
+        let mut zin = zip::ZipArchive::new(std::io::Cursor::new(bytes)).expect("not a zip");
+        let mut out: Vec<u8> = Vec::new();
+        {
+            let mut zw = zip::ZipWriter::new(std::io::Cursor::new(&mut out));
+            for i in 0..zin.len() {
+                let mut fl = zin.by_index(i).unwrap();
+                let name = fl.name().to_string();
+                if name.ends_with('/') { continue; }
+                let mut buf = Vec::new();
+                fl.read_to_end(&mut buf).unwrap();
+                if name == "ppt/slides/slide1.xml" {
+                    buf = f(String::from_utf8(buf).unwrap()).into_bytes();
+                }
+                zw.start_file(name, zip::write::SimpleFileOptions::default()).unwrap();
+                zw.write_all(&buf).unwrap();
+            }
+            zw.finish().unwrap();
+        }
+        out
+    }
+
+    // v315: 背景渐变色标用主题色 + mods，色标不能丢
+    #[test]
+    fn test_parse_background_gradient_scheme_clr_stops() {
+        let mut slide = make_slide(vec![make_text_shape(1, "bg")]);
+        slide.background = Some(FillStyle::Gradient {
+            stops: vec![
+                roe_model::common::GradientStop { pos: 0.0, color: Color { r: 0xFF, g: 0, b: 0, a: 255 } },
+                roe_model::common::GradientStop { pos: 1.0, color: Color { r: 0, g: 0, b: 0xFF, a: 255 } },
+            ],
+            kind: roe_model::common::GradientKind::Linear { angle: 90.0 },
+            rotate_with_shape: true,
+        });
+        let bytes = PptxWriter::write(&make_presentation(vec![slide])).expect("write failed");
+        let out = rewrite_slide1_v315(bytes, |t| {
+            let o1 = r#"<a:srgbClr val="FF0000"/>"#;
+            let o2 = r#"<a:srgbClr val="0000FF"/>"#;
+            assert!(t.contains(o1) && t.contains(o2), "xml={}", t);
+            t.replacen(o1, r#"<a:schemeClr val="accent1"><a:lumMod val="50000"/></a:schemeClr>"#, 1)
+             .replacen(o2, r#"<a:schemeClr val="accent2"/>"#, 1)
+        });
+        let parsed = PptxParser::parse(&out).expect("parse failed");
+        match &parsed.slides[0].background {
+            Some(FillStyle::Gradient { stops, .. }) => assert_eq!(stops.len(), 2, "主题色色标不应丢失"),
+            other => panic!("expected gradient, got {:?}", other),
+        }
+    }
+
+    // v315: 非对称 fillToRect 取矩形中心（l=0 r=50% → cx=0.25）
+    #[test]
+    fn test_parse_background_fill_to_rect_center() {
+        let mut slide = make_slide(vec![make_text_shape(1, "bg")]);
+        slide.background = Some(FillStyle::Gradient {
+            stops: vec![
+                roe_model::common::GradientStop { pos: 0.0, color: Color { r: 1, g: 2, b: 3, a: 255 } },
+                roe_model::common::GradientStop { pos: 1.0, color: Color { r: 4, g: 5, b: 6, a: 255 } },
+            ],
+            kind: roe_model::common::GradientKind::Radial { cx: 0.5, cy: 0.5 },
+            rotate_with_shape: true,
+        });
+        let bytes = PptxWriter::write(&make_presentation(vec![slide])).expect("write failed");
+        let out = rewrite_slide1_v315(bytes, |t| {
+            let o = r#"<a:fillToRect l="50000" t="50000" r="50000" b="50000"/>"#;
+            assert!(t.contains(o), "xml={}", t);
+            t.replacen(o, r#"<a:fillToRect l="0" t="0" r="50000" b="50000"/>"#, 1)
+        });
+        let parsed = PptxParser::parse(&out).expect("parse failed");
+        match &parsed.slides[0].background {
+            Some(FillStyle::Gradient { kind: roe_model::common::GradientKind::Radial { cx, cy }, .. }) => {
+                assert!((cx - 0.25).abs() < 0.001 && (cy - 0.25).abs() < 0.001, "cx={cx} cy={cy}");
+            }
+            other => panic!("expected radial, got {:?}", other),
+        }
+    }
+
+    // v315: 图案背景往返（保存再打开）
+    #[test]
+    fn test_roundtrip_slide_background_pattern() {
+        let mut slide = make_slide(vec![make_text_shape(1, "bg")]);
+        slide.background = Some(FillStyle::Pattern {
+            preset: "dkDnDiag".to_string(),
+            fg: Color { r: 0xFF, g: 0x00, b: 0x00, a: 255 },
+            bg: Color { r: 0x00, g: 0xFF, b: 0x00, a: 128 },
+        });
+        let prs = make_presentation(vec![slide]);
+        let bytes = PptxWriter::write(&prs).expect("write failed");
+        let parsed = PptxParser::parse(&bytes).expect("roundtrip parse failed");
+        match &parsed.slides[0].background {
+            Some(FillStyle::Pattern { preset, fg, bg }) => {
+                assert_eq!(preset, "dkDnDiag");
+                assert_eq!((fg.r, fg.g, fg.b, fg.a), (0xFF, 0, 0, 255));
+                assert_eq!((bg.r, bg.g, bg.b), (0, 0xFF, 0));
+                assert_eq!(bg.a, 128, "alpha 往返应还原");
+            }
+            other => panic!("expected pattern background, got {:?}", other),
+        }
+    }
+
+    // v315: 图案背景写出检查（读取侧未做，这里只验证写出的 XML）
+    #[test]
+    fn test_write_slide_background_pattern_xml() {
+        use std::io::Read;
+        let mut slide = make_slide(vec![make_text_shape(1, "bg")]);
+        slide.background = Some(FillStyle::Pattern {
+            preset: "dkDnDiag".to_string(),
+            fg: Color { r: 0xFF, g: 0x00, b: 0x00, a: 255 },
+            bg: Color { r: 0x00, g: 0xFF, b: 0x00, a: 128 },
+        });
+        let prs = make_presentation(vec![slide]);
+        let bytes = PptxWriter::write(&prs).expect("write failed");
+
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes.clone()))
+            .expect("not a zip");
+        let mut xml = String::new();
+        zip.by_name("ppt/slides/slide1.xml")
+            .expect("no slide1.xml")
+            .read_to_string(&mut xml)
+            .unwrap();
+
+        assert!(xml.contains(r#"<a:pattFill prst="dkDnDiag">"#), "xml={}", xml);
+        let fg_pos = xml.find("<a:fgClr>").expect("no fgClr");
+        let bg_pos = xml.find("<a:bgClr>").expect("no bgClr");
+        assert!(fg_pos < bg_pos, "fgClr 必须在 bgClr 之前");
+        assert!(xml.contains(r#"<a:fgClr><a:srgbClr val="FF0000"/></a:fgClr>"#));
+        assert!(xml.contains(r#"<a:bgClr><a:srgbClr val="00FF00"><a:alpha val="50196"/></a:srgbClr></a:bgClr>"#));
+        // 写出的文件必须仍能被解析器打开
+        PptxParser::parse(&bytes).expect("parse failed");
+    }
+
+    // v315: 内置纹理平铺背景往返（保存再打开）
+    #[test]
+    fn test_roundtrip_slide_background_texture_tiled() {
+        let png = roe_model::textures::texture_bytes("walnut").unwrap().to_vec();
+        let mut slide = make_slide(vec![make_text_shape(1, "bg")]);
+        slide.background = Some(FillStyle::PictureTiled {
+            image: roe_model::common::ImageData {
+                data: png.clone(),
+                mime: "image/png".to_string(),
+                crop_l: 0.0, crop_t: 0.0, crop_r: 0.0, crop_b: 0.0,
+            },
+            tile_offset_x: 10.0,
+            tile_offset_y: 5.0,
+            tile_scale_x: 0.5,
+            tile_scale_y: 0.5,
+            tile_align: "tl".to_string(),
+        });
+        let prs = make_presentation(vec![slide]);
+        let bytes = PptxWriter::write(&prs).expect("write failed");
+        let parsed = PptxParser::parse(&bytes).expect("roundtrip parse failed");
+        match &parsed.slides[0].background {
+            Some(FillStyle::PictureTiled { image, tile_offset_x, tile_offset_y, tile_scale_x, tile_scale_y, tile_align }) => {
+                assert_eq!(image.data, png, "图片字节应一致");
+                assert_eq!(roe_model::textures::texture_name_for_bytes(&image.data), Some("walnut"));
+                assert!((tile_scale_x - 0.5).abs() < 1e-4);
+                assert!((tile_scale_y - 0.5).abs() < 1e-4);
+                assert!((tile_offset_x - 10.0).abs() < 0.01);
+                assert!((tile_offset_y - 5.0).abs() < 0.01);
+                assert_eq!(tile_align, "tl");
+            }
+            other => panic!("expected tiled background, is_some={}", other.is_some()),
+        }
+    }
+
+    // v315: 平铺背景写出检查（XML 与 media 包）
+    #[test]
+    fn test_write_slide_background_texture_tiled_xml() {
+        use std::io::Read;
+        let png = roe_model::textures::texture_bytes("sand").unwrap().to_vec();
+        let mut slide = make_slide(vec![make_text_shape(1, "bg")]);
+        slide.background = Some(FillStyle::PictureTiled {
+            image: roe_model::common::ImageData {
+                data: png.clone(),
+                mime: "image/png".to_string(),
+                crop_l: 0.0, crop_t: 0.0, crop_r: 0.0, crop_b: 0.0,
+            },
+            tile_offset_x: 0.0, tile_offset_y: 0.0,
+            tile_scale_x: 0.5, tile_scale_y: 0.5,
+            tile_align: "tl".to_string(),
+        });
+        let prs = make_presentation(vec![slide]);
+        let bytes = PptxWriter::write(&prs).expect("write failed");
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes.clone())).expect("not a zip");
+        let mut xml = String::new();
+        zip.by_name("ppt/slides/slide1.xml").expect("no slide1.xml").read_to_string(&mut xml).unwrap();
+        assert!(xml.contains(r#"<a:tile tx="0" ty="0" sx="50000" sy="50000" flip="none" algn="tl"/>"#), "xml={}", xml);
+        let b = xml.find("<a:blip ").expect("no blip");
+        let t = xml.find("<a:tile ").expect("no tile");
+        assert!(b < t, "blip 必须在 tile 之前");
+        let mut found = false;
+        for i in 0..zip.len() {
+            let mut f = zip.by_index(i).unwrap();
+            if f.name().starts_with("ppt/media/") {
+                let mut buf = Vec::new();
+                f.read_to_end(&mut buf).unwrap();
+                if buf == png { found = true; }
+            }
+        }
+        assert!(found, "media 里应带纹理图片");
+        PptxParser::parse(&bytes).expect("parse failed");
+    }
+
+    // v315: tile 缺 sx/sy 时按 100% 处理
+    #[test]
+    fn test_read_tile_missing_scale_defaults_100() {
+        let png = roe_model::textures::texture_bytes("cork").unwrap().to_vec();
+        let mut slide = make_slide(vec![make_text_shape(1, "bg")]);
+        slide.background = Some(FillStyle::PictureTiled {
+            image: roe_model::common::ImageData {
+                data: png,
+                mime: "image/png".to_string(),
+                crop_l: 0.0, crop_t: 0.0, crop_r: 0.0, crop_b: 0.0,
+            },
+            tile_offset_x: 0.0, tile_offset_y: 0.0,
+            tile_scale_x: 0.5, tile_scale_y: 0.5,
+            tile_align: "tl".to_string(),
+        });
+        let prs = make_presentation(vec![slide]);
+        let bytes = PptxWriter::write(&prs).expect("write failed");
+        let bytes = rewrite_slide1_v315(bytes, |x| x.replace(r#" sx="50000" sy="50000""#, ""));
+        let parsed = PptxParser::parse(&bytes).expect("parse failed");
+        match &parsed.slides[0].background {
+            Some(FillStyle::PictureTiled { tile_scale_x, tile_scale_y, .. }) => {
+                assert!((tile_scale_x - 1.0).abs() < 1e-4, "sx={}", tile_scale_x);
+                assert!((tile_scale_y - 1.0).abs() < 1e-4, "sy={}", tile_scale_y);
+            }
+            other => panic!("expected tiled background, is_some={}", other.is_some()),
+        }
+    }
+
+    // v316: JPEG 平铺背景往返，mime 应按文件头还原为 image/jpeg
+    #[test]
+    fn test_roundtrip_slide_background_tiled_jpeg_mime() {
+        let jpg: Vec<u8> = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, b'J', b'F', b'I', b'F', 0x00, 0x01];
+        let mut slide = make_slide(vec![make_text_shape(1, "bg")]);
+        slide.background = Some(FillStyle::PictureTiled {
+            image: roe_model::common::ImageData {
+                data: jpg.clone(),
+                mime: "image/jpeg".to_string(),
+                crop_l: 0.0, crop_t: 0.0, crop_r: 0.0, crop_b: 0.0,
+            },
+            tile_offset_x: 0.0, tile_offset_y: 0.0,
+            tile_scale_x: 1.0, tile_scale_y: 1.0,
+            tile_align: "tl".to_string(),
+        });
+        let prs = make_presentation(vec![slide]);
+        let bytes = PptxWriter::write(&prs).expect("write failed");
+        let parsed = PptxParser::parse(&bytes).expect("roundtrip parse failed");
+        match &parsed.slides[0].background {
+            Some(FillStyle::PictureTiled { image, .. }) => {
+                assert_eq!(image.data, jpg);
+                assert_eq!(image.mime, "image/jpeg");
+            }
+            other => panic!("expected tiled background, is_some={}", other.is_some()),
         }
     }
 
@@ -1200,10 +1921,8 @@ mod tests {
         let s = &parsed.slides[0].shapes[0];
         let stroke = s.style.stroke.as_ref().expect("expected stroke");
         assert!((stroke.width - 2.0).abs() < 0.01, "width={}", stroke.width);
-        // 颜色固定黑色是 parser 现状，不是 writer bug：
-        assert_eq!(stroke.color.r, 0);
-        assert_eq!(stroke.color.g, 0);
-        assert_eq!(stroke.color.b, 0);
+        // v316: 描边颜色已能往返
+        assert_eq!((stroke.color.r, stroke.color.g, stroke.color.b), (10, 20, 30));
     }
 
     #[test]
@@ -1498,7 +2217,7 @@ mod tests {
     // None) / stroke宽度 / text文字 / image），不做整体 struct 相等比较：
     // - animation_tree/transition/notes/master 真实内容：parser 恒定
     //   default，两次 parse 结果本来就一样，比较没有意义，不比较
-    // - FillStyle::Gradient/Picture/PictureTiled：writer 退化成 noFill，
+    // - 此测试的简易构造不覆盖 Gradient/Picture/PictureTiled 的保真（另有专门往返测试），
     //   比较会必然失败，跳过这类 shape 的 fill 断言（仍断言其余字段）
     // - stroke 颜色：parser 读回恒为黑色（parser 自身限制），只断言宽度
     // - Paragraph/Run 除 text 外字段：parser 不读，不比较
@@ -1631,11 +2350,11 @@ mod tests {
                 }
             }
 
-            // fill：跳过 Gradient/Picture/PictureTiled（writer 已知退化为
-            // noFill，不保真，断言会必然失败且不代表新增回归）
+            // fill：跳过 Gradient/Picture/PictureTiled（这里的通用比较不适用，
+            // 它们另有专门的往返测试）
             let exp_fill_comparable = !matches!(
                 exp.style.fill,
-                Some(FillStyle::Gradient { .. }) | Some(FillStyle::Picture(_)) | Some(FillStyle::PictureTiled { .. })
+                Some(FillStyle::Gradient { .. }) | Some(FillStyle::Picture(_)) | Some(FillStyle::PictureTiled { .. }) | Some(FillStyle::Pattern { .. })
             );
             if exp_fill_comparable {
                 match (&exp.style.fill, &act.style.fill) {

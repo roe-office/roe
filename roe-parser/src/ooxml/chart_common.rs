@@ -229,11 +229,18 @@ pub(crate) fn parse_ooxml_chart_xml(
     let mut cur_ser_name = String::new();
     let mut cur_x_labels: Vec<String> = Vec::new();
     let mut cur_vals: Vec<f64> = Vec::new();
+    let mut cur_xvals: Vec<Option<f64>> = Vec::new();
+    let mut cur_sizes: Vec<f64> = Vec::new();
+    let mut in_xval = false;
+    let mut in_bsize = false;
+    let mut in_fmt = false;
+    let mut cur_cat_fmt = String::new();
     let mut found_chart = false;
     let mut in_line_chart = false;
     let mut cur_ser_trend = false;
     let mut has_legend = false;
     let mut has_grid = false;
+    let mut legend_pos: Option<roe_model::impress::LegendPos> = None;
     let mut x_axis_label = String::new();
     let mut y_axis_label = String::new();
     let mut in_cat_ax = false;
@@ -267,16 +274,26 @@ pub(crate) fn parse_ooxml_chart_xml(
         match reader.read_event() {
             Ok(Event::Start(ref e)) => {
                 match e.local_name().as_ref() {
-                    b"barChart" => { if !found_chart { kind = ChartKind::Bar; } found_chart = true; }
-                    b"lineChart" => { if !found_chart { kind = ChartKind::Line; } found_chart = true; in_line_chart = true; }
-                    b"pieChart" => { if !found_chart { kind = ChartKind::Pie; } found_chart = true; }
-                    b"scatterChart" => { if !found_chart { kind = ChartKind::Scatter; } found_chart = true; }
+                    b"barChart" | b"bar3DChart" => { if !found_chart { kind = ChartKind::Bar; } found_chart = true; }
+                    b"stockChart" => { if !found_chart { kind = ChartKind::Stock; } found_chart = true; }
+                    b"lineChart" | b"line3DChart" => { if !found_chart { kind = ChartKind::Line; } found_chart = true; in_line_chart = true; }
+                    b"pieChart" | b"pie3DChart" => { if !found_chart { kind = ChartKind::Pie; } found_chart = true; }
+                    b"scatterChart" | b"bubbleChart" => { if !found_chart { kind = ChartKind::Scatter; } found_chart = true; }
                     b"radarChart" => { if !found_chart { kind = ChartKind::Radar; } found_chart = true; }
-                    b"areaChart" => { if !found_chart { kind = ChartKind::Area; } found_chart = true; }
+                    b"areaChart" | b"area3DChart" => { if !found_chart { kind = ChartKind::Area; } found_chart = true; }
                     b"doughnutChart" => { if !found_chart { kind = ChartKind::Doughnut; } found_chart = true; }
                     b"legend" => { has_legend = true; }
                     b"majorGridlines" => { has_grid = true; }
                     b"trendline" if in_ser => { cur_ser_trend = true; }
+                    b"legendPos" => {
+                        legend_pos = match attr_str(e, b"val").as_deref() {
+                            Some("t") => Some(roe_model::impress::LegendPos::Top),
+                            Some("b") => Some(roe_model::impress::LegendPos::Bottom),
+                            Some("l") => Some(roe_model::impress::LegendPos::Left),
+                            Some("r") => Some(roe_model::impress::LegendPos::Right),
+                            _ => None,
+                        };
+                    }
                     b"dPt" => { in_dpt = true; }
                     b"dLbls" => { in_dlbls = true; data_labels.explicit = true; }
                     b"ln" if in_dpt => { in_dpt_ln = true; }
@@ -293,7 +310,7 @@ pub(crate) fn parse_ooxml_chart_xml(
                     b"ser" => {
                         in_ser = true;
                         cur_ser_name.clear();
-                        cur_x_labels.clear();
+                        cur_x_labels.clear(); cur_xvals.clear(); cur_sizes.clear(); cur_cat_fmt.clear();
                         cur_vals.clear();
                         cur_ser_scheme_color = None;
                         cur_ser_rgb = None;
@@ -303,7 +320,9 @@ pub(crate) fn parse_ooxml_chart_xml(
                     b"tx" if in_ser => { in_ser_tx = true; ser_name_buf.clear(); }
                     b"t" if in_ser_tx => { in_ser_tx_t = true; }
                     b"v" if in_ser_tx && !in_cat && !in_val => { in_ser_tx_t = true; }
-                    b"cat" | b"xVal" if in_ser => { in_cat = true; }
+                    b"cat" | b"xVal" if in_ser => { in_cat = true; in_xval = matches!(e.local_name().as_ref(), b"xVal"); }
+                    b"bubbleSize" if in_ser => { in_val = true; in_bsize = true; }
+                    b"formatCode" if in_cat => { in_fmt = true; cur_cat_fmt.clear(); }
                     b"pt" if in_cat => { in_cat_pt = true; cat_buf.clear(); }
                     b"v" if in_cat_pt => {}
                     b"val" | b"yVal" if in_ser => { in_val = true; }
@@ -324,6 +343,15 @@ pub(crate) fn parse_ooxml_chart_xml(
                     }
                     b"legend" => { has_legend = true; }
                     b"majorGridlines" => { has_grid = true; }
+                    b"legendPos" => {
+                        legend_pos = match attr_str(e, b"val").as_deref() {
+                            Some("t") => Some(roe_model::impress::LegendPos::Top),
+                            Some("b") => Some(roe_model::impress::LegendPos::Bottom),
+                            Some("l") => Some(roe_model::impress::LegendPos::Left),
+                            Some("r") => Some(roe_model::impress::LegendPos::Right),
+                            _ => None,
+                        };
+                    }
                     b"autoTitleDeleted" => {
                         auto_title_deleted = attr_str(e, b"val").as_deref() == Some("1");
                     }
@@ -441,17 +469,26 @@ pub(crate) fn parse_ooxml_chart_xml(
                     b"v" if in_ser_tx_t && !in_cat_pt && !in_val_pt => { in_ser_tx_t = false; }
                     b"pt" if in_cat_pt => {
                         in_cat_pt = false;
-                        cur_x_labels.push(cat_buf.trim().to_string());
+                        let raw_lab = cat_buf.trim().to_string();
+                        let lab = if !in_xval && is_date_fmt(&cur_cat_fmt) {
+                            raw_lab.parse::<f64>().ok().filter(|v| *v >= 1.0)
+                                .map(|v| serial_to_date_text(v.floor() as i64))
+                                .unwrap_or(raw_lab)
+                        } else { raw_lab };
+                        cur_x_labels.push(lab);
+                        if in_xval { cur_xvals.push(cat_buf.trim().parse::<f64>().ok()); }
                     }
-                    b"cat" | b"xVal" if in_cat => { in_cat = false; }
+                    b"formatCode" if in_fmt => { in_fmt = false; }
+                    b"cat" | b"xVal" if in_cat => { in_cat = false; in_xval = false; }
                     b"pt" if in_val_pt => {
                         in_val_pt = false;
                         let v = val_buf.trim().parse::<f64>().unwrap_or(0.0);
-                        cur_vals.push(v);
+                        if in_bsize { cur_sizes.push(v); } else { cur_vals.push(v); }
                     }
                     b"val" | b"yVal" if in_val => { in_val = false; }
+                    b"bubbleSize" if in_val => { in_val = false; in_bsize = false; }
                     b"spPr" if in_ser_sppr => { in_ser_sppr = false; }
-                    b"lineChart" => { in_line_chart = false; }
+                    b"lineChart" | b"line3DChart" => { in_line_chart = false; }
                     b"ser" if in_ser => {
                         in_ser = false;
                         in_ser_tx = false;
@@ -467,6 +504,10 @@ pub(crate) fn parse_ooxml_chart_xml(
                             color: cur_ser_rgb.take().or(resolved_color),
                             as_line: in_line_chart,
                             trendline: cur_ser_trend,
+                            x_values: if !cur_xvals.is_empty() && cur_xvals.iter().all(|x| x.is_some()) {
+                                Some(cur_xvals.drain(..).flatten().collect())
+                            } else { cur_xvals.clear(); None },
+                            sizes: if cur_sizes.is_empty() { None } else { Some(cur_sizes.drain(..).collect()) },
                         });
                     }
                     _ => {}
@@ -481,6 +522,7 @@ pub(crate) fn parse_ooxml_chart_xml(
                 }
                 if in_ser_tx_t { ser_name_buf.push_str(&t); }
                 if in_cat_pt { cat_buf.push_str(&t); }
+                if in_fmt { cur_cat_fmt.push_str(&t); }
                 if in_val_pt { val_buf.push_str(&t); }
             }
             Ok(Event::Eof) => break,
@@ -512,5 +554,111 @@ pub(crate) fn parse_ooxml_chart_xml(
         hole_size_pct,
         slice_border_color,
         data_labels,
+        legend_pos,
     })
+}
+
+#[cfg(test)]
+mod bubble_x_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn parse(xml: &str) -> ChartModel {
+        parse_ooxml_chart_xml(xml, &HashMap::new(), &HashMap::new()).expect("chart")
+    }
+
+    #[test]
+    fn bubble_reads_x_values_and_sizes_as_scatter() {
+        let xml = r#"<c:chartSpace xmlns:c="c"><c:chart><c:plotArea><c:bubbleChart><c:ser><c:idx val="0"/><c:order val="0"/><c:tx><c:strRef><c:f>S!$B$1</c:f><c:strCache><c:ptCount val="1"/><c:pt idx="0"><c:v>Y</c:v></c:pt></c:strCache></c:strRef></c:tx><c:xVal><c:numRef><c:f>S!$A$2:$A$4</c:f><c:numCache><c:ptCount val="3"/><c:pt idx="0"><c:v>0.7</c:v></c:pt><c:pt idx="1"><c:v>1.8</c:v></c:pt><c:pt idx="2"><c:v>2.6</c:v></c:pt></c:numCache></c:numRef></c:xVal><c:yVal><c:numRef><c:f>S!$B$2:$B$4</c:f><c:numCache><c:ptCount val="3"/><c:pt idx="0"><c:v>2.7</c:v></c:pt><c:pt idx="1"><c:v>3.2</c:v></c:pt><c:pt idx="2"><c:v>0.8</c:v></c:pt></c:numCache></c:numRef></c:yVal><c:bubbleSize><c:numRef><c:f>S!$C$2:$C$4</c:f><c:numCache><c:ptCount val="3"/><c:pt idx="0"><c:v>10</c:v></c:pt><c:pt idx="1"><c:v>4</c:v></c:pt><c:pt idx="2"><c:v>8</c:v></c:pt></c:numCache></c:numRef></c:bubbleSize></c:ser></c:bubbleChart></c:plotArea></c:chart></c:chartSpace>"#;
+        let m = parse(xml);
+        assert!(matches!(m.kind, ChartKind::Scatter));
+        assert_eq!(m.series.len(), 1);
+        assert_eq!(m.series[0].data, vec![2.7, 3.2, 0.8]);
+        assert_eq!(m.series[0].x_values, Some(vec![0.7, 1.8, 2.6]));
+        assert_eq!(m.series[0].sizes, Some(vec![10.0, 4.0, 8.0]));
+    }
+
+    #[test]
+    fn legend_pos_is_parsed() {
+        use roe_model::impress::LegendPos;
+        let mk = |inner: &str| format!(r#"<c:chartSpace xmlns:c="c"><c:chart><c:plotArea><c:barChart><c:ser><c:idx val="0"/><c:val><c:numRef><c:f>S!$B$2</c:f><c:numCache><c:ptCount val="1"/><c:pt idx="0"><c:v>1</c:v></c:pt></c:numCache></c:numRef></c:val></c:ser></c:barChart></c:plotArea>{inner}</c:chart></c:chartSpace>"#);
+        for (v, want) in [("l", LegendPos::Left), ("r", LegendPos::Right), ("t", LegendPos::Top), ("b", LegendPos::Bottom)] {
+            let m = parse(&mk(&format!(r#"<c:legend><c:legendPos val="{v}"/></c:legend>"#)));
+            assert!(m.show_legend);
+            assert_eq!(m.legend_pos, Some(want), "val={v}");
+        }
+        let m = parse(&mk(r#"<c:legend><c:legendPos val="tr"/></c:legend>"#));
+        assert_eq!(m.legend_pos, None);
+        let m = parse(&mk(""));
+        assert!(!m.show_legend && m.legend_pos.is_none());
+    }
+
+    #[test]
+    fn scatter_with_text_x_keeps_old_behavior() {
+        let xml = r#"<c:chartSpace xmlns:c="c"><c:chart><c:plotArea><c:scatterChart><c:ser><c:idx val="0"/><c:xVal><c:strRef><c:f>S!$A$2:$A$3</c:f><c:strCache><c:ptCount val="2"/><c:pt idx="0"><c:v>a</c:v></c:pt><c:pt idx="1"><c:v>b</c:v></c:pt></c:strCache></c:strRef></c:xVal><c:yVal><c:numRef><c:f>S!$B$2:$B$3</c:f><c:numCache><c:ptCount val="2"/><c:pt idx="0"><c:v>1</c:v></c:pt><c:pt idx="1"><c:v>2</c:v></c:pt></c:numCache></c:numRef></c:yVal></c:ser></c:scatterChart></c:plotArea></c:chart></c:chartSpace>"#;
+        let m = parse(xml);
+        assert_eq!(m.series[0].data, vec![1.0, 2.0]);
+        assert_eq!(m.series[0].x_values, None);
+        assert_eq!(m.series[0].sizes, None);
+    }
+}
+
+
+/// 数字格式串是否为日期格式(yyyy/m/d、m/d/yyyy 等);General 不算。
+fn is_date_fmt(f: &str) -> bool {
+    let l = f.to_ascii_lowercase();
+    l.contains("yy") || l.contains("dd") || l.contains("m/d") || l.contains("d/m")
+}
+
+/// Excel 序列号(1900 日期系统,起点 1899-12-30)转 "yyyy/m/d"。
+fn serial_to_date_text(n: i64) -> String {
+    let z = n - 25569 + 719468; // 距 1970-01-01 的天数,再平移到 0000-03-01
+    let era = z.div_euclid(146097);
+    let doe = z.rem_euclid(146097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + if m <= 2 { 1 } else { 0 };
+    format!("{}/{}/{}", y, m, d)
+}
+
+#[cfg(test)]
+mod stock_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[test]
+    fn serial_to_date() {
+        assert_eq!(serial_to_date_text(37261), "2002/1/5");
+        assert_eq!(serial_to_date_text(37265), "2002/1/9");
+        assert_eq!(serial_to_date_text(25569), "1970/1/1");
+        assert_eq!(serial_to_date_text(61), "1900/3/1");
+    }
+
+    #[test]
+    fn date_fmt_detection() {
+        assert!(is_date_fmt("yyyy/m/d"));
+        assert!(is_date_fmt("m/d/yyyy"));
+        assert!(!is_date_fmt("General"));
+        assert!(!is_date_fmt("0.00"));
+    }
+
+    #[test]
+    fn stock_chart_four_series_with_date_labels() {
+        let mut sers = String::new();
+        for k in 0..4 {
+            sers.push_str(&format!(
+                r#"<c:ser><c:idx val="{k}"/><c:tx><c:strRef><c:f>S!$B$1</c:f><c:strCache><c:ptCount val="1"/><c:pt idx="0"><c:v>s{k}</c:v></c:pt></c:strCache></c:strRef></c:tx><c:cat><c:numRef><c:f>S!$A$2:$A$3</c:f><c:numCache><c:formatCode>yyyy/m/d</c:formatCode><c:ptCount val="2"/><c:pt idx="0"><c:v>37261</c:v></c:pt><c:pt idx="1"><c:v>37262</c:v></c:pt></c:numCache></c:numRef></c:cat><c:val><c:numRef><c:f>S!$B$2:$B$3</c:f><c:numCache><c:formatCode>General</c:formatCode><c:ptCount val="2"/><c:pt idx="0"><c:v>{a}</c:v></c:pt><c:pt idx="1"><c:v>{b}</c:v></c:pt></c:numCache></c:numRef></c:val></c:ser>"#,
+                k = k, a = 10 + k, b = 20 + k
+            ));
+        }
+        let xml = format!(r#"<c:chartSpace xmlns:c="c"><c:chart><c:plotArea><c:stockChart>{}<c:hiLowLines/></c:stockChart></c:plotArea></c:chart></c:chartSpace>"#, sers);
+        let m = parse_ooxml_chart_xml(&xml, &HashMap::new(), &HashMap::new()).expect("chart");
+        assert!(matches!(m.kind, ChartKind::Stock));
+        assert_eq!(m.series.len(), 4);
+        assert_eq!(m.x_labels, vec!["2002/1/5".to_string(), "2002/1/6".to_string()]);
+        assert_eq!(m.series[3].data, vec![13.0, 23.0]);
+    }
 }

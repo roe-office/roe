@@ -1097,14 +1097,40 @@ fn sgr_fill(f: &roe_model::common::FillStyle) -> serde_json::Value {
                     m.insert("kind".to_string(), serde_json::json!("linear"));
                     m.insert("angle".to_string(), serde_json::json!(r2(*angle)));
                 }
-                GradientKind::Radial => { m.insert("kind".to_string(), serde_json::json!("radial")); }
-                GradientKind::Rect => { m.insert("kind".to_string(), serde_json::json!("rect")); }
+                GradientKind::Radial { cx, cy } => {
+                    m.insert("kind".to_string(), serde_json::json!("radial"));
+                    m.insert("cx".to_string(), serde_json::json!(r2(*cx)));
+                    m.insert("cy".to_string(), serde_json::json!(r2(*cy)));
+                }
+                GradientKind::Rect { cx, cy } => {
+                    m.insert("kind".to_string(), serde_json::json!("rect"));
+                    m.insert("cx".to_string(), serde_json::json!(r2(*cx)));
+                    m.insert("cy".to_string(), serde_json::json!(r2(*cy)));
+                }
                 _ => { m.insert("kind".to_string(), serde_json::json!("other")); }
             }
             v
         }
         FillStyle::Picture(_) => serde_json::json!({ "type": "picture" }),
-        FillStyle::PictureTiled { .. } => serde_json::json!({ "type": "picture_tiled" }),
+        FillStyle::PictureTiled { image, tile_offset_x, tile_offset_y, tile_scale_x, tile_scale_y, tile_align } => {
+            if let Some(name) = roe_model::textures::texture_name_for_bytes(&image.data[..]) {
+                serde_json::json!({
+                    "type": "texture", "name": name,
+                    "tile_scale": r2(*tile_scale_x),
+                    "tile_scale_x": r2(*tile_scale_x), "tile_scale_y": r2(*tile_scale_y),
+                    "tile_offset_x": r2(*tile_offset_x), "tile_offset_y": r2(*tile_offset_y),
+                    "tile_align": tile_align
+                })
+            } else {
+                serde_json::json!({
+                    "type": "picture_tiled",
+                    "tile_scale_x": r2(*tile_scale_x), "tile_scale_y": r2(*tile_scale_y),
+                    "tile_offset_x": r2(*tile_offset_x), "tile_offset_y": r2(*tile_offset_y),
+                    "tile_align": tile_align
+                })
+            }
+        }
+        FillStyle::Pattern { preset, fg, bg } => serde_json::json!({ "type": "pattern", "preset": preset, "fg": sgr_color(fg), "bg": sgr_color(bg) }),
         #[allow(unreachable_patterns)]
         _ => serde_json::json!({ "type": "other" }),
     }
@@ -2405,6 +2431,35 @@ mod style_read_tests {
             let out = run(&mut pres, script);
             assert!(out.starts_with("err:"), "{script} -> {out}");
         }
+    }
+
+    #[test]
+    fn background_pattern_roundtrip() {
+        let mut pres = make_pres();
+        let js = r#"{"type":"pattern","preset":"dkDnDiag","fg":{"r":10,"g":20,"b":30},"bg":{"r":250,"g":251,"b":252,"a":128}}"#;
+        assert_eq!(run(&mut pres, &format!("set_slide_background(0, `{js}`)")), "");
+        let v = jv(&run(&mut pres, "get_slide_background(0)"));
+        assert_eq!(v["type"], "pattern");
+        assert_eq!(v["preset"], "dkDnDiag");
+        assert_eq!(v["fg"]["r"], 10);
+        assert_eq!(v["fg"]["a"], 255);
+        assert_eq!(v["bg"]["g"], 251);
+        assert_eq!(v["bg"]["a"], 128);
+        // 未知预设名：必须报错，且原背景不变
+        let bad = r#"{"type":"pattern","preset":"nonsense"}"#;
+        let out = run(&mut pres, &format!("set_slide_background(0, `{bad}`)"));
+        assert!(!out.is_empty(), "未知预设应报错");
+        let v = jv(&run(&mut pres, "get_slide_background(0)"));
+        assert_eq!(v["preset"], "dkDnDiag");
+        // 缺 preset 也要报错
+        let out = run(&mut pres, r#"set_slide_background(0, `{"type":"pattern"}`)"#);
+        assert!(!out.is_empty(), "缺 preset 应报错");
+        // 只给预设名：前景默认黑，背景默认白
+        assert_eq!(run(&mut pres, r#"set_slide_background(0, `{"type":"pattern","preset":"pct50"}`)"#), "");
+        let v = jv(&run(&mut pres, "get_slide_background(0)"));
+        assert_eq!(v["preset"], "pct50");
+        assert_eq!(v["fg"]["r"], 0);
+        assert_eq!(v["bg"]["r"], 255);
     }
 
     #[test]

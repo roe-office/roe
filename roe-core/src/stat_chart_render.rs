@@ -1,5 +1,6 @@
 //! 统计图表(chartEx)渲染:StatChartModel + 宽高 → SVG → RGBA。
-//! 目前实现直方图;其余类型返回 None,调用方回退到占位框。
+//! 六种统计图:瀑布、漏斗走 charts-rs(含 ROE-PATCH);直方、箱线、树图、旭日为自画 SVG。
+//! 数据为空或尺寸非法时返回 None,调用方回退到占位框。
 //! 不走 charts-rs,直接拼 SVG,以便精确控制柱子紧贴、区间标签、白色细边。
 
 use crate::chart_render::{nice_axis, svg_to_pixmap, OFFICE_PALETTE};
@@ -423,127 +424,107 @@ fn hex(c: (u8, u8, u8)) -> String {
     format!("#{:02X}{:02X}{:02X}", c.0, c.1, c.2)
 }
 
-fn waterfall_svg(model: &StatChartModel, w: u32, h: u32, scale: f32) -> Option<String> {
+/// StatChartModel.legend_pos("t"/"b"/"l"/"r") -> charts-rs legend.position。
+/// None/未知/"t" 不设(顶部默认);注意 Position::default() 是 Left,不能 unwrap_or_default。
+fn stat_legend_position(model: &StatChartModel) -> Option<charts_rs::Position> {
+    match model.legend_pos.as_deref() {
+        Some("b") => Some(charts_rs::Position::Bottom),
+        Some("l") => Some(charts_rs::Position::Left),
+        Some("r") => Some(charts_rs::Position::Right),
+        _ => None,
+    }
+}
+
+/// 瀑布图 charts-rs 版(试点)。与 waterfall_svg 并存,由环境变量 ROE_STAT_CHARTS 切换。
+/// 注意:汇总柱 value 为 0 时 charts-rs 会按累计值算,自画版直接用数据值(边角差异)。
+fn waterfall_via_charts(model: &StatChartModel, w: u32, h: u32, scale: f32) -> Option<String> {
+    use charts_rs::{Color, LegendCategory, WaterfallChart, WaterfallData};
     let ser = model.series.first()?;
     let d = model.data.iter().find(|d| d.id == ser.data_id).or_else(|| model.data.first())?;
     let n = d.values.len();
     if n == 0 {
         return None;
     }
-    // (起点, 终点, 类型 0增加 1减少 2汇总, 数据值)
-    let mut bars: Vec<(f64, f64, u8, f64)> = Vec::new();
+    let scale = if scale > 0.0 { scale } else { 1.0 };
+    let (lw, lh) = (w as f32 / scale, h as f32 / scale);
+
+    // 与自画版相同的累计与刻度范围
     let mut run = 0.0_f64;
+    let (mut lo, mut hi) = (0.0_f64, 0.0_f64);
+    let mut items: Vec<WaterfallData> = Vec::with_capacity(n);
     for i in 0..n {
         let v = d.values[i].unwrap_or(0.0);
-        if ser.subtotals.contains(&i) {
-            bars.push((0.0, v, 2, v));
-            run = v;
-        } else {
-            let e = run + v;
-            bars.push((run, e, if v >= 0.0 { 0 } else { 1 }, v));
-            run = e;
-        }
+        let total = ser.subtotals.contains(&i);
+        let (s0, e0) = if total { (0.0, v) } else { (run, run + v) };
+        run = e0;
+        lo = lo.min(s0.min(e0));
+        hi = hi.max(s0.max(e0));
+        items.push(WaterfallData { value: v as f32, is_total: total });
     }
-    let lo = bars.iter().map(|b| b.0.min(b.1)).fold(0.0, f64::min);
-    let hi = bars.iter().map(|b| b.0.max(b.1)).fold(0.0, f64::max);
     let (a, b, nt) = nice_range_n(lo, hi, 10);
+    let cats: Vec<String> = (0..n).map(|i| cat_at(d, i)).collect();
 
-    let (mut svg, wf, hf, _scale) = svg_head(w, h, scale);
-    let title = title_text(model);
-    let legend = model.show_legend;
-    let left = 44.0_f32;
-    let right = 16.0_f32;
-    let mut top = if title.is_some() { 44.0_f32 } else { 16.0_f32 };
-    if legend {
-        top += 20.0;
+    let rgb = |c: (u8, u8, u8)| Color { r: c.0, g: c.1, b: c.2, a: 255 };
+    let (blue, orange, grey) = (rgb(OFFICE_PALETTE[0]), rgb(OFFICE_PALETTE[1]), rgb(OFFICE_PALETTE[2]));
+    let text = Color { r: 0x59, g: 0x59, b: 0x59, a: 255 };
+
+    let mut c = WaterfallChart::new(items, cats);
+    c.width = lw;
+    c.height = lh;
+    c.font_family = "serif".to_string();
+    c.increase_color = blue;
+    c.decrease_color = orange;
+    c.total_color = grey;
+    c.label_signed = true;
+    c.bar_radius = Some(0.0);
+    c.connector_line_dash_array = Some(String::new());
+    c.bar_width_ratio = (1.0 / (1.0 + model.gap_width.unwrap_or(0.5).max(0.0))) as f32;
+    c.label_show = ser.data_labels.as_ref().map(|l| l.show_value).unwrap_or(false);
+    c.grid.stroke_width = if model.show_grid { 1.0 } else { 0.0 };
+    let line_grey = Color { r: 0xD9, g: 0xD9, b: 0xD9, a: 255 };
+    c.grid.stroke_color = line_grey;
+    c.x_axis.stroke_color = line_grey;
+    // 标题、字号与统计图同口径
+    if let Some(t) = title_text(model) {
+        c.title.text = t;
     }
-    let bottom = 36.0_f32;
-    let plot_w = wf - left - right;
-    let plot_h = hf - top - bottom;
-    if plot_w <= 0.0 || plot_h <= 0.0 {
-        return None;
+    c.title.font.size = 16.0;
+    c.title.font.weight = None;
+    c.title.font.color = text;
+    c.legend.font.size = 11.0;
+    c.legend.font.color = text;
+    c.x_axis.font.size = 11.0;
+    c.x_axis.font.color = text;
+    c.series.label.font.size = 11.0;
+    c.series.label.font.color = text;
+    for cfg in c.y_axis_configs.iter_mut() {
+        cfg.font.size = 11.0;
+        cfg.font.color = text;
+        cfg.min = Some(a as f32);
+        cfg.max = Some(b as f32);
+        cfg.split_number = nt;
     }
-    let y_of = |v: f64| -> f32 { top + plot_h * (1.0 - ((v - a) / (b - a)) as f32) };
-    if let Some(t) = &title {
-        svg.push_str(&title_svg(t, wf));
-    }
-    // 图例:增加/减少/汇总
-    let pal_idx = [0usize, 1, 3];
-    if legend {
-        let names = ["增加", "减少", "汇总"];
-        let item_w: Vec<f32> = names.iter().map(|n| 14.0 + n.chars().count() as f32 * 11.0).collect();
-        let total: f32 = item_w.iter().sum::<f32>() + 10.0 * 2.0;
-        let mut x = (wf - total) / 2.0;
-        let ly = if title.is_some() { 46.0_f32 } else { 18.0_f32 };
-        for k in 0..3 {
-            svg.push_str(&format!(
-                "<rect class=\"legend\" x=\"{:.1}\" y=\"{:.1}\" width=\"10\" height=\"10\" fill=\"{}\"/>\
-                 <text x=\"{:.1}\" y=\"{:.1}\" font-family=\"serif\" font-size=\"11\" fill=\"#595959\">{}</text>",
-                x, ly - 5.0, hex(OFFICE_PALETTE[pal_idx[k]]), x + 14.0, ly + 4.0, names[k]
-            ));
-            x += item_w[k] + 10.0;
+    if model.show_legend {
+        c.legend.show = Some(true);
+        c.legend.category = LegendCategory::Square;
+        if let Some(pos) = stat_legend_position(model) {
+            c.legend.position = Some(pos);
         }
+        c.legend_override = Some(vec![
+            ("增加".to_string(), blue),
+            ("减少".to_string(), orange),
+            ("汇总".to_string(), grey),
+        ]);
     }
-    // 网格线 + Y 刻度
-    for i in 0..=nt {
-        let val = a + (b - a) * i as f64 / nt as f64;
-        let y = y_of(val);
-        if model.show_grid || val.abs() < 1e-9 {
-            let color = if val.abs() < 1e-9 { "#BFBFBF" } else { "#D9D9D9" };
-            svg.push_str(&format!(
-                "<line x1=\"{:.1}\" y1=\"{:.1}\" x2=\"{:.1}\" y2=\"{:.1}\" stroke=\"{}\" stroke-width=\"1\"/>",
-                left, y, left + plot_w, y, color
-            ));
-        }
-        svg.push_str(&format!(
-            "<text x=\"{:.1}\" y=\"{:.1}\" font-family=\"serif\" font-size=\"11\" fill=\"#595959\" text-anchor=\"end\">{}</text>",
-            left - 6.0, y + 4.0, fmt_num(val)
-        ));
-    }
-    // 柱子、连接线、数据标签、类别名
-    let slot = plot_w / n as f32;
-    let gap = model.gap_width.unwrap_or(0.5).max(0.0) as f32;
-    let bw = slot / (1.0 + gap);
-    let show_val = ser.data_labels.as_ref().map(|l| l.show_value).unwrap_or(false);
-    for (i, bar) in bars.iter().enumerate() {
-        let x = left + i as f32 * slot + (slot - bw) / 2.0;
-        let (ys, ye) = (y_of(bar.0), y_of(bar.1));
-        let (ytop, bh) = (ys.min(ye), (ys - ye).abs().max(0.5));
-        svg.push_str(&format!(
-            "<rect class=\"bar k{}\" x=\"{:.2}\" y=\"{:.2}\" width=\"{:.2}\" height=\"{:.2}\" fill=\"{}\" stroke=\"#FFFFFF\" stroke-width=\"0.5\"/>",
-            bar.2, x, ytop, bw, bh, hex(OFFICE_PALETTE[pal_idx[bar.2 as usize]])
-        ));
-        if i + 1 < n {
-            let nx = left + (i + 1) as f32 * slot + (slot - bw) / 2.0;
-            svg.push_str(&format!(
-                "<line x1=\"{:.2}\" y1=\"{:.2}\" x2=\"{:.2}\" y2=\"{:.2}\" stroke=\"#BFBFBF\" stroke-width=\"1\"/>",
-                x + bw, ye, nx, ye
-            ));
-        }
-        if show_val {
-            let out_y = if bar.3 >= 0.0 { ytop - 4.0 } else { ytop + bh + 13.0 };
-            // 柱外标签会越过绘图区上/下沿时,挪到柱内靠顶/靠底(柱高不足一个字高则不挪)
-            let overflow = if bar.3 >= 0.0 { out_y - 11.0 < top } else { out_y > top + plot_h + 4.0 };
-            let ly = if overflow && bh > 16.0 {
-                if bar.3 >= 0.0 { ytop + 13.0 } else { ytop + bh - 4.0 }
-            } else {
-                out_y
-            };
-            svg.push_str(&format!(
-                "<text x=\"{:.1}\" y=\"{:.1}\" font-family=\"serif\" font-size=\"11\" fill=\"#595959\" text-anchor=\"middle\">{}</text>",
-                x + bw / 2.0, ly, fmt_num(bar.3)
-            ));
-        }
-        svg.push_str(&format!(
-            "<text x=\"{:.1}\" y=\"{:.1}\" font-family=\"serif\" font-size=\"11\" fill=\"#595959\" text-anchor=\"middle\">{}</text>",
-            left + i as f32 * slot + slot / 2.0, top + plot_h + 18.0, esc(&cat_at(d, i))
-        ));
-    }
-    svg.push_str("</svg>");
-    Some(svg)
+    let inner = c.svg().ok()?;
+    // 外包一层,按 scale 放大到物理像素
+    Some(format!(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{w}\" height=\"{h}\" viewBox=\"0 0 {lw:.2} {lh:.2}\">{inner}</svg>"
+    ))
 }
 
-fn funnel_svg(model: &StatChartModel, w: u32, h: u32, scale: f32) -> Option<String> {
+fn funnel_via_charts(model: &StatChartModel, w: u32, h: u32, scale: f32) -> Option<String> {
+    use charts_rs::{Color, FunnelChart, Series};
     let ser = model.series.first()?;
     let d = model.data.iter().find(|d| d.id == ser.data_id).or_else(|| model.data.first())?;
     let n = d.values.len();
@@ -551,57 +532,80 @@ fn funnel_svg(model: &StatChartModel, w: u32, h: u32, scale: f32) -> Option<Stri
         return None;
     }
     let vals: Vec<f64> = d.values.iter().map(|v| v.unwrap_or(0.0).max(0.0)).collect();
-    let vmax = vals.iter().cloned().fold(0.0, f64::max);
-    if vmax <= 0.0 {
+    if vals.iter().cloned().fold(0.0, f64::max) <= 0.0 {
         return None;
     }
+    let scale = if scale > 0.0 { scale } else { 1.0 };
+    let (lw, lh) = (w as f32 / scale, h as f32 / scale);
     let cats: Vec<String> = (0..n).map(|i| cat_at(d, i)).collect();
     let maxc = cats.iter().map(|c| c.chars().count()).max().unwrap_or(0) as f32;
-    let (mut svg, wf, hf, _scale) = svg_head(w, h, scale);
     let title = title_text(model);
     let left = (maxc * 11.0 + 14.0).max(30.0);
     let right = 16.0_f32;
     let top = if title.is_some() { 44.0_f32 } else { 16.0_f32 };
     let bottom = 16.0_f32;
-    let plot_w = wf - left - right;
-    let plot_h = hf - top - bottom;
+    let plot_w = lw - left - right;
+    let plot_h = lh - top - bottom;
     if plot_w <= 0.0 || plot_h <= 0.0 {
         return None;
     }
-    if let Some(t) = &title {
-        svg.push_str(&title_svg(t, wf));
-    }
-    svg.push_str(&format!(
-        "<line x1=\"{l:.1}\" y1=\"{:.1}\" x2=\"{l:.1}\" y2=\"{:.1}\" stroke=\"#D9D9D9\" stroke-width=\"1\"/>",
-        top, top + plot_h, l = left
-    ));
     let slot = plot_h / n as f32;
     let gap = model.gap_width.unwrap_or(0.06).max(0.0) as f32;
     let bh = slot / (1.0 + gap);
-    let fill = hex(OFFICE_PALETTE[0]);
+    let gp = slot - bh;
+    let fh = plot_h - gp;
+    let rgb = |c: (u8, u8, u8)| Color { r: c.0, g: c.1, b: c.2, a: 255 };
+    let fill = rgb(OFFICE_PALETTE[0]);
+    let white = Color { r: 255, g: 255, b: 255, a: 255 };
     let show_val = ser.data_labels.as_ref().map(|l| l.show_value).unwrap_or(false);
+
+    let list: Vec<Series> = (0..n)
+        .map(|i| {
+            let mut s: Series = (cats[i].as_str(), vec![vals[i] as f32]).into();
+            s.index = Some(0);
+            s
+        })
+        .collect();
+    let mut c = FunnelChart::new(list);
+    c.width = plot_w;
+    c.height = fh;
+    c.margin.left = 0.0;
+    c.margin.top = 0.0;
+    c.margin.right = 0.0;
+    c.margin.bottom = 0.0;
+    c.font_family = "serif".to_string();
+    c.title.text = String::new();
+    c.legend.show = Some(false);
+    c.tooltip.show = false;
+    c.series.colors = vec![fill];
+    c.series.label.font.size = 11.0;
+    c.series.label.font.color = white;
+    c.series.label.formatter = if show_val { "{c}".to_string() } else { " ".to_string() };
+    c.series_label_position = Some("inside".to_string());
+    c.funnel_gap = gp;
+    c.funnel_rect = true;
+    c.funnel_keep_order = true;
+    c.funnel_stroke = Some((white, 0.5));
+    let inner = c.svg().ok()?;
+
+    let (mut out, _, _, _) = svg_head(w, h, scale);
+    if let Some(t) = &title {
+        out.push_str(&title_svg(t, lw));
+    }
+    out.push_str(&format!(
+        "<line x1=\"{l:.1}\" y1=\"{:.1}\" x2=\"{l:.1}\" y2=\"{:.1}\" stroke=\"#D9D9D9\" stroke-width=\"1\"/>",
+        top, top + plot_h, l = left
+    ));
+    out.push_str(&format!("<g transform=\"translate({:.2},{:.2})\">{}</g>", left, top + gp / 2.0, inner));
     for i in 0..n {
-        let bwid = plot_w * (vals[i] / vmax) as f32;
-        let x = left + (plot_w - bwid) / 2.0;
-        let y = top + i as f32 * slot + (slot - bh) / 2.0;
         let cy = top + i as f32 * slot + slot / 2.0;
-        svg.push_str(&format!(
-            "<rect class=\"bar\" x=\"{:.2}\" y=\"{:.2}\" width=\"{:.2}\" height=\"{:.2}\" fill=\"{}\" stroke=\"#FFFFFF\" stroke-width=\"0.5\"/>",
-            x, y, bwid, bh, fill
-        ));
-        svg.push_str(&format!(
+        out.push_str(&format!(
             "<text x=\"{:.1}\" y=\"{:.1}\" font-family=\"serif\" font-size=\"11\" fill=\"#595959\" text-anchor=\"end\">{}</text>",
             left - 6.0, cy + 4.0, esc(&cats[i])
         ));
-        if show_val {
-            svg.push_str(&format!(
-                "<text x=\"{:.1}\" y=\"{:.1}\" font-family=\"serif\" font-size=\"11\" fill=\"#FFFFFF\" text-anchor=\"middle\">{}</text>",
-                left + plot_w / 2.0, cy + 4.0, fmt_num(vals[i])
-            ));
-        }
     }
-    svg.push_str("</svg>");
-    Some(svg)
+    out.push_str("</svg>");
+    Some(out)
 }
 
 // ---------- 层级图(树状图 / 旭日图)共用 ----------
@@ -660,9 +664,9 @@ fn tree_height(n: &Node) -> usize {
     n.children.iter().map(tree_height).max().unwrap_or(0) + 1
 }
 
-/// 顶层分支的取色顺序:蓝、橙、金黄(与 WPS 一致),之后深蓝、绿、灰(后三个为推测)。
+/// 顶层分支的取色顺序:蓝、橙、灰(WPS 实测),之后金黄、深蓝、绿(后三个为推测)。
 fn tree_color(i: usize) -> String {
-    const ORDER: [usize; 6] = [0, 1, 3, 4, 5, 2];
+    const ORDER: [usize; 6] = [0, 1, 2, 3, 4, 5];
     hex(OFFICE_PALETTE[ORDER[i % 6]])
 }
 
@@ -897,11 +901,14 @@ pub fn stat_chart_to_svg(model: &StatChartModel, w: u32, h: u32, scale: f32) -> 
     match model.kind {
         StatChartKind::Histogram => histogram_svg(model, w, h, scale),
         StatChartKind::BoxWhisker => box_svg(model, w, h, scale),
-        StatChartKind::Waterfall => waterfall_svg(model, w, h, scale),
-        StatChartKind::Funnel => funnel_svg(model, w, h, scale),
+        StatChartKind::Waterfall => {
+            waterfall_via_charts(model, w, h, scale)
+        }
+        StatChartKind::Funnel => {
+            funnel_via_charts(model, w, h, scale)
+        }
         StatChartKind::Treemap => treemap_svg(model, w, h, scale),
         StatChartKind::Sunburst => sunburst_svg(model, w, h, scale),
-        _ => None,
     }
 }
 
@@ -1076,12 +1083,14 @@ mod tests {
             &[100.0, 20.0, 50.0, -40.0, 130.0, -60.0, 70.0, 140.0], vec![7, 4], "outEnd",
         );
         let svg = stat_chart_to_svg(&m, 480, 300, 1.0).expect("svg");
-        assert_eq!(svg.matches("class=\"bar k").count(), 8);
-        assert_eq!(svg.matches("class=\"bar k0\"").count(), 4);
-        assert_eq!(svg.matches("class=\"bar k1\"").count(), 2);
-        assert_eq!(svg.matches("class=\"bar k2\"").count(), 2);
-        assert_eq!(svg.matches("class=\"legend\"").count(), 3);
-        assert!(svg.contains(">-40<") && svg.contains(">180<"));
+        // 新版(charts-rs)输出:不断言自画版 class,改查颜色与文字(忽略空白)
+        let flat: String = svg.split_whitespace().collect::<Vec<_>>().join("").to_uppercase();
+        for c in ["5B9BD5", "ED7D31", "A5A5A5"] {
+            assert!(flat.contains(c), "缺少颜色 {c}");
+        }
+        for t in ["增加", "减少", "汇总", "-40", "-60", "180"] {
+            assert!(flat.contains(t), "缺少文字 {t}");
+        }
         assert_eq!(nice_range_n(0.0, 170.0, 10), (0.0, 180.0, 9));
     }
 
@@ -1092,8 +1101,10 @@ mod tests {
             &[5000.0, 4000.0, 3000.0, 1000.0, 250.0], vec![], "ctr",
         );
         let svg = stat_chart_to_svg(&m, 480, 300, 1.0).expect("svg");
-        assert_eq!(svg.matches("class=\"bar\"").count(), 5);
-        assert!(svg.contains(">5000<") && svg.contains(">250<") && svg.contains(">类别5<"));
+        // 漏斗走 charts-rs 后,每层是一个 <polygon>(自画版回退时是 class="bar" 的 rect)
+        assert_eq!(svg.matches("<polygon").count() + svg.matches("class=\"bar\"").count(), 5);
+        let flat: String = svg.split_whitespace().collect();
+        assert!(flat.contains(">5000<") && flat.contains(">250<") && flat.contains(">类别5<"));
     }
 
     fn tree_model(kind: StatChartKind) -> StatChartModel {

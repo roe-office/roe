@@ -11,6 +11,11 @@ documentation.workspace = true
 name = "roe-agent"
 path = "src/main.rs"
 
+[[bin]]
+name = "roe-mcp"
+path = "src/bin/roe_mcp.rs"
+required-features = ["mcp"]
+
 [lib]
 name = "roe_agent"
 path = "src/lib.rs"
@@ -33,7 +38,7 @@ roe-script = { path = "../roe-script" }
 rig-core  = { version = "0.42.0", default-features = false, features = ["rustls"] }
 rig-agent = { version = "0.42.0", default-features = false }
 
-tokio    = { version = "1", features = ["rt-multi-thread", "macros"] }
+tokio    = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
 futures  = { version = "0.3", default-features = false, features = ["std"] }
 dotenvy  = "0.15"
 serde       = { workspace = true }
@@ -55,6 +60,14 @@ thiserror   = { workspace = true }
 # API 基本兼容，迁移成本低），不要引入已停更的原始 infer。
 cap-std = "4"
 sha2    = "0.10"
+# 本地日期(只取 MMDD 用于 exports 文件命名)
+chrono  = { version = "0.4", default-features = false, features = ["clock"] }
+
+# MCP Server(roe-mcp bin)。可选:GUI 不需要;构建用 --features mcp。
+rmcp = { version = "3.8.0", default-features = false, features = ["server", "transport-io"], optional = true }
+
+[features]
+mcp = ["dep:rmcp"]
 
 [dev-dependencies]
 tempfile = "3"

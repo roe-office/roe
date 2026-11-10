@@ -52,7 +52,7 @@ fn walk_shapes(shapes: &[roe_model::impress::Shape], st: &mut Stat) {
         }
         match &shape.style.fill {
             Some(FillStyle::Solid(_)) | Some(FillStyle::None) | None => st.solid_or_none_fill += 1,
-            Some(FillStyle::Gradient { .. }) | Some(FillStyle::Picture(_)) | Some(FillStyle::PictureTiled { .. }) => {
+            Some(FillStyle::Gradient { .. }) | Some(FillStyle::Picture(_)) | Some(FillStyle::PictureTiled { .. }) | Some(FillStyle::Pattern { .. }) => {
                 st.gradient_or_picture_fill += 1;
             }
         }

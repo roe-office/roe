@@ -1,17 +1,17 @@
 //! v247: Writer 字符级剪贴板（应用内，进程级单槽位，可跨文档）。
 //! 偏移 = 段内全部 run 文本拼接后的 UTF-8 字节偏移，与格式接口一致。
-//! 只支持 body 里的普通段落；选区若跨表格/图片会拒绝。
+//! 选区起止须是普通段落；中间的表格/图片/图表/形状整块复制删除粘贴；含分节符会拒绝。
 
 use crate::error::{set_last_error, RoeErrorCode};
 use crate::handle;
-use roe_model::writer::{BodyElement, Paragraph, Run};
+use roe_model::writer::{BodyElement, Paragraph, Revision, RevisionKind, Run};
 use roe_parser::RoeDocument;
 use std::cell::RefCell;
 use std::ffi::CString;
 use std::os::raw::c_char;
 
 thread_local! {
-    static WCLIP: RefCell<Option<Vec<Paragraph>>> = const { RefCell::new(None) };
+    static WCLIP: RefCell<Option<Vec<BodyElement>>> = const { RefCell::new(None) };
 }
 
 fn order(pa: u32, oa: u32, pb: u32, ob: u32) -> (usize, usize, usize, usize) {
@@ -33,9 +33,12 @@ fn check_body(body: &[BodyElement], pa: usize, pb: usize) -> Result<(), String> 
     if pa > pb || pb >= body.len() {
         return Err("段落下标越界".to_string());
     }
+    if !matches!(body[pa], BodyElement::Paragraph(_)) || !matches!(body[pb], BodyElement::Paragraph(_)) {
+        return Err("选区起止必须落在普通段落内".to_string());
+    }
     for i in pa..=pb {
-        if !matches!(body[i], BodyElement::Paragraph(_)) {
-            return Err("选区包含表格或图片，暂不支持".to_string());
+        if matches!(body[i], BodyElement::Section(_)) {
+            return Err("选区包含分节符，暂不支持".to_string());
         }
     }
     Ok(())
@@ -78,31 +81,34 @@ fn text_len(runs: &[Run]) -> usize {
     runs.iter().map(|r| r.text.len()).sum()
 }
 
-fn copy_in(body: &[BodyElement], pa: usize, oa: usize, pb: usize, ob: usize) -> Result<Vec<Paragraph>, String> {
+fn copy_in(body: &[BodyElement], pa: usize, oa: usize, pb: usize, ob: usize) -> Result<Vec<BodyElement>, String> {
     check_body(body, pa, pb)?;
-    let mut out: Vec<Paragraph> = Vec::new();
+    let mut out: Vec<BodyElement> = Vec::new();
     if pa == pb {
         let p = para_ref(body, pa)?;
         let right = split_runs(&p.runs, oa)?.1;
         let mid = split_runs(&right, ob - oa)?.0;
         let mut np = p.clone();
         np.runs = mid;
-        out.push(np);
+        out.push(BodyElement::Paragraph(np));
     } else {
         let p = para_ref(body, pa)?;
         let mut np = p.clone();
         np.runs = split_runs(&p.runs, oa)?.1;
-        out.push(np);
+        out.push(BodyElement::Paragraph(np));
+        // 中间的段落、表格、图片、图表、形状整块复制
         for i in (pa + 1)..pb {
-            out.push(para_ref(body, i)?.clone());
+            out.push(body[i].clone());
         }
         let p = para_ref(body, pb)?;
         let mut np = p.clone();
         np.runs = split_runs(&p.runs, ob)?.0;
-        out.push(np);
+        out.push(BodyElement::Paragraph(np));
     }
-    for p in out.iter_mut() {
-        p.bookmarks.clear();
+    for e in out.iter_mut() {
+        if let BodyElement::Paragraph(p) = e {
+            p.bookmarks.clear();
+        }
     }
     Ok(out)
 }
@@ -126,18 +132,55 @@ fn delete_in(body: &mut Vec<BodyElement>, pa: usize, oa: usize, pb: usize, ob: u
     Ok(())
 }
 
-fn paste_in(body: &mut Vec<BodyElement>, frag: &[Paragraph], p: usize, o: usize) -> Result<(usize, usize), String> {
+/// v308: 修订模式下的范围删除。区间内文字标成删除；跨段时把各段并成一段（合并本身不记修订）。
+fn tracked_delete_range(doc: &mut roe_model::writer::WriterDocument, pa: usize, oa: usize, pb: usize, ob: usize, author: &str) -> Result<(), String> {
+    check_body(&doc.body, pa, pb)?;
+    for i in pa..=pb {
+        if !matches!(doc.body[i], BodyElement::Paragraph(_)) {
+            return Err("修订模式：选区内含表格或图片，暂不支持删除".to_string());
+        }
+    }
+    let date = crate::revisions::now_iso_utc();
+    for i in pa..=pb {
+        let start = if i == pa { oa } else { 0 };
+        let end = if i == pb { ob } else { text_len(&para_ref(&doc.body, i)?.runs) };
+        let id = crate::revisions::next_revision_id(doc);
+        let BodyElement::Paragraph(p) = &mut doc.body[i] else { unreachable!() };
+        crate::text_edit::tracked_delete_span(p, start, end, author, id, &date)?;
+    }
+    if pb > pa {
+        let mut tail: Vec<Run> = Vec::new();
+        for i in (pa + 1)..=pb {
+            tail.extend(para_ref(&doc.body, i)?.runs.clone());
+        }
+        let BodyElement::Paragraph(first) = &mut doc.body[pa] else { unreachable!() };
+        first.runs.extend(tail);
+        doc.body.drain((pa + 1)..=pb);
+    }
+    Ok(())
+}
+
+fn frag_para(frag: &[BodyElement], i: usize) -> Result<&Paragraph, String> {
+    match frag.get(i) {
+        Some(BodyElement::Paragraph(p)) => Ok(p),
+        _ => Err("剪贴板内容首尾不是段落".to_string()),
+    }
+}
+
+fn paste_in(body: &mut Vec<BodyElement>, frag: &[BodyElement], p: usize, o: usize) -> Result<(usize, usize), String> {
     check_body(body, p, p)?;
     let n = frag.len();
     if n == 0 {
         return Err("剪贴板为空".to_string());
     }
+    let first_frag = frag_para(frag, 0)?;
+    let last_frag = frag_para(frag, n - 1)?;
     let target = para_ref(body, p)?.clone();
     let (left, right) = split_runs(&target.runs, o)?;
     if n == 1 {
-        let add = text_len(&frag[0].runs);
+        let add = text_len(&first_frag.runs);
         let mut runs = left;
-        runs.extend(frag[0].runs.iter().cloned());
+        runs.extend(first_frag.runs.iter().cloned());
         runs.extend(right);
         let mut np = target;
         np.runs = runs;
@@ -146,18 +189,18 @@ fn paste_in(body: &mut Vec<BodyElement>, frag: &[Paragraph], p: usize, o: usize)
     }
     let mut first = target.clone();
     let mut fr = left;
-    fr.extend(frag[0].runs.iter().cloned());
+    fr.extend(first_frag.runs.iter().cloned());
     first.runs = fr;
-    let last_len = text_len(&frag[n - 1].runs);
+    let last_len = text_len(&last_frag.runs);
     let mut last = target;
-    let mut lr: Vec<Run> = frag[n - 1].runs.iter().cloned().collect();
+    let mut lr: Vec<Run> = last_frag.runs.iter().cloned().collect();
     lr.extend(right);
     last.runs = lr;
     last.page_break_before = false;
     last.bookmarks.clear();
     let mut inserts: Vec<BodyElement> = Vec::new();
-    for fp in &frag[1..n - 1] {
-        inserts.push(BodyElement::Paragraph(fp.clone()));
+    for fe in &frag[1..n - 1] {
+        inserts.push(fe.clone());
     }
     inserts.push(BodyElement::Paragraph(last));
     body[p] = BodyElement::Paragraph(first);
@@ -165,6 +208,27 @@ fn paste_in(body: &mut Vec<BodyElement>, frag: &[Paragraph], p: usize, o: usize)
         body.insert(p + 1 + k, e);
     }
     Ok((p + n - 1, last_len))
+}
+
+/// v309: 修订模式下粘贴，片段内所有 run 标成同一条“插入”修订（拒绝时整段一起消失）。
+/// 片段原有的修订标记被覆盖；表格、图片等非段落元素这一轮不标。
+fn mark_frag_inserted(frag: &[BodyElement], id: u32, author: &str) -> Vec<BodyElement> {
+    let date = crate::revisions::now_iso_utc();
+    let mut out = frag.to_vec();
+    for el in out.iter_mut() {
+        if let BodyElement::Paragraph(p) = el {
+            for r in p.runs.iter_mut() {
+                r.revision = Some(Revision {
+                    kind: RevisionKind::Insert,
+                    id,
+                    author: author.to_string(),
+                    date: date.clone(),
+                    under: None,
+                });
+            }
+        }
+    }
+    out
 }
 
 /// 剪贴板是否有 Writer 文本内容。
@@ -177,7 +241,7 @@ pub extern "C" fn roe_writer_clip_has() -> i32 {
 #[no_mangle]
 pub extern "C" fn roe_writer_copy(handle: u64, pa: u32, oa: u32, pb: u32, ob: u32) -> i32 {
     let (pa, oa, pb, ob) = order(pa, oa, pb, ob);
-    let result = handle::with_entry(handle, |entry| -> Result<Vec<Paragraph>, String> {
+    let result = handle::with_entry(handle, |entry| -> Result<Vec<BodyElement>, String> {
         let RoeDocument::Writer(doc) = &entry.doc else { return Err("非 Writer 文档".to_string()); };
         copy_in(&doc.body, pa, oa, pb, ob)
     });
@@ -201,8 +265,14 @@ pub extern "C" fn roe_writer_delete_range(handle: u64, pa: u32, oa: u32, pb: u32
     let result = handle::with_entry(handle, |entry| -> Result<(), String> {
         if !matches!(&entry.doc, RoeDocument::Writer(_)) { return Err("非 Writer 文档".to_string()); }
         let prev = entry.doc.clone();
+        let (track, author) = (entry.writer_options.track_changes,
+            if entry.writer_options.track_author.is_empty() { "用户".to_string() } else { entry.writer_options.track_author.clone() });
         let RoeDocument::Writer(doc) = &mut entry.doc else { return Err("非 Writer 文档".to_string()); };
-        delete_in(&mut doc.body, pa, oa, pb, ob)?;
+        if track {
+            tracked_delete_range(doc, pa, oa, pb, ob, &author)?;
+        } else {
+            delete_in(&mut doc.body, pa, oa, pb, ob)?;
+        }
         entry.push_undo_snapshot(prev, handle::EditCursorContext::at(pa, 0));
         Ok(())
     });
@@ -230,7 +300,14 @@ pub extern "C" fn roe_writer_paste(handle: u64, para: u32, offset: u32) -> *mut 
     let result = handle::with_entry(handle, |entry| -> Result<(usize, usize), String> {
         if !matches!(&entry.doc, RoeDocument::Writer(_)) { return Err("非 Writer 文档".to_string()); }
         let prev = entry.doc.clone();
+        let track = entry.writer_options.track_changes;
+        let author = if entry.writer_options.track_author.is_empty() { "用户".to_string() } else { entry.writer_options.track_author.clone() };
         let RoeDocument::Writer(doc) = &mut entry.doc else { return Err("非 Writer 文档".to_string()); };
+        let frag = if track {
+            mark_frag_inserted(&frag, crate::revisions::next_revision_id(doc), &author)
+        } else {
+            frag.clone()
+        };
         let pos = paste_in(&mut doc.body, &frag, p, o)?;
         entry.push_undo_snapshot(prev, handle::EditCursorContext::at(p, 0));
         Ok(pos)
@@ -454,10 +531,16 @@ pub extern "C" fn roe_writer_insert_page_break(handle: u64, para: u32, offset: u
         if o > total { return Err(format!("offset={o} 超出段落长度 {total}")); }
         let code;
         if o == 0 {
+            // 与 Word 一致: 断点前留一个空段落, 原段落移到下一页
+            let mut blank = target.clone();
+            blank.runs = Vec::new();
+            blank.bookmarks.clear();
+            blank.page_break_before = false;
             let mut np = target;
             np.page_break_before = true;
-            doc.body[p] = BodyElement::Paragraph(np);
-            code = 0;
+            doc.body[p] = BodyElement::Paragraph(blank);
+            doc.body.insert(p + 1, BodyElement::Paragraph(np));
+            code = 1;
         } else {
             let (left, right) = split_runs(&target.runs, o)?;
             let mut first = target.clone();
@@ -477,5 +560,273 @@ pub extern "C" fn roe_writer_insert_page_break(handle: u64, para: u32, offset: u
         Some(Ok(c)) => { handle::invalidate_writer_layout_cache(handle); c }
         Some(Err(m)) => { set_last_error(format!("roe_writer_insert_page_break: {m}")); -1 }
         None => { set_last_error("roe_writer_insert_page_break: 无效句柄"); -1 }
+    }
+}
+
+// ───────── 系统剪贴板配合：缓冲与纯文本互转 ─────────
+fn frag_to_text(frag: &[BodyElement]) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    for e in frag {
+        if let BodyElement::Paragraph(p) = e {
+            lines.push(p.runs.iter().map(|r| r.text.as_str()).collect::<String>());
+        }
+    }
+    lines.join("\n")
+}
+
+fn text_to_frag(text: &str) -> Result<Vec<BodyElement>, String> {
+    let norm = text.replace("\r\n", "\n").replace('\r', "\n");
+    if norm.is_empty() {
+        return Err("文本为空".to_string());
+    }
+    Ok(norm
+        .split('\n')
+        .map(|line| {
+            let runs = if line.is_empty() { vec![] } else { vec![Run { text: line.to_string(), ..Default::default() }] };
+            BodyElement::Paragraph(Paragraph { runs, ..Default::default() })
+        })
+        .collect())
+}
+
+/// 导出内部缓冲的纯文本（段落用 \n 连接，整块元素跳过）。无缓冲返回 null。用 roe_free_string 释放。
+#[no_mangle]
+pub extern "C" fn roe_writer_clip_text() -> *mut c_char {
+    let text = WCLIP.with(|c| c.borrow().as_ref().map(|f| frag_to_text(f)));
+    match text {
+        Some(t) => CString::new(t.replace('\0', "")).map(|cs| cs.into_raw()).unwrap_or(std::ptr::null_mut()),
+        None => std::ptr::null_mut(),
+    }
+}
+
+/// 把外部纯文本（UTF-8，\n 或 \r\n 分段）放进内部缓冲，之后可直接 roe_writer_paste。
+#[no_mangle]
+pub extern "C" fn roe_writer_set_clip_text(text: *const c_char) -> i32 {
+    if text.is_null() {
+        set_last_error("roe_writer_set_clip_text: 空指针");
+        return RoeErrorCode::ScriptError as i32;
+    }
+    let cs = unsafe { std::ffi::CStr::from_ptr(text) };
+    let Ok(t) = cs.to_str() else {
+        set_last_error("roe_writer_set_clip_text: 不是有效 UTF-8");
+        return RoeErrorCode::ScriptError as i32;
+    };
+    match text_to_frag(t) {
+        Ok(f) => { WCLIP.with(|c| *c.borrow_mut() = Some(f)); RoeErrorCode::Ok as i32 }
+        Err(m) => { set_last_error(format!("roe_writer_set_clip_text: {m}")); RoeErrorCode::ScriptError as i32 }
+    }
+}
+
+#[cfg(test)]
+mod clip_block_tests {
+    use super::*;
+    use roe_model::common::{Color, Table};
+    use roe_model::writer::Section;
+
+    fn mk_table() -> Table {
+        let black = Some(Color { r: 0, g: 0, b: 0, a: 255 });
+        Table {
+            float_pos: None,
+            col_widths: vec![],
+            style_id: None,
+            first_row: false, first_col: false, last_row: false, last_col: false,
+            band_row: false, band_col: false,
+            default_border_color: black,
+            default_border_width: Some(0.5),
+            inside_h_color: black,
+            inside_h_width: Some(0.5),
+            inside_v_color: black,
+            inside_v_width: Some(0.5),
+            rows: vec![],
+        }
+    }
+
+    fn para(t: &str) -> BodyElement {
+        BodyElement::Paragraph(Paragraph {
+            runs: vec![Run { text: t.to_string(), ..Default::default() }],
+            ..Default::default()
+        })
+    }
+    fn text(e: &BodyElement) -> String {
+        match e {
+            BodyElement::Paragraph(p) => p.runs.iter().map(|r| r.text.as_str()).collect(),
+            _ => "<obj>".to_string(),
+        }
+    }
+    fn texts(b: &[BodyElement]) -> Vec<String> { b.iter().map(text).collect() }
+
+    #[test]
+    fn copy_across_table_keeps_block() {
+        let body = vec![para("AAAA"), BodyElement::Table(mk_table()), para("BBBB")];
+        let frag = copy_in(&body, 0, 2, 2, 2).unwrap();
+        assert_eq!(texts(&frag), vec!["AA", "<obj>", "BB"]);
+    }
+
+    #[test]
+    fn delete_across_table_removes_block() {
+        let mut body = vec![para("AAAA"), BodyElement::Table(mk_table()), para("BBBB")];
+        delete_in(&mut body, 0, 2, 2, 2).unwrap();
+        assert_eq!(texts(&body), vec!["AABB"]);
+    }
+
+    #[test]
+    fn paste_inserts_block_in_order() {
+        let src = vec![para("AAAA"), BodyElement::Table(mk_table()), para("BBBB")];
+        let frag = copy_in(&src, 0, 2, 2, 2).unwrap();
+        let mut body = vec![para("XY")];
+        let pos = paste_in(&mut body, &frag, 0, 1).unwrap();
+        assert_eq!(texts(&body), vec!["XAA", "<obj>", "BBY"]);
+        assert_eq!(pos, (2, 2));
+    }
+
+    #[test]
+    fn plain_paragraphs_still_work() {
+        let src = vec![para("hello"), para("world")];
+        let frag = copy_in(&src, 0, 3, 1, 2).unwrap();
+        assert_eq!(texts(&frag), vec!["lo", "wo"]);
+        let mut body = vec![para("ab")];
+        let pos = paste_in(&mut body, &frag, 0, 1).unwrap();
+        assert_eq!(texts(&body), vec!["alo", "wob"]);
+        assert_eq!(pos, (1, 2));
+    }
+
+    #[test]
+    fn section_and_non_paragraph_ends_rejected() {
+        let body = vec![para("A"), BodyElement::Section(Section::default()), para("B")];
+        assert!(copy_in(&body, 0, 0, 2, 1).is_err());
+        let body2 = vec![para("A"), BodyElement::Table(mk_table()), para("B")];
+        assert!(copy_in(&body2, 1, 0, 2, 1).is_err());
+        assert!(copy_in(&body2, 0, 0, 1, 0).is_err());
+    }
+}
+
+#[cfg(test)]
+mod clip_text_tests {
+    use super::*;
+    use roe_model::writer::Section;
+
+    fn para(t: &str) -> BodyElement {
+        BodyElement::Paragraph(Paragraph { runs: vec![Run { text: t.to_string(), ..Default::default() }], ..Default::default() })
+    }
+
+    #[test]
+    fn frag_text_skips_blocks() {
+        let f = vec![para("AA"), BodyElement::Section(Section::default()), para("BB")];
+        assert_eq!(frag_to_text(&f), "AA\nBB");
+    }
+
+    #[test]
+    fn text_splits_into_paragraphs() {
+        let f = text_to_frag("a\r\n\r\nb").unwrap();
+        assert_eq!(frag_to_text(&f), "a\n\nb");
+        assert_eq!(f.len(), 3);
+        assert!(text_to_frag("").is_err());
+    }
+
+    #[test]
+    fn external_text_pastes_and_roundtrips() {
+        let frag = text_to_frag("X\nY").unwrap();
+        let mut body = vec![para("abcd")];
+        let pos = paste_in(&mut body, &frag, 0, 2).unwrap();
+        assert_eq!(frag_to_text(&body), "abX\nYcd");
+        assert_eq!(pos, (1, 1));
+    }
+}
+
+#[cfg(test)]
+mod track_range_tests {
+    use super::*;
+    use roe_model::writer::{RevisionKind, WriterDocument};
+
+    fn doc_of(paras: &[&str]) -> WriterDocument {
+        let mut d = WriterDocument::default();
+        for t in paras {
+            let mut p = Paragraph::default();
+            p.runs.push(Run { text: t.to_string(), ..Default::default() });
+            d.body.push(BodyElement::Paragraph(p));
+        }
+        d
+    }
+
+    fn texts(d: &WriterDocument, i: usize) -> Vec<(String, Option<RevisionKind>)> {
+        let BodyElement::Paragraph(p) = &d.body[i] else { panic!() };
+        p.runs.iter().map(|r| (r.text.clone(), r.revision.as_ref().map(|v| v.kind))).collect()
+    }
+
+    #[test]
+    fn same_paragraph_marks_delete() {
+        let mut d = doc_of(&["ABCDEF"]);
+        tracked_delete_range(&mut d, 0, 1, 0, 3, "me").unwrap();
+        let t = texts(&d, 0);
+        assert_eq!(t.len(), 3);
+        assert_eq!(t[1], ("BC".to_string(), Some(RevisionKind::Delete)));
+        assert_eq!(d.body.len(), 1);
+    }
+
+    #[test]
+    fn cross_paragraph_marks_and_merges() {
+        let mut d = doc_of(&["AAAA", "BBBB", "CCCC"]);
+        tracked_delete_range(&mut d, 0, 2, 2, 1, "me").unwrap();
+        assert_eq!(d.body.len(), 1);
+        let t = texts(&d, 0);
+        let plain: String = t.iter().filter(|x| x.1.is_none()).map(|x| x.0.as_str()).collect();
+        let del: String = t.iter().filter(|x| x.1 == Some(RevisionKind::Delete)).map(|x| x.0.as_str()).collect();
+        assert_eq!(plain, "AACCC");
+        assert_eq!(del, "AABBBBC");
+    }
+}
+
+#[cfg(test)]
+mod track_paste_tests {
+    use super::*;
+
+    fn para(t: &str) -> BodyElement {
+        BodyElement::Paragraph(Paragraph { runs: vec![Run { text: t.to_string(), ..Default::default() }], ..Default::default() })
+    }
+
+    /// 取某段所有非空 run：(文本, 修订类型, 修订id, 作者)
+    fn runs_of(body: &[BodyElement], i: usize) -> Vec<(String, Option<RevisionKind>, u32, String)> {
+        let BodyElement::Paragraph(p) = &body[i] else { panic!("not paragraph") };
+        p.runs.iter().filter(|r| !r.text.is_empty()).map(|r| {
+            let rv = r.revision.as_ref();
+            (r.text.clone(), rv.map(|v| v.kind), rv.map(|v| v.id).unwrap_or(0), rv.map(|v| v.author.clone()).unwrap_or_default())
+        }).collect()
+    }
+
+    #[test]
+    fn untracked_paste_has_no_revision() {
+        let frag = text_to_frag("X\nY").unwrap();
+        let mut body = vec![para("abcd")];
+        paste_in(&mut body, &frag, 0, 2).unwrap();
+        for i in 0..2 {
+            for (_, k, _, _) in runs_of(&body, i) { assert!(k.is_none()); }
+        }
+    }
+
+    #[test]
+    fn tracked_paste_marks_all_pasted_runs_as_one_insert() {
+        let frag = text_to_frag("X\nY").unwrap();
+        let marked = mark_frag_inserted(&frag, 7, "用户");
+        let mut body = vec![para("abcd")];
+        paste_in(&mut body, &marked, 0, 2).unwrap();
+        let p0 = runs_of(&body, 0);
+        let p1 = runs_of(&body, 1);
+        assert_eq!(p0[0], ("ab".to_string(), None, 0, String::new()));
+        assert_eq!(p0[1], ("X".to_string(), Some(RevisionKind::Insert), 7, "用户".to_string()));
+        assert_eq!(p1[0], ("Y".to_string(), Some(RevisionKind::Insert), 7, "用户".to_string()));
+        assert_eq!(p1[1], ("cd".to_string(), None, 0, String::new()));
+    }
+
+    #[test]
+    fn marking_overrides_existing_revision() {
+        let mut frag = vec![para("Z")];
+        if let BodyElement::Paragraph(p) = &mut frag[0] {
+            p.runs[0].revision = Some(Revision {
+                kind: RevisionKind::Delete, id: 3, author: "别人".to_string(),
+                date: String::new(), under: None,
+            });
+        }
+        let marked = mark_frag_inserted(&frag, 9, "AI");
+        let r = runs_of(&marked, 0);
+        assert_eq!(r[0], ("Z".to_string(), Some(RevisionKind::Insert), 9, "AI".to_string()));
     }
 }

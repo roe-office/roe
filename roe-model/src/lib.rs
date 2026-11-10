@@ -12,7 +12,10 @@ pub mod stats;
 pub mod stat_chart;
 pub mod style;
 pub mod common;
+pub mod textures;
+pub mod pattern;
 pub mod pivot_layout;
+pub mod num_format_class;
 /// PPTX-11: 预设几何形状 fmla 公式求值系统。见模块内文档注释。
 pub mod preset_geometry;
 pub mod table_style;

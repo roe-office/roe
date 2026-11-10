@@ -25,9 +25,10 @@ fn make_cache_key(
         }
     } else {
         ShapeCacheKey {
-            text: line_text.to_string(),
+            text: format!("{}\u{1}{}", line_text, runs.iter().map(|r| if r.style.font_family_is_set { '1' } else { '0' }).collect::<String>()),
             run_styles: runs.iter().map(|r| {
-                (r.start, r.end, r.style.font_size.to_bits(), r.style.bold, r.style.italic)
+                let fsz = match &r.formula_box { Some(fb) => fb.width.to_bits(), None => r.style.font_size.to_bits() };
+                (r.start, r.end, fsz, r.style.bold, r.style.italic)
             }).collect(),
         }
     }
@@ -60,8 +61,9 @@ fn shape_line(
     };
 
     let default_brush = RunBrush { color: [30, 30, 30, 255], run_idx: None };
+    let shaped_text = line_text.replace('\u{FFFC}', "\u{200B}");
     let mut builder = registry.layout_context.ranged_builder(
-        &mut registry.font_context, line_text, 1.0, true,
+        &mut registry.font_context, &shaped_text, 1.0, true,
     );
     builder.push_default(StyleProperty::Brush(default_brush));
     builder.push_default(GenericFamily::SystemUi);
@@ -73,14 +75,28 @@ fn shape_line(
         let start = span.start.min(line_text.len());
         let end   = span.end.min(line_text.len());
         if start >= end { continue; }
+        if let Some(fb) = &span.formula_box {
+            builder.push_inline_box(parley::InlineBox {
+                id: run_idx as u64,
+                kind: parley::InlineBoxKind::InFlow,
+                index: start,
+                width: fb.width,
+                height: span.style.font_size,
+                baseline: None,
+            });
+            continue;
+        }
         let range = start..end;
         builder.push(StyleProperty::Brush(RunBrush { color: [30, 30, 30, 255], run_idx: Some(run_idx) }), range.clone());
         builder.push(StyleProperty::FontSize(span.style.font_size), range.clone());
+        if span.style.font_family_is_set {
+            builder.push(StyleProperty::FontFamily(parley::FontFamily::named("Carlito")), range.clone());
+        }
         if span.style.bold   { builder.push(StyleProperty::FontWeight(FontWeight::BOLD), range.clone()); }
         if span.style.italic { builder.push(StyleProperty::FontStyle(FontStyle::Italic), range.clone()); }
     }
 
-    let mut layout: parley::Layout<RunBrush> = builder.build(line_text);
+    let mut layout: parley::Layout<RunBrush> = builder.build(&shaped_text);
     // 不限制宽度：line_shape 只用来算单行字符坐标，不需要真的换行
     layout.break_all_lines(None);
 
@@ -103,7 +119,15 @@ fn shape_line(
         // 用 visual_clusters()（而非 clusters()）是为了和官方 glyphs() 的
         // 遍历顺序完全一致，避免 RTL 场景下顺序不一致引入新问题。
         for item in line.items() {
-            let PositionedLayoutItem::GlyphRun(glyph_run) = item else { continue };
+            let glyph_run = match item {
+                PositionedLayoutItem::InlineBox(pb) => {
+                    if let Some(sp) = runs.get(pb.id as usize) {
+                        glyphs.push((sp.start, sp.end, pb.x, pb.width));
+                    }
+                    continue;
+                }
+                PositionedLayoutItem::GlyphRun(g) => g,
+            };
             // V108修复第二版（根因见 ROE_Progress_v108.md）：实测证实
             // glyph_run.run() 确实返回覆盖整行所有文字的共享 Run 对象
             // （V107方向正确，上一版判断被诊断日志推翻）。因此
@@ -120,6 +144,7 @@ fn shape_line(
                     continue;
                 }
                 let range = cluster.text_range();
+                if runs.iter().any(|s| s.formula_box.is_some() && range.start >= s.start && range.start < s.end) { continue; }
                 if cluster.glyphs().count() == 0 {
                     continue;
                 }
@@ -166,8 +191,9 @@ pub fn shape_line_full(
     };
 
     let default_brush = RunBrush { color: [30, 30, 30, 255], run_idx: None };
+    let shaped_text = line_text.replace('\u{FFFC}', "\u{200B}");
     let mut builder = registry.layout_context.ranged_builder(
-        &mut registry.font_context, line_text, 1.0, true,
+        &mut registry.font_context, &shaped_text, 1.0, true,
     );
     builder.push_default(StyleProperty::Brush(default_brush));
     builder.push_default(GenericFamily::SystemUi);
@@ -179,14 +205,28 @@ pub fn shape_line_full(
         let start = span.start.min(line_text.len());
         let end   = span.end.min(line_text.len());
         if start >= end { continue; }
+        if let Some(fb) = &span.formula_box {
+            builder.push_inline_box(parley::InlineBox {
+                id: run_idx as u64,
+                kind: parley::InlineBoxKind::InFlow,
+                index: start,
+                width: fb.width,
+                height: span.style.font_size,
+                baseline: None,
+            });
+            continue;
+        }
         let range = start..end;
         builder.push(StyleProperty::Brush(RunBrush { color: [30, 30, 30, 255], run_idx: Some(run_idx) }), range.clone());
         builder.push(StyleProperty::FontSize(span.style.font_size), range.clone());
+        if span.style.font_family_is_set {
+            builder.push(StyleProperty::FontFamily(parley::FontFamily::named("Carlito")), range.clone());
+        }
         if span.style.bold   { builder.push(StyleProperty::FontWeight(FontWeight::BOLD), range.clone()); }
         if span.style.italic { builder.push(StyleProperty::FontStyle(FontStyle::Italic), range.clone()); }
     }
 
-    let mut layout: parley::Layout<RunBrush> = builder.build(line_text);
+    let mut layout: parley::Layout<RunBrush> = builder.build(&shaped_text);
     layout.break_all_lines(None);
     layout
 }

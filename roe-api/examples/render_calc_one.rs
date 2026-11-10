@@ -8,6 +8,11 @@ fn main() {
     let output_dir = args.get(2).map(|s| s.as_str()).unwrap_or("/tmp");
     let wb = open_calc(path).expect("open failed");
     let filename = Path::new(path).file_stem().unwrap().to_string_lossy().to_string();
+    // v319: 把源 xlsx 复制到输出目录,方便和渲染图对比
+    let _ = std::fs::create_dir_all(output_dir);
+    if let Some(fname) = Path::new(path).file_name() {
+        let _ = std::fs::copy(path, Path::new(output_dir).join(fname));
+    }
     println!("sheet count: {}", wb.sheets.len());
     let max_cols = 20u32;
     let max_rows = 50u32;

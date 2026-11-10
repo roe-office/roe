@@ -291,6 +291,80 @@ pub fn extract_pivot_config(xml: &str, field_names: &[String]) -> Option<PivotCo
     Some(PivotConfigExtract { row_fields, col_fields, value_fields, filter_fields })
 }
 
+/// 由 (compact, outline) 属性判定布局;字段级优先于根属性;未显式声明返回 None(保持默认 Outline)。
+fn layout_from_attrs(
+    fld: Option<(String, String)>,
+    root: &(String, String),
+) -> Option<roe_model::calc::PivotLayoutMode> {
+    use roe_model::calc::PivotLayoutMode as M;
+    let (lc, lo) = fld.unwrap_or_else(|| root.clone());
+    if lc == "0" {
+        Some(if lo == "1" { M::Outline } else { M::Tabular })
+    } else if lc == "1" || (lc.is_empty() && lo == "1") {
+        Some(M::Compact)
+    } else {
+        None
+    }
+}
+
+/// 仅解析 pivotTableDefinition 的布局形态(导入重建时使用)。
+pub fn parse_pivot_layout(xml: &str) -> Option<roe_model::calc::PivotLayoutMode> {
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(true);
+    let mut root: (String, String) = (String::new(), String::new());
+    let mut fld: Option<(String, String)> = None;
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
+                let attrs: Vec<_> = e.attributes().filter_map(|a| a.ok()).collect();
+                let get = |k: &[u8]| -> String {
+                    attrs.iter().find(|a| a.key.as_ref() == k)
+                        .map(|a| String::from_utf8_lossy(&a.value).into_owned())
+                        .unwrap_or_default()
+                };
+                match e.name().as_ref() {
+                    b"pivotTableDefinition" => { root = (get(b"compact"), get(b"outline")); }
+                    b"pivotField" if fld.is_none() && !get(b"axis").is_empty() => {
+                        let fl = (get(b"compact"), get(b"outline"));
+                        if !(fl.0.is_empty() && fl.1.is_empty()) { fld = Some(fl); }
+                    }
+                    _ => {}
+                }
+            }
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+    }
+    layout_from_attrs(fld, &root)
+}
+
+/// 仅解析小计位置:第一个轴字段的 subtotalTop="0" 即小计在组底(默认/缺省为在上)。
+/// 只对大纲/紧凑有意义;表格形式恒在组末,读到的值不影响渲染。
+pub fn parse_pivot_subtotals_bottom(xml: &str) -> bool {
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(true);
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
+                if e.name().as_ref() == b"pivotField" {
+                    let attrs: Vec<_> = e.attributes().filter_map(|a| a.ok()).collect();
+                    let get = |k: &[u8]| -> String {
+                        attrs.iter().find(|a| a.key.as_ref() == k)
+                            .map(|a| String::from_utf8_lossy(&a.value).into_owned())
+                            .unwrap_or_default()
+                    };
+                    if !get(b"axis").is_empty() {
+                        return get(b"subtotalTop") == "0";
+                    }
+                }
+            }
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+    }
+    false
+}
+
 pub fn parse_pivot_table(xml: &str, field_names: &[String], cache_fields: &[Vec<String>]) -> Option<PivotMeta> {
     let mut reader = Reader::from_str(xml);
     reader.config_mut().trim_text(true);
@@ -332,6 +406,9 @@ pub fn parse_pivot_table(xml: &str, field_names: &[String], cache_fields: &[Vec<
     let mut col_grand_totals: bool = true;
     // ROOT-060: 值字段展开方向，默认false（展开在列方向，即当前已支持的场景）
     let mut data_on_rows: bool = false;
+    // 布局:根属性 (compact, outline) 与第一个轴字段的 (compact, outline),字段级优先
+    let mut root_layout: (String, String) = (String::new(), String::new());
+    let mut fld_layout: Option<(String, String)> = None;
 
     loop {
         let evt = reader.read_event();
@@ -359,6 +436,7 @@ pub fn parse_pivot_table(xml: &str, field_names: &[String], cache_fields: &[Vec<
                         let cgt = get(b"colGrandTotals");
                         if rgt == "0" { row_grand_totals = false; }
                         if cgt == "0" { col_grand_totals = false; }
+                        root_layout = (get(b"compact"), get(b"outline"));
                         // ROOT-060: dataOnRows属性标记值字段(dataFields)展开方向。
                         // "1"=展开在行方向（此时rowFields里会有field x="-2"占位，
                         // 真实分组字段都在colFields）；缺省或"0"=展开在列方向（默认，
@@ -380,6 +458,10 @@ pub fn parse_pivot_table(xml: &str, field_names: &[String], cache_fields: &[Vec<
                     b"pivotFields" => { in_pivot_fields = true; }
                     b"pivotField" if in_pivot_fields => {
                         cur_axis = get(b"axis");
+                        if !cur_axis.is_empty() && fld_layout.is_none() {
+                            let fl = (get(b"compact"), get(b"outline"));
+                            if !(fl.0.is_empty() && fl.1.is_empty()) { fld_layout = Some(fl); }
+                        }
                         cur_field_item_order = Vec::new();
                         if is_empty_event {
                             // 自闭合 <pivotField .../>：不会有 End 事件，立即补做
@@ -584,6 +666,10 @@ pub fn parse_pivot_table(xml: &str, field_names: &[String], cache_fields: &[Vec<
         data_on_rows,
         ..Default::default()
     };
+    if let Some(m) = layout_from_attrs(fld_layout.clone(), &root_layout) {
+        if matches!(m, roe_model::calc::PivotLayoutMode::Compact) { meta.data_col_start = 1; }
+        meta.layout_mode = m;
+    }
     meta.compute_spans();
     Some(meta)
 }
@@ -721,5 +807,30 @@ mod pivot_info_tests {
         let (n, st) = parse_pivot_table_info(xml);
         assert_eq!(n, None);
         assert_eq!(st, None);
+    }
+}
+
+#[cfg(test)]
+mod subtotal_top_tests {
+    use super::parse_pivot_subtotals_bottom;
+
+    #[test]
+    fn subtotal_top_zero_means_bottom() {
+        let xml = r#"<pivotTableDefinition><pivotFields count="2"><pivotField axis="axisRow" subtotalTop="0"/><pivotField dataField="1"/></pivotFields></pivotTableDefinition>"#;
+        assert!(parse_pivot_subtotals_bottom(xml));
+    }
+
+    #[test]
+    fn subtotal_top_default_means_top() {
+        let xml = r#"<pivotTableDefinition><pivotFields count="1"><pivotField axis="axisRow"/></pivotFields></pivotTableDefinition>"#;
+        assert!(!parse_pivot_subtotals_bottom(xml));
+        let xml1 = r#"<pivotTableDefinition><pivotFields count="1"><pivotField axis="axisRow" subtotalTop="1"/></pivotFields></pivotTableDefinition>"#;
+        assert!(!parse_pivot_subtotals_bottom(xml1));
+    }
+
+    #[test]
+    fn subtotal_top_ignores_non_axis_field() {
+        let xml = r#"<pivotTableDefinition><pivotFields count="2"><pivotField dataField="1" subtotalTop="0"/><pivotField axis="axisRow"/></pivotFields></pivotTableDefinition>"#;
+        assert!(!parse_pivot_subtotals_bottom(xml));
     }
 }

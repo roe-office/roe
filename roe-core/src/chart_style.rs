@@ -2,20 +2,21 @@
 //! 先把整个 JSON 解析成补丁,全部合法才写入,任一字段非法则一个字段都不改。
 
 use roe_model::common::Color;
-use roe_model::impress::{ChartGrouping, ChartKind, ChartModel};
+use roe_model::impress::{ChartGrouping, ChartKind, ChartModel, LegendPos};
 use roe_model::stat_chart::StatChartModel;
 use serde_json::{Map, Value};
 
 pub const STYLE_KEYS: &[&str] = &[
     "kind", "title", "show_legend", "show_grid", "x_axis_label", "y_axis_label",
     "border_color", "border_width", "grouping", "show_val",
-    "gap_width_pct", "overlap_pct", "hole_size_pct",
+    "gap_width_pct", "overlap_pct", "hole_size_pct", "legend_pos",
 ];
-pub const STAT_STYLE_KEYS: &[&str] = &["title", "show_legend", "show_grid"];
+pub const STAT_STYLE_KEYS: &[&str] = &["title", "show_legend", "show_grid", "legend_pos"];
 pub const KINDS: &[&str] = &[
     "Bar", "HorizontalBar", "Line", "Pie", "Scatter", "Radar", "Area", "Doughnut",
 ];
 pub const GROUPINGS: &[&str] = &["Standard", "Stacked", "PercentStacked"];
+pub const LEGEND_POSS: &[&str] = &["Top", "Bottom", "Left", "Right"];
 
 fn parse_hex(s: &str) -> Option<Color> {
     let h = s.strip_prefix('#').unwrap_or(s);
@@ -131,6 +132,20 @@ pub fn apply_chart_style(m: &mut ChartModel, v: &Value, reject_unknown: bool) ->
     let gap = get_num_opt(obj, "gap_width_pct")?;
     let overlap = get_num_opt(obj, "overlap_pct")?;
     let hole = get_num_opt(obj, "hole_size_pct")?;
+    // legend_pos: 缺省=不改;null=清除(未指定);字符串=设置
+    let legend_pos = match obj.get("legend_pos") {
+        None => None,
+        Some(Value::Null) => Some(None),
+        Some(Value::String(s)) => Some(Some(match s.as_str() {
+            "Top" => LegendPos::Top,
+            "Bottom" => LegendPos::Bottom,
+            "Left" => LegendPos::Left,
+            "Right" => LegendPos::Right,
+            other => return Err(format!(
+                "legend_pos={:?} 不合法,合法值(区分大小写): {}", other, LEGEND_POSS.join(", "))),
+        })),
+        Some(o) => return Err(format!("legend_pos 必须是字符串或 null,收到 {o}")),
+    };
 
     // 全部校验通过,开始写入
     if let Some(k) = kind { m.kind = k; }
@@ -146,6 +161,7 @@ pub fn apply_chart_style(m: &mut ChartModel, v: &Value, reject_unknown: bool) ->
     if let Some(x) = gap { m.gap_width_pct = x; }
     if let Some(x) = overlap { m.overlap_pct = x; }
     if let Some(x) = hole { m.hole_size_pct = x; }
+    if let Some(x) = legend_pos { m.legend_pos = x; }
     Ok(())
 }
 
@@ -164,12 +180,24 @@ pub fn apply_stat_chart_style(m: &mut StatChartModel, v: &Value, reject_unknown:
     let title = get_title(obj)?;
     let show_legend = get_bool(obj, "show_legend")?;
     let show_grid = get_bool(obj, "show_grid")?;
+    // legend_pos: 缺省=不改;null=清除(存盘时默认 t);字符串 Top/Bottom/Left/Right 存为 t/b/l/r
+    let legend_pos = match obj.get("legend_pos") {
+        None => None,
+        Some(Value::Null) => Some(None),
+        Some(Value::String(s)) => Some(Some(match s.as_str() {
+            "Top" => "t", "Bottom" => "b", "Left" => "l", "Right" => "r",
+            other => return Err(format!(
+                "legend_pos={:?} 不合法,合法值(区分大小写): {}", other, LEGEND_POSS.join(", "))),
+        }.to_string())),
+        Some(o) => return Err(format!("legend_pos 必须是字符串或 null,收到 {o}")),
+    };
     if let Some(t) = title {
         m.title_present = t.is_some();
         m.title = t;
     }
     if let Some(b) = show_legend { m.show_legend = b; }
     if let Some(b) = show_grid { m.show_grid = b; }
+    if let Some(x) = legend_pos { m.legend_pos = x; }
     Ok(())
 }
 
@@ -186,7 +214,7 @@ mod tests {
             x_axis_label: String::new(), y_axis_label: String::new(),
             border_color: Color { r: 0xcc, g: 0xcc, b: 0xcc, a: 255 }, border_width: 1.0,
             gap_width_pct: None, overlap_pct: None, grouping: ChartGrouping::Standard,
-            hole_size_pct: None, data_labels: DataLabels::default(), slice_border_color: None,
+            hole_size_pct: None, data_labels: DataLabels::default(), slice_border_color: None, legend_pos: None,
         }
     }
     fn j(s: &str) -> Value { serde_json::from_str(s).unwrap() }
@@ -222,6 +250,45 @@ mod tests {
         let e = apply_chart_style(&mut m, &j(r#"{"title":"X","show_legend":false,"kind":"Nope"}"#), true).unwrap_err();
         assert!(e.contains("Nope") && e.contains("HorizontalBar"), "got: {e}");
         assert!(m.title.is_none() && m.show_legend, "任一字段非法,整体不生效");
+    }
+
+    #[test]
+    fn legend_pos_set_clear_and_invalid() {
+        let mut m = model();
+        apply_chart_style(&mut m, &j(r#"{"legend_pos":"Right"}"#), true).unwrap();
+        assert_eq!(m.legend_pos, Some(LegendPos::Right));
+        apply_chart_style(&mut m, &j(r#"{"legend_pos":null}"#), true).unwrap();
+        assert_eq!(m.legend_pos, None);
+        let e = apply_chart_style(&mut m, &j(r#"{"legend_pos":"right"}"#), true).unwrap_err();
+        assert!(e.contains("Bottom"), "got: {e}");
+        assert!(apply_chart_style(&mut m, &j(r#"{"legend_pos":5}"#), true).is_err());
+    }
+
+    fn stat_model() -> StatChartModel {
+        use roe_model::stat_chart::StatChartKind;
+        StatChartModel {
+            kind: StatChartKind::Waterfall, title_present: false, title: None,
+            show_legend: true, legend_pos: None, show_grid: true, gap_width: None,
+            data: vec![], series: vec![],
+        }
+    }
+
+    #[test]
+    fn stat_legend_pos_set_clear_invalid() {
+        let mut m = stat_model();
+        apply_stat_chart_style(&mut m, &j(r#"{"legend_pos":"Right"}"#), true).unwrap();
+        assert_eq!(m.legend_pos.as_deref(), Some("r"));
+        apply_stat_chart_style(&mut m, &j(r#"{"legend_pos":"Bottom","show_grid":false}"#), true).unwrap();
+        assert_eq!(m.legend_pos.as_deref(), Some("b"));
+        assert!(!m.show_grid);
+        apply_stat_chart_style(&mut m, &j(r#"{"legend_pos":null}"#), true).unwrap();
+        assert!(m.legend_pos.is_none());
+        m.legend_pos = Some("l".into());
+        let e = apply_stat_chart_style(&mut m, &j(r#"{"legend_pos":"right","show_grid":true}"#), true).unwrap_err();
+        assert!(e.contains("Bottom"), "got: {e}");
+        assert_eq!(m.legend_pos.as_deref(), Some("l"));
+        assert!(!m.show_grid, "非法时整体不生效");
+        assert!(apply_stat_chart_style(&mut m, &j(r#"{"kind":"x"}"#), true).is_err());
     }
 
     #[test]

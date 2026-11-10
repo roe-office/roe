@@ -19,7 +19,8 @@ use serde_json::Value as JsonValue;
 use roe_api::document::{
     close_document_impl, new_document_impl, open_document_bytes_impl, save_document_ooxml_impl,
 };
-use roe_api::script::{execute_script_impl, readonly_query_script_impl};
+use roe_api::script::readonly_query_script_impl;
+use roe_api::script_export::execute_script_with_exports;
 
 use crate::executor::{ExecuteOutcome, ScriptExecError, ScriptExecutor};
 use crate::workspace::WorkspaceContext;
@@ -85,6 +86,8 @@ impl DocKind {
 /// 一个无头文档的摘要(不暴露 handle)。
 #[derive(Debug, Clone, Serialize)]
 pub struct DocSummary {
+    /// 稳定 id("d1"、"d2"…):进程内单调递增,关闭后不复用。
+    pub id: String,
     pub kind: DocKind,
     pub name: String,
     pub current: bool,
@@ -104,14 +107,16 @@ type Reply<T, E = String> = oneshot::Sender<Result<T, E>>;
 enum Cmd {
     New { kind: DocKind, name: String, reply: Reply<DocSummary> },
     Open { bytes: Vec<u8>, kind: DocKind, hint: i32, name: String, reply: Reply<DocSummary> },
-    Save { reply: Reply<SavedBytes> },
-    CloseCurrent { reply: Reply<DocSummary> },
+    Save { doc: Option<String>, reply: Reply<SavedBytes> },
+    Close { doc: Option<String>, reply: Reply<DocSummary> },
     List { reply: Reply<Vec<DocSummary>> },
-    Execute { script: String, reply: Reply<ExecuteOutcome, ScriptExecError> },
-    Query { script: String, reply: Reply<JsonValue, ScriptExecError> },
+    Execute { doc: Option<String>, script: String, reply: Reply<ExecuteOutcome, ScriptExecError> },
+    Query { doc: Option<String>, script: String, reply: Reply<JsonValue, ScriptExecError> },
 }
 
 struct Doc {
+    /// 稳定 id(进程内单调递增,关闭后不复用),对外写成 "d<数字>"。
+    id: u64,
     handle: u64,
     kind: DocKind,
     name: String,
@@ -120,12 +125,44 @@ struct Doc {
 struct State {
     docs: Vec<Doc>,
     workspace: Arc<WorkspaceContext>,
+    next_id: u64,
+}
+
+fn doc_id_str(n: u64) -> String {
+    format!("d{n}")
 }
 
 impl State {
     fn summary_of(&self, idx: usize) -> DocSummary {
         let d = &self.docs[idx];
-        DocSummary { kind: d.kind, name: d.name.clone(), current: idx + 1 == self.docs.len() }
+        DocSummary { id: doc_id_str(d.id), kind: d.kind, name: d.name.clone(), current: idx + 1 == self.docs.len() }
+    }
+
+    fn alloc_id(&mut self) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        id
+    }
+}
+
+/// 定位目标文档:None = 当前文档(栈顶);Some(id) = 指定 id,不改变栈。
+/// Err(None) 表示一份文档都没有(沿用旧语义);Err(Some(msg)) 表示 id 不存在。
+fn locate(st: &State, doc: &Option<String>) -> Result<usize, Option<String>> {
+    match doc {
+        None => {
+            if st.docs.is_empty() {
+                Err(None)
+            } else {
+                Ok(st.docs.len() - 1)
+            }
+        }
+        Some(id) => {
+            let id = id.trim();
+            st.docs.iter().position(|d| doc_id_str(d.id) == id).ok_or_else(|| {
+                let ids: Vec<String> = st.docs.iter().map(|d| doc_id_str(d.id)).collect();
+                Some(format!("找不到 id 为 {id:?} 的文档;当前打开的文档 id: [{}]", ids.join(", ")))
+            })
+        }
     }
 }
 
@@ -136,7 +173,8 @@ fn run(st: &mut State, cmd: Cmd) {
             let r = if handle == 0 {
                 Err("创建文档失败".to_string())
             } else {
-                st.docs.push(Doc { handle, kind, name });
+                let id = st.alloc_id();
+                st.docs.push(Doc { id, handle, kind, name });
                 Ok(st.summary_of(st.docs.len() - 1))
             };
             let _ = reply.send(r);
@@ -146,25 +184,32 @@ fn run(st: &mut State, cmd: Cmd) {
             let r = if handle == 0 {
                 Err(format!("无法打开 {name}:文件损坏或格式不受支持"))
             } else {
-                st.docs.push(Doc { handle, kind, name });
+                let id = st.alloc_id();
+                st.docs.push(Doc { id, handle, kind, name });
                 Ok(st.summary_of(st.docs.len() - 1))
             };
             let _ = reply.send(r);
         }
-        Cmd::Save { reply } => {
-            let r = match st.docs.last() {
-                None => Err("没有打开的文档".to_string()),
-                Some(d) => save_document_ooxml_impl(d.handle, d.kind.ooxml_hint())
-                    .map(|bytes| SavedBytes { bytes, kind: d.kind, name: d.name.clone() }),
+        Cmd::Save { doc, reply } => {
+            let r = match locate(st, &doc) {
+                Err(None) => Err("没有打开的文档".to_string()),
+                Err(Some(msg)) => Err(msg),
+                Ok(i) => {
+                    let d = &st.docs[i];
+                    save_document_ooxml_impl(d.handle, d.kind.ooxml_hint())
+                        .map(|bytes| SavedBytes { bytes, kind: d.kind, name: d.name.clone() })
+                }
             };
             let _ = reply.send(r);
         }
-        Cmd::CloseCurrent { reply } => {
-            let r = match st.docs.pop() {
-                None => Err("没有打开的文档".to_string()),
-                Some(d) => {
+        Cmd::Close { doc, reply } => {
+            let r = match locate(st, &doc) {
+                Err(None) => Err("没有打开的文档".to_string()),
+                Err(Some(msg)) => Err(msg),
+                Ok(i) => {
+                    let d = st.docs.remove(i);
                     close_document_impl(d.handle);
-                    Ok(DocSummary { kind: d.kind, name: d.name, current: false })
+                    Ok(DocSummary { id: doc_id_str(d.id), kind: d.kind, name: d.name, current: false })
                 }
             };
             let _ = reply.send(r);
@@ -173,30 +218,37 @@ fn run(st: &mut State, cmd: Cmd) {
             let v = (0..st.docs.len()).map(|i| st.summary_of(i)).collect();
             let _ = reply.send(Ok(v));
         }
-        Cmd::Execute { script, reply } => {
-            let r = match st.docs.last() {
-                None => Err(ScriptExecError::NoActiveDocument),
-                Some(d) => {
+        Cmd::Execute { doc, script, reply } => {
+            let r = match locate(st, &doc) {
+                Err(None) => Err(ScriptExecError::NoActiveDocument),
+                Err(Some(msg)) => Err(ScriptExecError::Script(msg)),
+                Ok(i) => {
+                    let d = &st.docs[i];
                     let media: &dyn roe_script::media_context::MediaAssetSource = &*st.workspace;
-                    match execute_script_impl(d.handle, &script, Some(media)) {
+                    match execute_script_with_exports(d.handle, &script, Some(media)) {
                         None => Err(ScriptExecError::InvalidHandle(d.handle)),
                         Some(Err(e)) => Err(ScriptExecError::Script(e)),
-                        Some(Ok((dirty_pages, dirty_regions, script_result))) => {
-                            Ok(ExecuteOutcome { dirty_pages, dirty_regions, script_result })
+                        Some(Ok((dirty_pages, dirty_regions, script_result, rep))) => {
+                            let (exports, export_errors) = crate::executor::convert_report(rep);
+                            Ok(ExecuteOutcome { dirty_pages, dirty_regions, script_result, exports, export_errors })
                         }
                     }
                 }
             };
             let _ = reply.send(r);
         }
-        Cmd::Query { script, reply } => {
-            let r = match st.docs.last() {
-                None => Err(ScriptExecError::NoActiveDocument),
-                Some(d) => match readonly_query_script_impl(d.handle, &script) {
-                    None => Err(ScriptExecError::InvalidHandle(d.handle)),
-                    Some(Err(e)) => Err(ScriptExecError::Script(e)),
-                    Some(Ok(v)) => Ok(v),
-                },
+        Cmd::Query { doc, script, reply } => {
+            let r = match locate(st, &doc) {
+                Err(None) => Err(ScriptExecError::NoActiveDocument),
+                Err(Some(msg)) => Err(ScriptExecError::Script(msg)),
+                Ok(i) => {
+                    let d = &st.docs[i];
+                    match readonly_query_script_impl(d.handle, &script) {
+                        None => Err(ScriptExecError::InvalidHandle(d.handle)),
+                        Some(Err(e)) => Err(ScriptExecError::Script(e)),
+                        Some(Ok(v)) => Ok(v),
+                    }
+                }
             };
             let _ = reply.send(r);
         }
@@ -216,7 +268,7 @@ impl DocWorker {
         std::thread::Builder::new()
             .name("roe-doc-worker".into())
             .spawn(move || {
-                let mut st = State { docs: Vec::new(), workspace };
+                let mut st = State { docs: Vec::new(), workspace, next_id: 1 };
                 while let Ok(cmd) = rx.recv() {
                     // panic 时 cmd 里的 reply 被丢弃,调用方收到 GONE,线程继续服务。
                     let _ = catch_unwind(AssertUnwindSafe(|| run(&mut st, cmd)));
@@ -270,12 +322,40 @@ impl DocWorker {
 
     /// 把当前文档序列化为 OOXML 字节(不落盘)。
     pub async fn save_document(&self) -> Result<SavedBytes, String> {
-        self.ask(|reply| Cmd::Save { reply }, || GONE.to_string()).await
+        self.save_document_of(None).await
     }
 
     /// 关闭当前文档,回到上一个(若有)。
     pub async fn close_current(&self) -> Result<DocSummary, String> {
-        self.ask(|reply| Cmd::CloseCurrent { reply }, || GONE.to_string()).await
+        self.close_document_of(None).await
+    }
+
+    /// 保存指定 id 的文档(None = 当前文档)。不改变当前文档。
+    pub async fn save_document_of(&self, doc: Option<String>) -> Result<SavedBytes, String> {
+        self.ask(move |reply| Cmd::Save { doc, reply }, || GONE.to_string()).await
+    }
+
+    /// 关闭指定 id 的文档(None = 当前文档)。关闭非栈顶文档时,当前文档不变。
+    pub async fn close_document_of(&self, doc: Option<String>) -> Result<DocSummary, String> {
+        self.ask(move |reply| Cmd::Close { doc, reply }, || GONE.to_string()).await
+    }
+
+    /// 在指定 id 的文档上执行写脚本(None = 当前文档)。不改变当前文档。
+    pub fn execute_on(
+        &self,
+        doc: Option<String>,
+        script: String,
+    ) -> BoxFuture<'static, Result<ExecuteOutcome, ScriptExecError>> {
+        self.ask(move |reply| Cmd::Execute { doc, script, reply }, || ScriptExecError::Script(GONE.to_string()))
+    }
+
+    /// 在指定 id 的文档上执行只读查询(None = 当前文档)。
+    pub fn query_on(
+        &self,
+        doc: Option<String>,
+        script: String,
+    ) -> BoxFuture<'static, Result<JsonValue, ScriptExecError>> {
+        self.ask(move |reply| Cmd::Query { doc, script, reply }, || ScriptExecError::Script(GONE.to_string()))
     }
 
     pub async fn list_documents(&self) -> Result<Vec<DocSummary>, String> {
@@ -285,11 +365,11 @@ impl DocWorker {
 
 impl ScriptExecutor for DocWorker {
     fn execute(&self, script: String) -> BoxFuture<'static, Result<ExecuteOutcome, ScriptExecError>> {
-        self.ask(move |reply| Cmd::Execute { script, reply }, || ScriptExecError::Script(GONE.to_string()))
+        self.execute_on(None, script)
     }
 
     fn query(&self, script: String) -> BoxFuture<'static, Result<JsonValue, ScriptExecError>> {
-        self.ask(move |reply| Cmd::Query { script, reply }, || ScriptExecError::Script(GONE.to_string()))
+        self.query_on(None, script)
     }
 }
 
@@ -393,5 +473,87 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(w.query("get_cell(0, 0, 0)".into()).await.unwrap().to_string().contains("7"));
+    }
+}
+
+#[cfg(test)]
+mod doc_id_tests {
+    use super::*;
+
+    fn worker() -> DocWorker {
+        let ws = Arc::new(
+            WorkspaceContext::open_or_create(&tempfile::tempdir().expect("temp dir").keep()).expect("ws"),
+        );
+        DocWorker::spawn(ws).expect("spawn")
+    }
+
+    fn id(s: &str) -> Option<String> {
+        Some(s.to_string())
+    }
+
+    #[tokio::test]
+    async fn ids_are_stable_unique_and_never_reused() {
+        let w = worker();
+        let a = w.new_document(DocKind::Calc, "a").await.unwrap();
+        let b = w.new_document(DocKind::Writer, "b").await.unwrap();
+        assert_eq!((a.id.as_str(), b.id.as_str()), ("d1", "d2"));
+        w.close_document_of(id("d2")).await.unwrap();
+        let c = w.new_document(DocKind::Calc, "c").await.unwrap();
+        assert_eq!(c.id, "d3", "关闭后 id 不复用");
+        let ids: Vec<String> = w.list_documents().await.unwrap().into_iter().map(|d| d.id).collect();
+        assert_eq!(ids, vec!["d1", "d3"]);
+    }
+
+    #[tokio::test]
+    async fn execute_and_query_target_the_named_document_only() {
+        let w = worker();
+        w.new_document(DocKind::Calc, "first").await.unwrap();
+        w.new_document(DocKind::Calc, "second").await.unwrap();
+        w.execute_on(id("d1"), "set_cell(0, 0, 0, \"alpha\")".into()).await.unwrap();
+        w.execute_on(None, "set_cell(0, 0, 0, \"beta\")".into()).await.unwrap();
+        let q1 = w.query_on(id("d1"), "get_cell(0, 0, 0)".into()).await.unwrap().to_string();
+        let q2 = w.query_on(None, "get_cell(0, 0, 0)".into()).await.unwrap().to_string();
+        assert!(q1.contains("alpha") && !q1.contains("beta"), "{q1}");
+        assert!(q2.contains("beta") && !q2.contains("alpha"), "{q2}");
+        let docs = w.list_documents().await.unwrap();
+        assert_eq!(docs.iter().find(|d| d.current).unwrap().id, "d2", "doc_id 不改变当前文档");
+    }
+
+    #[tokio::test]
+    async fn unknown_id_is_an_error_and_empty_stack_keeps_old_semantics() {
+        let w = worker();
+        assert!(matches!(w.execute_on(None, "1".into()).await, Err(ScriptExecError::NoActiveDocument)));
+        assert!(matches!(w.query_on(None, "1".into()).await, Err(ScriptExecError::NoActiveDocument)));
+        w.new_document(DocKind::Calc, "a").await.unwrap();
+        assert!(matches!(w.execute_on(id("d9"), "1".into()).await, Err(ScriptExecError::Script(_))));
+        assert!(matches!(w.query_on(id("d9"), "1".into()).await, Err(ScriptExecError::Script(_))));
+        assert!(w.save_document_of(id("d9")).await.is_err());
+        assert!(w.close_document_of(id("d9")).await.is_err());
+        assert_eq!(w.list_documents().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn save_by_id_saves_the_named_document() {
+        let w = worker();
+        w.new_document(DocKind::Calc, "first").await.unwrap();
+        w.new_document(DocKind::Writer, "second").await.unwrap();
+        let a = w.save_document_of(id("d1")).await.unwrap();
+        assert_eq!((a.name.as_str(), a.kind), ("first", DocKind::Calc));
+        let b = w.save_document().await.unwrap();
+        assert_eq!((b.name.as_str(), b.kind), ("second", DocKind::Writer));
+    }
+
+    #[tokio::test]
+    async fn close_by_id_removes_only_that_document_and_keeps_active() {
+        let w = worker();
+        w.new_document(DocKind::Calc, "first").await.unwrap();
+        w.new_document(DocKind::Calc, "second").await.unwrap();
+        let closed = w.close_document_of(id("d1")).await.unwrap();
+        assert_eq!(closed.name, "first");
+        let docs = w.list_documents().await.unwrap();
+        assert_eq!(docs.len(), 1);
+        assert_eq!((docs[0].id.as_str(), docs[0].current), ("d2", true));
+        let top = w.close_document_of(None).await.unwrap();
+        assert_eq!(top.name, "second");
     }
 }

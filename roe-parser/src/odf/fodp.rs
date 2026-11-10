@@ -954,7 +954,7 @@ pub fn parse_chart_from_xml(obj_node: &XNode) -> Option<roe_model::impress::Char
     }
 
     let series: Vec<ChartSeries> = series_names.into_iter().zip(series_data.into_iter())
-        .map(|(name, data)| ChartSeries { name, data, color: None, as_line: false, trendline: false })
+        .map(|(name, data)| ChartSeries { name, data, color: None, as_line: false, trendline: false, x_values: None, sizes: None })
         .collect();
 
     Some(ChartModel {
@@ -969,7 +969,7 @@ pub fn parse_chart_from_xml(obj_node: &XNode) -> Option<roe_model::impress::Char
         grouping: roe_model::impress::ChartGrouping::Standard,
         hole_size_pct: None,
         data_labels: Default::default(),
-        slice_border_color: None,
+        slice_border_color: None, legend_pos: None,
     })
 }
 

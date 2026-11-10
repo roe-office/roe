@@ -188,6 +188,40 @@ fn collect_lf() -> Result<DataFrame, String> {
 // 注册所有 df 函数到 Rhai Engine
 // ════════════════════════════════════════════════════════════
 
+/// sheet 名 -> 合法 SQL 表名:非字母数字下划线换成 `_`,数字开头加 `_` 前缀,
+/// 空名用 sheet,重名加 _2/_3 序号。
+fn unique_table_name(sheet_name: &str, used: &mut std::collections::BTreeSet<String>) -> String {
+    let mut base: String = sheet_name
+        .trim()
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '_' { c } else { '_' })
+        .collect();
+    if base.is_empty() {
+        base = "sheet".to_string();
+    }
+    if base.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+        base.insert(0, '_');
+    }
+    let mut name = base.clone();
+    let mut n = 2;
+    while used.contains(&name.to_lowercase()) {
+        name = format!("{base}_{n}");
+        n += 1;
+    }
+    used.insert(name.to_lowercase());
+    name
+}
+
+/// SQL 文本(已小写)里是否以完整标识符形式出现了表名(已小写)。
+fn sql_mentions_table(sql_lower: &str, table_lower: &str) -> bool {
+    let is_id = |c: char| c.is_alphanumeric() || c == '_';
+    sql_lower.match_indices(table_lower).any(|(i, _)| {
+        let before_ok = sql_lower[..i].chars().next_back().map(|c| !is_id(c)).unwrap_or(true);
+        let after_ok = sql_lower[i + table_lower.len()..].chars().next().map(|c| !is_id(c)).unwrap_or(true);
+        before_ok && after_ok
+    })
+}
+
 /// 只读环境:先全量注册,再用同名桩覆盖「碰文件系统 / 写数据集容器 / 写 workbook」的函数。
 /// (只读引擎的调用方含 AI agent,不得让脚本读本机任意文件或改动数据集。)
 pub fn register_readonly(engine: &mut Engine) {
@@ -224,6 +258,59 @@ pub fn register(engine: &mut Engine) {
             Ok(inner) => inner.unwrap_or_else(|e| e),
             Err(e) => e,
         }
+    });
+
+    // df_sheet_tables() -> JSON [{"sheet","table"}]  各 sheet 对应的 SQL 表名(只算名字,不转换数据)
+    engine.register_fn("df_sheet_tables", || -> String {
+        match with_wb(|wb| {
+            let mut used: std::collections::BTreeSet<String> = Default::default();
+            let v: Vec<serde_json::Value> = wb.sheets.iter().map(|sh| {
+                let table = unique_table_name(&sh.name, &mut used);
+                serde_json::json!({ "sheet": sh.name, "table": table })
+            }).collect();
+            serde_json::Value::Array(v).to_string()
+        }) {
+            Ok(s) => s,
+            Err(e) => e,
+        }
+    });
+
+    // df_register_sheets(sql) -> JSON [{"sheet","table","cols":[..]}] | "err:..."
+    // 把 SQL 里引用到的 sheet(按转换后的表名匹配)转成数据集注册进会话仓库,同名覆盖。
+    // 之后用 df_sql_ds / df_sql_save 查询,可多 sheet JOIN。只读引擎可用(不改工作簿、不碰文件)。
+    engine.register_fn("df_register_sheets", |sql: String| -> String {
+        let sql_l = sql.to_lowercase();
+        let converted = match with_wb(|wb| -> Result<Vec<(String, String, DataFrame)>, String> {
+            let mut used: std::collections::BTreeSet<String> = Default::default();
+            let mut out = Vec::new();
+            for sh in wb.sheets.iter() {
+                let table = unique_table_name(&sh.name, &mut used);
+                if !sql_mentions_table(&sql_l, &table.to_lowercase()) {
+                    continue;
+                }
+                let df = roe_polars_bridge::sheet_to_dataframe_typed(sh)
+                    .map_err(|e| format!("err:sheet「{}」转换失败: {e}", sh.name))?;
+                if df.width() == 0 {
+                    continue;
+                }
+                out.push((sh.name.clone(), table, df));
+            }
+            Ok(out)
+        }) {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => return e,
+            Err(e) => return e,
+        };
+        let mut info = Vec::new();
+        for (sheet, table, df) in converted {
+            let cols: Vec<String> = df.get_column_names().iter().map(|s| s.to_string()).collect();
+            let t = table.clone();
+            if let Err(e) = with_ds(|d| { d.insert(t, Dataset::Mem(df)); }) {
+                return e;
+            }
+            info.push(serde_json::json!({ "sheet": sheet, "table": table, "cols": cols }));
+        }
+        serde_json::Value::Array(info).to_string()
     });
 
     // df_load_file(path) -> "ok" | "err:..."
@@ -1114,6 +1201,76 @@ mod tests {
             sparkline_groups: vec![],
         });
         wb
+    }
+
+    #[test]
+    fn test_unique_table_name_rules() {
+        let mut used = std::collections::BTreeSet::new();
+        assert_eq!(unique_table_name("Sheet1", &mut used), "Sheet1");
+        assert_eq!(unique_table_name("sheet1", &mut used), "sheet1_2"); // 大小写不敏感重名
+        assert_eq!(unique_table_name("2024 销售", &mut used), "_2024_销售");
+        assert_eq!(unique_table_name("", &mut used), "sheet");
+        assert_eq!(unique_table_name("a-b", &mut used), "a_b");
+    }
+
+    #[test]
+    fn test_sql_mentions_table_word_boundary() {
+        assert!(sql_mentions_table("select * from data", "data"));
+        assert!(sql_mentions_table("select * from data where x=1", "data"));
+        assert!(!sql_mentions_table("select * from database_1", "data"));
+        assert!(!sql_mentions_table("select metadata from t", "data"));
+        assert!(sql_mentions_table("select * from 销售 join 客户", "销售"));
+    }
+
+    #[test]
+    fn test_register_sheets_join() {
+        let mut wb = make_wb_two_sheets();
+        let mut ds = DatasetStore::new();
+        let e = make_engine();
+        bind_datasets(&mut ds);
+        with_workbook_df(&mut wb, || {
+            let sql = "SELECT d.Region, d.Sales, l.Manager FROM data d JOIN lookup l ON d.Region = l.RegionName";
+            let r: String = e.eval(&format!("df_register_sheets(\"{}\")", sql)).unwrap();
+            let v: serde_json::Value = serde_json::from_str(&r).unwrap_or_else(|_| panic!("非 JSON: {r}"));
+            assert_eq!(v.as_array().unwrap().len(), 2, "应注册 data 与 lookup: {r}");
+            let pv: String = e.eval(&format!("df_sql_ds(\"{}\")", sql)).unwrap();
+            let pj: serde_json::Value = serde_json::from_str(&pv).unwrap_or_else(|_| panic!("SQL 失败: {pv}"));
+            assert_eq!(pj["total_rows"], 3, "JOIN 应得 3 行: {pj}");
+        });
+        unbind_datasets();
+    }
+
+    #[test]
+    fn test_register_sheets_skips_unreferenced() {
+        let mut wb = make_wb_two_sheets();
+        let mut ds = DatasetStore::new();
+        let e = make_engine();
+        bind_datasets(&mut ds);
+        with_workbook_df(&mut wb, || {
+            let r: String = e.eval(r#"df_register_sheets("SELECT * FROM data")"#).unwrap();
+            let v: serde_json::Value = serde_json::from_str(&r).unwrap();
+            assert_eq!(v.as_array().unwrap().len(), 1, "只应注册 data: {r}");
+        });
+        unbind_datasets();
+        assert!(ds.contains_key("data") && !ds.contains_key("lookup"));
+    }
+
+    #[test]
+    fn test_register_sheets_chinese_name() {
+        let mut wb = make_wb_two_sheets();
+        wb.sheets[0].name = "销售 数据".into();
+        let mut ds = DatasetStore::new();
+        let e = make_engine();
+        bind_datasets(&mut ds);
+        with_workbook_df(&mut wb, || {
+            let sql = "SELECT Region, Sales FROM 销售_数据 WHERE Sales > 100";
+            let r: String = e.eval(&format!("df_register_sheets(\"{}\")", sql)).unwrap();
+            assert!(r.contains("销售_数据"), "表名应转为 销售_数据: {r}");
+            let pv: String = e.eval(&format!("df_sql_ds(\"{}\")", sql)).unwrap();
+            let pj: serde_json::Value = serde_json::from_str(&pv).unwrap_or_else(|_| panic!("中文表名 SQL 失败: {pv}"));
+            assert_eq!(pj["total_rows"], 2, "Sales>100 应 2 行: {pj}");
+        });
+        unbind_datasets();
     }
 
     #[test]

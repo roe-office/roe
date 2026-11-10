@@ -17,7 +17,8 @@ use futures::future::BoxFuture;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
 
-use roe_api::script::{execute_script_impl, readonly_query_script_impl, DirtyRegion};
+use roe_api::script::{readonly_query_script_impl, DirtyRegion};
+use roe_api::script_export::{execute_script_with_exports, ExportReport};
 
 use crate::workspace::WorkspaceContext;
 
@@ -27,6 +28,31 @@ pub struct ExecuteOutcome {
     pub dirty_pages: Vec<usize>,
     pub dirty_regions: Vec<DirtyRegion>,
     pub script_result: JsonValue,
+    /// 脚本里 export_image 导出并已保存的图片(为空时不出现在序列化结果里)。
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub exports: Vec<ExportedImageInfo>,
+    /// 导出过程中的错误(文档修改已生效,只是图没导出来或没保存成功)。
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub export_errors: Vec<String>,
+}
+
+/// 一张已保存的导出图片。path 是 workspace 虚拟路径。
+#[derive(Debug, Clone, Serialize)]
+pub struct ExportedImageInfo {
+    pub path: String,
+    pub width: u32,
+    pub height: u32,
+    /// 仅 Calc:图里实际画出的行列数;truncated=true 表示比请求的少。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub calc_range: Option<roe_api::export_image::CalcRange>,
+}
+
+/// roe-api 的导出报告 -> 给 AI 看的纯数据。
+pub(crate) fn convert_report(rep: ExportReport) -> (Vec<ExportedImageInfo>, Vec<String>) {
+    let files = rep.files.into_iter()
+        .map(|f| ExportedImageInfo { path: f.path, width: f.width, height: f.height, calc_range: f.calc_range })
+        .collect();
+    (files, rep.errors)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -65,14 +91,13 @@ impl ScriptExecutor for LocalExecutor {
             Err(ScriptExecError::NoActiveDocument)
         } else {
             let media: &dyn roe_script::media_context::MediaAssetSource = &*self.workspace;
-            match execute_script_impl(self.handle, &script, Some(media)) {
+            match execute_script_with_exports(self.handle, &script, Some(media)) {
                 None => Err(ScriptExecError::InvalidHandle(self.handle)),
                 Some(Err(e)) => Err(ScriptExecError::Script(e)),
-                Some(Ok((dirty_pages, dirty_regions, script_result))) => Ok(ExecuteOutcome {
-                    dirty_pages,
-                    dirty_regions,
-                    script_result,
-                }),
+                Some(Ok((dirty_pages, dirty_regions, script_result, rep))) => {
+                    let (exports, export_errors) = convert_report(rep);
+                    Ok(ExecuteOutcome { dirty_pages, dirty_regions, script_result, exports, export_errors })
+                }
             }
         };
         Box::pin(std::future::ready(r))
@@ -163,5 +188,45 @@ mod tests {
             ex.execute("this is not rhai (".into()).await,
             Err(ScriptExecError::Script(_))
         ));
+    }
+}
+
+#[cfg(test)]
+mod export_outcome_tests {
+    use super::*;
+    use roe_api::script_export::ExportedFile;
+
+    #[test]
+    fn convert_report_and_serialize() {
+        let rep = ExportReport {
+            files: vec![ExportedFile { path: "/exports/a_page1_1108_v1.png".into(), width: 800, height: 600, calc_range: None }],
+            errors: vec!["boom".into()],
+            ..Default::default()
+        };
+        let (exports, export_errors) = convert_report(rep);
+        let out = ExecuteOutcome {
+            dirty_pages: vec![],
+            dirty_regions: vec![],
+            script_result: JsonValue::Null,
+            exports,
+            export_errors,
+        };
+        let v = serde_json::to_value(&out).unwrap();
+        assert_eq!(v["exports"][0]["path"], "/exports/a_page1_1108_v1.png");
+        assert_eq!(v["exports"][0]["width"], 800);
+        assert_eq!(v["export_errors"][0], "boom");
+    }
+
+    #[test]
+    fn empty_exports_are_omitted() {
+        let out = ExecuteOutcome {
+            dirty_pages: vec![],
+            dirty_regions: vec![],
+            script_result: JsonValue::Null,
+            exports: vec![],
+            export_errors: vec![],
+        };
+        let v = serde_json::to_value(&out).unwrap();
+        assert!(v.get("exports").is_none() && v.get("export_errors").is_none());
     }
 }

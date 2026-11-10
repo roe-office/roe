@@ -323,6 +323,63 @@ pub struct Run {
     /// （如页码），text 字段是 Word/解析时缓存的静态值，仅在渲染器无法计算
     /// 真实值时用作兜底显示；正常渲染应忽略 text，按 FieldKind 动态求值。
     #[serde(default)] pub field: Option<FieldKind>,
+    /// 修订标记（docx w:ins / w:del 包裹的 run）。None 表示普通文字。
+    /// 删除的文字（w:delText）仍以普通 text 存放，排版照常占宽度。
+    #[serde(default)] pub revision: Option<Revision>,
+}
+
+/// 修订种类（第一版只做插入与删除）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RevisionKind {
+    Insert,
+    Delete,
+}
+
+/// 一条修订的元数据，对应 w:ins / w:del 的 id、author、date 属性。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Revision {
+    pub kind: RevisionKind,
+    #[serde(default)] pub id: u32,
+    #[serde(default)] pub author: String,
+    /// 原始日期字符串，不解析
+    #[serde(default)] pub date: String,
+    /// 嵌套：Delete 之下原来的 Insert（先被某人插入、又被另一人删除）。
+    #[serde(default)] pub under: Option<Box<Revision>>,
+}
+
+/// 修订作者色（取自 LOK 默认作者色 AUTHOR1~9），按作者首次出现顺序 % 9 循环。
+pub const REVISION_AUTHOR_COLORS: [[u8; 3]; 9] = [
+    [0xC6, 0x92, 0x00], [0x06, 0x46, 0xA2], [0x57, 0x9D, 0x1C],
+    [0x69, 0x2B, 0x9D], [0xC5, 0x00, 0x0B], [0x00, 0x80, 0x80],
+    [0x8C, 0x84, 0x00], [0x35, 0x55, 0x6B], [0xD1, 0x76, 0x00],
+];
+
+impl WriterDocument {
+    /// 按正文顺序收集修订作者（去重，首次出现的先后即序号）。
+    /// 第一版只扫正文顶层段落，表格内的修订暂按序号 0 之外的实际作者仍可着色，
+    /// 但序号只由顶层段落决定。
+    pub fn revision_authors(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for el in &self.body {
+            if let BodyElement::Paragraph(p) = el {
+                for r in &p.runs {
+                    if let Some(rev) = &r.revision {
+                        if !out.contains(&rev.author) { out.push(rev.author.clone()); }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// 作者色；作者不在列表里（如只出现在表格）时按名字哈希取色。
+    pub fn revision_author_color(&self, authors: &[String], author: &str) -> [u8; 3] {
+        let idx = match authors.iter().position(|a| a == author) {
+            Some(i) => i,
+            None => author.bytes().fold(0usize, |h, b| h.wrapping_mul(31).wrapping_add(b as usize)),
+        };
+        REVISION_AUTHOR_COLORS[idx % 9]
+    }
 }
 
 /// WROOT-004: Run 携带的域（field）类型，目前只覆盖页码相关的两种。
@@ -592,6 +649,9 @@ pub struct ListInfo {
 pub struct ListStyle {
     pub name:   String,
     pub levels: Vec<ListLevelStyle>,
+    /// 各级编号/符号标签的颜色(导入自 numbering.xml 的 w:lvl/w:rPr/w:color), 缺省为空=用正文默认色
+    #[serde(default)]
+    pub label_colors: Vec<Option<[u8; 4]>>,
 }
 
 impl ListStyle {
@@ -626,6 +686,10 @@ pub struct NumberListLevel {
     pub start_value:     u32,
     /// text:display-levels，联合显示几级（如 "1.1.1" 为 3）
     pub display_levels:  u8,
+    /// 完整编号模板原文（如 "%1.%2."、"Section %1.%2"）。
+    /// 为 None 时走 prefix + 本级数字 + suffix；有值时按 %N 逐个展开。
+    #[serde(default)]
+    pub template:        Option<String>,
     /// 缩进相关（来自 style:list-level-properties / style:list-level-label-alignment）
     pub indent:          ListIndent,
 }
@@ -638,6 +702,7 @@ impl Default for NumberListLevel {
             suffix: String::from("."),
             start_value: 1,
             display_levels: 1,
+            template: None,
             indent: ListIndent::default(),
         }
     }
@@ -1076,5 +1141,19 @@ mod tests {
         let ids: Vec<u32> = threads[0].replies.iter().map(|c| c.id).collect();
         assert!(ids.contains(&2));
         assert!(ids.contains(&3));
+    }
+}
+
+#[cfg(test)]
+mod revision_author_tests {
+    use super::*;
+    #[test]
+    fn author_order_and_color() {
+        let mk = |a: &str| Run { text: "x".into(), revision: Some(Revision { kind: RevisionKind::Insert, id: 0, author: a.into(), date: String::new(), under: None }), ..Default::default() };
+        let doc = WriterDocument { body: vec![BodyElement::Paragraph(Paragraph { runs: vec![mk("Alice"), mk("Bob"), mk("Alice")], ..Default::default() })], ..Default::default() };
+        let au = doc.revision_authors();
+        assert_eq!(au, vec!["Alice".to_string(), "Bob".to_string()]);
+        assert_eq!(doc.revision_author_color(&au, "Alice"), REVISION_AUTHOR_COLORS[0]);
+        assert_eq!(doc.revision_author_color(&au, "Bob"), REVISION_AUTHOR_COLORS[1]);
     }
 }

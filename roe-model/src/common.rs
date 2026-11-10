@@ -275,6 +275,14 @@ pub enum FillStyle {
         /// 保留供未来扩展，不在解析层就丢弃信息。
         tile_align: String,
     },
+    /// v313: 图案填充，对应 OOXML `<a:pattFill prst="...">`。
+    /// preset 存 ECMA-376 预设名原文（pct5、dkDnDiag 等 48 种），
+    /// 点阵由渲染层按名字生成，解析/写出不丢信息。
+    Pattern {
+        preset: String,
+        fg: Color,
+        bg: Color,
+    },
     None,
 }
 
@@ -302,11 +310,21 @@ pub enum GradientKind {
     /// 形状几何中心（0.5, 0.5），不读取 `fillToRect` 算精确偏移中心
     /// ——LOK/OO 均确认这是更少见的自定义中心场景，第一期按最常见的
     /// "居中放射"简化处理，是已知简化非遗漏。
-    Radial,
+    Radial {
+        /// 中心 x，占形状宽度的比例 0.0-1.0，0.5 = 居中
+        cx: f32,
+        /// 中心 y，占形状高度的比例 0.0-1.0，0.5 = 居中
+        cy: f32,
+    },
     /// 矩形渐变，对应 `<a:path path="rect">`（`path="shape"` 两方
     /// 参照实现均标注未真正实现，归并到 Rect 处理）。中心点同上，
     /// 第一期固定几何中心。
-    Rect,
+    Rect {
+        /// 中心 x，占形状宽度的比例，0.5 = 居中
+        cx: f32,
+        /// 中心 y，占形状高度的比例，0.5 = 居中
+        cy: f32,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

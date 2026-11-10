@@ -236,6 +236,7 @@ struct RawShape {
     /// raw_to_shape 组装阶段会用这里的数据覆盖 fill（gradFill 和 solidFill/
     /// noFill 在 OOXML 里本就互斥，不会同时出现在同一个 spPr 里）。
     grad_raw: Option<(Vec<(f32, Color)>, RawGradKind, bool)>,
+    grad_center: Option<(f32, f32)>,
     stroke: Option<StrokeStyle>,
     /// PROOT-outerShdw: <a:effectLst><a:outerShdw blurRad=".." dist=".." dir="..">
     /// <a:srgbClr/a:schemeClr>+<a:alpha/></a:outerShdw></a:effectLst>。
@@ -326,6 +327,7 @@ impl Default for RawShape {
             adj_overrides: Vec::new(),
             fill: None,
             grad_raw: None,
+            grad_center: None,
             stroke: None,
             outer_shdw_raw: None,
             content: RawContent::Empty,
@@ -1257,6 +1259,19 @@ fn parse_slide_xml_shapes(
     let mut cur_gs_pos: f32 = 0.0;       // 当前 gs 的 pos，已归一化 0.0-1.0
     let mut cur_gradient_stops: Vec<(f32, Color)> = Vec::new();
     let mut cur_grad_kind_raw: Option<RawGradKind> = None;
+    // v315: 形状级 pattFill / 渐变中心点
+    let mut in_patt_sh = false;
+    let mut in_patt_fg_sh = false;
+    let mut in_patt_bg_sh = false;
+    let mut patt_sh_prst: Option<String> = None;
+    let mut patt_sh_fg: Option<Color> = None;
+    let mut patt_sh_bg: Option<Color> = None;
+    let mut cur_grad_center: Option<(f32, f32)> = None;
+    // v315: 渐变色标内 <a:schemeClr> 带 mods 子元素（Start 事件）
+    let mut in_gs_scheme_clr = false;
+    let mut cur_gs_scheme_slot: Option<String> = None;
+    let mut cur_gs_mods: Vec<(String, i32)> = Vec::new();
+    let mut cur_gs_alpha: Option<i32> = None;
     let mut cur_grad_rotate_with_shape: bool = true;
     #[allow(non_snake_case)]
     let mut in_txBody = false;  // <p:txBody>
@@ -1294,6 +1309,8 @@ fn parse_slide_xml_shapes(
     // 状态标记 + 收集颜色/alpha 的临时变量，</a:outerShdw>结束时统一写入
     // cur_shape.outer_shdw_raw（与 cur_ln_color 收集描边颜色是同款模式）。
     let mut in_outer_shdw = false;
+    let mut in_shape_fill_srgb = false; // v316: 形状纯色填充 srgbClr 带子元素（alpha）
+    let mut in_ln_srgb = false; // v316: 描边 srgbClr 带子元素（alpha）
     let mut cur_shdw_dist: i32 = 0;
     let mut cur_shdw_dir: i32 = 0;
     let mut cur_shdw_blur: i32 = 0;
@@ -1615,10 +1632,58 @@ fn parse_slide_xml_shapes(
                     b"gradFill" if in_spPr => {
                         in_grad_fill = true;
                         cur_gradient_stops.clear();
+                        cur_grad_center = None;
                         cur_grad_kind_raw = None;
                         cur_grad_rotate_with_shape = attr_str(e, b"rotWithShape")
                             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                             .unwrap_or(true);
+                    }
+                    b"pattFill" if in_spPr => {
+                        in_patt_sh = true;
+                        patt_sh_prst = attr_str(e, b"prst");
+                        patt_sh_fg = None;
+                        patt_sh_bg = None;
+                    }
+                    b"fgClr" if in_patt_sh => { in_patt_fg_sh = true; }
+                    b"bgClr" if in_patt_sh => { in_patt_bg_sh = true; }
+                    // v315: 带子元素（如 <a:alpha/>）的 srgbClr 是 Start 事件，
+                    // 原先只有 Empty 分支处理 srgbClr，带 alpha 的色标/图案色会整个丢失
+                    b"srgbClr" if in_gs || in_patt_fg_sh || in_patt_bg_sh => {
+                        if let Some(hex) = attr_str(e, b"val") {
+                            let c = parse_hex_color(&hex);
+                            if in_patt_fg_sh { patt_sh_fg = Some(c); }
+                            else if in_patt_bg_sh { patt_sh_bg = Some(c); }
+                            else { cur_gradient_stops.push((cur_gs_pos, c)); }
+                        }
+                    }
+                    // v316: 描边颜色（带 alpha 子元素时是 Start 事件）
+                    b"srgbClr" if in_ln => {
+                        if let Some(hex) = attr_str(e, b"val") {
+                            cur_ln_color = Some(parse_hex_color(&hex));
+                            in_ln_srgb = true;
+                        }
+                    }
+                    // v316: 带 <a:alpha/> 子元素的 srgbClr 是 Start 事件。
+                    // 形状纯色填充：先写入颜色，alpha 由 Empty 分支回填。
+                    b"srgbClr" if in_spPr && !in_grad_fill && !in_ln && !in_outer_shdw => {
+                        if let Some(ref mut s) = cur_shape {
+                            if let Some(hex) = attr_str(e, b"val") {
+                                s.fill = Some(FillStyle::Solid(parse_hex_color(&hex)));
+                                in_shape_fill_srgb = true;
+                            }
+                        }
+                    }
+                    // v316: 外阴影颜色（带 alpha 子元素时是 Start 事件）
+                    b"srgbClr" if in_outer_shdw => {
+                        if let Some(hex) = attr_str(e, b"val") {
+                            cur_shdw_color = Some(parse_hex_color(&hex));
+                        }
+                    }
+                    // v315: 带 <a:fillToRect/> 子元素的 <a:path> 是 Start 事件，
+                    // 原先只有 Empty 分支认 path，径向/矩形渐变保存后读回变成线性
+                    b"path" if in_grad_fill => {
+                        let path_type = attr_str(e, b"path").unwrap_or_else(|| "rect".to_string());
+                        cur_grad_kind_raw = Some(RawGradKind::Path { path_type });
                     }
                     b"gsLst" if in_grad_fill => {
                         in_gs_lst = true;
@@ -1863,6 +1928,12 @@ fn parse_slide_xml_shapes(
                             if let Some(fh) = attr_str(e, b"flipH") { s.flip_h = Some(fh == "1" || fh.eq_ignore_ascii_case("true")); }
                             if let Some(fv) = attr_str(e, b"flipV") { s.flip_v = Some(fv == "1" || fv.eq_ignore_ascii_case("true")); }
                         }
+                    }
+                    b"schemeClr" if in_gs => {
+                        in_gs_scheme_clr = true;
+                        cur_gs_scheme_slot = attr_str(e, b"val");
+                        cur_gs_mods.clear();
+                        cur_gs_alpha = None;
                     }
                     b"solidFill" if in_spPr => {
                         // srgbClr/sysClr 在子元素 Empty 里处理
@@ -2256,6 +2327,27 @@ fn parse_slide_xml_shapes(
                     // PROOT-D bugfix: 加 !in_ln 排除——此前这条分支会把
                     // <a:ln><a:solidFill><a:srgbClr/> 里的描边颜色也误当成
                     // 形状填充色写进 s.fill，见下方 in_ln 专属分支的对称处理。
+                    b"fillToRect" if in_grad_fill => {
+                        let ftr_l = attr_i32(e, b"l").unwrap_or(0) as f32;
+                        let ftr_t = attr_i32(e, b"t").unwrap_or(0) as f32;
+                        let ftr_r = attr_i32(e, b"r").unwrap_or(0) as f32;
+                        let ftr_b = attr_i32(e, b"b").unwrap_or(0) as f32;
+                        let cx = (ftr_l + (100000.0 - ftr_r)) / 200000.0;
+                        let cy = (ftr_t + (100000.0 - ftr_b)) / 200000.0;
+                        cur_grad_center = Some((cx, cy));
+                    }
+                    b"srgbClr" if in_patt_fg_sh || in_patt_bg_sh => {
+                        if let Some(hex) = attr_str(e, b"val") {
+                            let c = parse_hex_color(&hex);
+                            if in_patt_fg_sh { patt_sh_fg = Some(c); } else { patt_sh_bg = Some(c); }
+                        }
+                    }
+                    b"schemeClr" if in_patt_fg_sh || in_patt_bg_sh => {
+                        if let Some(slot) = attr_str(e, b"val") {
+                            let c = theme_colors.get(normalize_scheme_color_slot(&slot, clr_map)).copied().unwrap_or(Color { r: 0, g: 0, b: 0, a: 255 });
+                            if in_patt_fg_sh { patt_sh_fg = Some(c); } else { patt_sh_bg = Some(c); }
+                        }
+                    }
                     b"srgbClr" if in_spPr && !in_grad_fill && !in_ln => {
                         if let Some(ref mut s) = cur_shape {
                             if let Some(hex) = attr_str(e, b"val") {
@@ -2306,6 +2398,18 @@ fn parse_slide_xml_shapes(
                     // 而非参与apply_color_mods的RGB运算。原始值千分之一精度
                     // 百分比（如70000=70%），/100000.0换算成0-1，与项目其他
                     // alpha处理点（如cur_shdw_alpha消费处）同一换算约定。
+                    b"alpha" if in_ln_srgb => {
+                        let v = attr_i32(e, b"val").unwrap_or(100000).clamp(0, 100000) as i64;
+                        let a = ((v * 255 + 50000) / 100000) as u8;
+                        if let Some(c) = cur_ln_color.as_mut() { c.a = a; }
+                    }
+                    b"alpha" if in_shape_fill_srgb => {
+                        let v = attr_i32(e, b"val").unwrap_or(100000).clamp(0, 100000) as i64;
+                        let a = ((v * 255 + 50000) / 100000) as u8;
+                        if let Some(ref mut s) = cur_shape {
+                            if let Some(FillStyle::Solid(c)) = s.fill.as_mut() { c.a = a; }
+                        }
+                    }
                     b"alpha" if in_shape_fill_scheme_clr => {
                         cur_shape_fill_alpha = attr_i32(e, b"val");
                     }
@@ -2365,6 +2469,26 @@ fn parse_slide_xml_shapes(
                     // <a:outerShdw><a:srgbClr><a:alpha val="43000"/></a:srgbClr></a:outerShdw>，
                     // ST_PositiveFixedPercentage，43000=43%。必须放在in_outer_shdw分支之后，
                     // 不能和in_spPr场景下其他alpha用途混淆（此处专属于阴影颜色透明度）。
+                    b"shade" | b"tint" | b"satMod" | b"lumMod" | b"lumOff" if in_gs_scheme_clr => {
+                        if let Some(v) = attr_i32(e, b"val") {
+                            let name = String::from_utf8_lossy(e.local_name().as_ref()).to_string();
+                            cur_gs_mods.push((name, v));
+                        }
+                    }
+                    b"alpha" if in_gs_scheme_clr => {
+                        cur_gs_alpha = attr_i32(e, b"val");
+                    }
+                    b"alpha" if in_gs || in_patt_fg_sh || in_patt_bg_sh => {
+                        let v = attr_i32(e, b"val").unwrap_or(100000).clamp(0, 100000) as i64;
+                        let a = ((v * 255 + 50000) / 100000) as u8;
+                        if in_patt_fg_sh {
+                            if let Some(c) = patt_sh_fg.as_mut() { c.a = a; }
+                        } else if in_patt_bg_sh {
+                            if let Some(c) = patt_sh_bg.as_mut() { c.a = a; }
+                        } else if let Some(last) = cur_gradient_stops.last_mut() {
+                            last.1.a = a;
+                        }
+                    }
                     b"alpha" if in_outer_shdw => {
                         cur_shdw_alpha = attr_f32(e, b"val").map(|v| v as i32).unwrap_or(100000);
                     }
@@ -2758,9 +2882,22 @@ fn parse_slide_xml_shapes(
                                 kind_raw,
                                 cur_grad_rotate_with_shape,
                             ));
+                            s.grad_center = cur_grad_center.take();
                         } else {
                             cur_gradient_stops.clear();
                             cur_grad_kind_raw = None;
+                        }
+                    }
+                    b"fgClr" if in_patt_fg_sh => { in_patt_fg_sh = false; }
+                    b"bgClr" if in_patt_bg_sh => { in_patt_bg_sh = false; }
+                    b"pattFill" if in_patt_sh => {
+                        in_patt_sh = false;
+                        if let (Some(ref mut s), Some(prst)) = (cur_shape.as_mut(), patt_sh_prst.take()) {
+                            s.fill = Some(FillStyle::Pattern {
+                                preset: prst,
+                                fg: patt_sh_fg.take().unwrap_or(Color { r: 0, g: 0, b: 0, a: 255 }),
+                                bg: patt_sh_bg.take().unwrap_or(Color { r: 255, g: 255, b: 255, a: 255 }),
+                            });
                         }
                     }
                     b"blipFill" if in_shape_blip_fill => {
@@ -2775,6 +2912,19 @@ fn parse_slide_xml_shapes(
                     // alpha都为空（理论上不会发生，无mods的<a:schemeClr>
                     // 会触发Empty而非Start+End），行为等价于1983行附近
                     // 现有Empty分支的逻辑（同样的base色查找+unwrap_or兜底）。
+                    b"schemeClr" if in_gs_scheme_clr => {
+                        in_gs_scheme_clr = false;
+                        if let Some(slot) = cur_gs_scheme_slot.take() {
+                            let base = theme_colors.get(normalize_scheme_color_slot(&slot, clr_map)).copied().unwrap_or(Color { r: 0x4F, g: 0x81, b: 0xBD, a: 255 });
+                            let mut c = if cur_gs_mods.is_empty() { base } else { apply_color_mods(base, &cur_gs_mods) };
+                            if let Some(a) = cur_gs_alpha {
+                                c.a = ((a.clamp(0, 100000) as i64 * 255 + 50000) / 100000) as u8;
+                            }
+                            cur_gradient_stops.push((cur_gs_pos, c));
+                        }
+                        cur_gs_mods.clear();
+                        cur_gs_alpha = None;
+                    }
                     b"schemeClr" if in_shape_fill_scheme_clr => {
                         in_shape_fill_scheme_clr = false;
                         if let Some(ref mut s) = cur_shape {
@@ -2833,6 +2983,8 @@ fn parse_slide_xml_shapes(
                     // 把dist/dir/blurRad+颜色+alpha一次性写入cur_shape.outer_shdw_raw。
                     // 颜色缺省（<a:outerShdw>内没有任何颜色子元素，理论上不应发生，
                     // OOXML规范里颜色是必需子元素，纯防御性兜底）时用不透明黑色。
+                    b"srgbClr" if in_shape_fill_srgb => { in_shape_fill_srgb = false; }
+                    b"srgbClr" if in_ln_srgb => { in_ln_srgb = false; }
                     b"outerShdw" if in_outer_shdw => {
                         in_outer_shdw = false;
                         if let Some(ref mut s) = cur_shape {
@@ -3249,7 +3401,7 @@ fn parse_slide_xml_shapes(
                                     raw.fill = Some(FillStyle::Solid(c));
                                 }
                             }
-                            if raw.stroke.is_none() {
+                            if raw.stroke.is_none() && !raw.ln_no_fill {
                                 if let Some(mut c) = style_line_color {
                                     // PROOT-006: lnRef颜色shade/tint/satMod调整。
                                     // style_line_color此刻只是schemeClr查表得到的纯色，
@@ -3384,7 +3536,7 @@ fn parse_slide_xml_shapes(
                                     raw.fill = Some(FillStyle::Solid(c));
                                 }
                             }
-                            if raw.stroke.is_none() {
+                            if raw.stroke.is_none() && !raw.ln_no_fill {
                                 if let Some(mut c) = style_line_color {
                                     // PROOT-006: lnRef颜色shade/tint/satMod调整。
                                     // style_line_color此刻只是schemeClr查表得到的纯色，
@@ -3693,10 +3845,16 @@ fn raw_to_shape(
             }
             RawGradKind::Path { path_type } => {
                 match path_type.as_str() {
-                    "circle" => GradientKind::Radial,
+                    "circle" => {
+                        let (cx, cy) = raw.grad_center.unwrap_or((0.5, 0.5));
+                        GradientKind::Radial { cx, cy }
+                    }
                     // "rect" | "shape"：shape两方参照实现均未真正实现，
                     // 归并到 Rect 处理，见 GradientKind::Rect 文档注释。
-                    _ => GradientKind::Rect,
+                    _ => {
+                        let (cx, cy) = raw.grad_center.unwrap_or((0.5, 0.5));
+                        GradientKind::Rect { cx, cy }
+                    }
                 }
             }
         };
@@ -5797,6 +5955,19 @@ fn find_theme_target(rels_xml: &str) -> Option<String> {
 /// 输入l/t/r/b是OOXML原始千分比整数（100000=100%），输出是归一化到
 /// 0.0-1.0的裁剪比例，与`<a:srcRect>`场景的crop_l/t/r/b同一单位，
 /// 供render_shape_image统一处理，调用方无需区分来源。
+/// 按文件头判断图片 mime（PNG/JPEG/GIF，其余 image/unknown）。
+fn sniff_image_mime(data: &[u8]) -> String {
+    if data.starts_with(b"\x89PNG") {
+        "image/png".to_string()
+    } else if data.starts_with(b"\xff\xd8") {
+        "image/jpeg".to_string()
+    } else if data.starts_with(b"GIF") {
+        "image/gif".to_string()
+    } else {
+        "image/unknown".to_string()
+    }
+}
+
 fn crop_quotients_from_fill_rect(l: i32, t: i32, r: i32, b: i32) -> (f32, f32, f32, f32) {
     const MAX_PERCENT: f64 = 100000.0;
 
@@ -5849,6 +6020,17 @@ fn parse_slide_background(
     let mut grad_stops: Vec<roe_model::common::GradientStop> = Vec::new();
     let mut grad_kind: Option<roe_model::common::GradientKind> = None;
     let mut grad_rotate = true;
+    // v315: <p:bgPr><a:pattFill prst><a:fgClr/><a:bgClr/></a:pattFill>
+    // v315: 背景渐变色标用主题色 + mods（自闭合时无 End 事件，统一在 </a:gs> 收尾）
+    let mut gs_slot: Option<String> = None;
+    let mut gs_mods: Vec<(String, i32)> = Vec::new();
+    let mut gs_alpha: Option<i32> = None;
+    let mut in_patt_fill = false;
+    let mut in_patt_fg = false;
+    let mut in_patt_bg = false;
+    let mut patt_prst: Option<String> = None;
+    let mut patt_fg: Option<Color> = None;
+    let mut patt_bg: Option<Color> = None;
     // PROOT-1xx: <p:bgRef idx="1001"><a:schemeClr val="bg2"/></p:bgRef>
     // 场景——背景不是直接内联<a:solidFill>/<a:gradFill>（那是bgPr分支），
     // 而是引用主题bgFillStyleLst第idx项的填充模板，模板里的schemeClr
@@ -5915,10 +6097,47 @@ fn parse_slide_background(
                     b"path" if in_grad_fill => {
                         let pt = attr_str(e, b"path").unwrap_or_else(|| "rect".to_string());
                         grad_kind = Some(if pt == "circle" {
-                            roe_model::common::GradientKind::Radial
+                            roe_model::common::GradientKind::Radial { cx: 0.5, cy: 0.5 }
                         } else {
-                            roe_model::common::GradientKind::Rect
+                            roe_model::common::GradientKind::Rect { cx: 0.5, cy: 0.5 }
                         });
+                    }
+                    // v315: fillToRect 的 l/t 还原中心点 cx/cy（缺省 0 → 与 ECMA 一致）
+                    b"fillToRect" if in_grad_fill => {
+                        let ftr_l = attr_i32(e, b"l").unwrap_or(0) as f32;
+                        let ftr_t = attr_i32(e, b"t").unwrap_or(0) as f32;
+                        let ftr_r = attr_i32(e, b"r").unwrap_or(0) as f32;
+                        let ftr_b = attr_i32(e, b"b").unwrap_or(0) as f32;
+                        let cx = (ftr_l + (100000.0 - ftr_r)) / 200000.0;
+                        let cy = (ftr_t + (100000.0 - ftr_b)) / 200000.0;
+                        grad_kind = match grad_kind {
+                            Some(roe_model::common::GradientKind::Radial { .. }) =>
+                                Some(roe_model::common::GradientKind::Radial { cx, cy }),
+                            Some(roe_model::common::GradientKind::Rect { .. }) =>
+                                Some(roe_model::common::GradientKind::Rect { cx, cy }),
+                            other => other,
+                        };
+                    }
+                    // v315: 色标内 <a:alpha>（背景渐变色标，写入刚 push 的那个色标）
+                    b"schemeClr" if in_gs => {
+                        gs_slot = attr_str(e, b"val");
+                        gs_mods.clear();
+                        gs_alpha = None;
+                    }
+                    b"shade" | b"tint" | b"satMod" | b"lumMod" | b"lumOff" if in_gs && gs_slot.is_some() => {
+                        if let Some(v) = attr_i32(e, b"val") {
+                            let name = String::from_utf8_lossy(e.local_name().as_ref()).to_string();
+                            gs_mods.push((name, v));
+                        }
+                    }
+                    b"alpha" if in_gs && gs_slot.is_some() => {
+                        gs_alpha = attr_i32(e, b"val");
+                    }
+                    b"alpha" if in_gs => {
+                        let v = attr_i32(e, b"val").unwrap_or(100000).clamp(0, 100000) as i64;
+                        if let Some(last) = grad_stops.last_mut() {
+                            last.color.a = ((v * 255 + 50000) / 100000) as u8;
+                        }
                     }
                     b"srgbClr" if in_gs => {
                         if let Some(hex) = attr_str(e, b"val") {
@@ -5926,6 +6145,34 @@ fn parse_slide_background(
                                 pos: cur_gs_pos,
                                 color: parse_hex_color(&hex),
                             });
+                        }
+                    }
+                    b"pattFill" if in_bg_pr => {
+                        in_patt_fill = true;
+                        patt_prst = attr_str(e, b"prst");
+                    }
+                    b"fgClr" if in_patt_fill => { in_patt_fg = true; }
+                    b"bgClr" if in_patt_fill => { in_patt_bg = true; }
+                    b"srgbClr" if in_patt_fg || in_patt_bg => {
+                        if let Some(hex) = attr_str(e, b"val") {
+                            let c = parse_hex_color(&hex);
+                            if in_patt_fg { patt_fg = Some(c); } else { patt_bg = Some(c); }
+                        }
+                    }
+                    b"schemeClr" if in_patt_fg || in_patt_bg => {
+                        if let Some(slot) = attr_str(e, b"val") {
+                            if let Some(c) = theme_colors.get(normalize_scheme_color_slot(&slot, clr_map)).copied() {
+                                if in_patt_fg { patt_fg = Some(c); } else { patt_bg = Some(c); }
+                            }
+                        }
+                    }
+                    b"alpha" if in_patt_fg || in_patt_bg => {
+                        let v = attr_i32(e, b"val").unwrap_or(100000).clamp(0, 100000) as i64;
+                        let a = ((v * 255 + 50000) / 100000) as u8;
+                        if in_patt_fg {
+                            if let Some(c) = patt_fg.as_mut() { c.a = a; }
+                        } else if let Some(c) = patt_bg.as_mut() {
+                            c.a = a;
                         }
                     }
                     b"stretch" if in_blip_fill => { in_stretch = true; }
@@ -5991,8 +6238,24 @@ fn parse_slide_background(
                     b"bgRef" => { in_bg_ref = false; }
                     b"blipFill" => { in_blip_fill = false; }
                     b"solidFill" => { in_solid_fill = false; }
-                    b"gs" => { in_gs = false; }
+                    b"gs" => {
+                        in_gs = false;
+                        if let Some(slot) = gs_slot.take() {
+                            let base = theme_colors.get(normalize_scheme_color_slot(&slot, clr_map)).copied()
+                                .unwrap_or(Color { r: 0x4F, g: 0x81, b: 0xBD, a: 255 });
+                            let mut col = if gs_mods.is_empty() { base } else { apply_color_mods(base, &gs_mods) };
+                            if let Some(a) = gs_alpha {
+                                col.a = ((a.clamp(0, 100000) as i64 * 255 + 50000) / 100000) as u8;
+                            }
+                            grad_stops.push(roe_model::common::GradientStop { pos: cur_gs_pos, color: col });
+                        }
+                        gs_mods.clear();
+                        gs_alpha = None;
+                    }
                     b"gradFill" => { in_grad_fill = false; }
+                    b"pattFill" => { in_patt_fill = false; }
+                    b"fgClr" => { in_patt_fg = false; }
+                    b"bgClr" => { in_patt_bg = false; }
                     b"stretch" => { in_stretch = false; }
                     _ => {}
                 }
@@ -6005,10 +6268,8 @@ fn parse_slide_background(
 
     if let Some(rid) = bg_rid {
         if let Some(bytes) = image_map.get(&rid) {
-            // mime 类型：背景图片场景第一期不做真正的格式嗅探，固定按 png 处理——
-            // 与 ShapeContent::Image 现有渲染路径（render_shape_image）一致，
-            // tiny-skia 侧图片解码目前也只验证过 png，其余格式（jpg等）留待
-            // 遇到真实样本报告问题时再扩展格式嗅探逻辑。
+            // mime 类型：按文件头嗅探（sniff_image_mime，PNG/JPEG/GIF），
+            // 渲染侧用 image crate 解码，不依赖 mime。
             //
             // ROE-TILE-001: has_tile 与 <a:stretch> 是互斥的两种子元素
             // （见上方扫描循环注释），故这里用 if/else 分流，不会同时
@@ -6020,7 +6281,7 @@ fn parse_slide_background(
                 return Some(FillStyle::PictureTiled {
                     image: roe_model::common::ImageData {
                         data: bytes.clone(),
-                        mime: "image/png".to_string(),
+                        mime: sniff_image_mime(bytes),
                         crop_l: 0.0, crop_t: 0.0, crop_r: 0.0, crop_b: 0.0,
                     },
                     tile_offset_x,
@@ -6034,7 +6295,7 @@ fn parse_slide_background(
                 crop_quotients_from_fill_rect(fill_rect_l, fill_rect_t, fill_rect_r, fill_rect_b);
             return Some(FillStyle::Picture(roe_model::common::ImageData {
                 data: bytes.clone(),
-                mime: "image/png".to_string(),
+                mime: sniff_image_mime(bytes),
                 crop_l, crop_t, crop_r, crop_b,
             }));
         }
@@ -6043,6 +6304,16 @@ fn parse_slide_background(
     if let Some(color) = bg_solid_color {
         return Some(FillStyle::Solid(color));
     }
+
+    // v315: 图案背景（fgClr/bgClr 缺省按 ECMA：前景黑、背景白）
+    if let Some(prst) = patt_prst {
+        return Some(FillStyle::Pattern {
+            preset: prst,
+            fg: patt_fg.unwrap_or(Color { r: 0, g: 0, b: 0, a: 255 }),
+            bg: patt_bg.unwrap_or(Color { r: 255, g: 255, b: 255, a: 255 }),
+        });
+    }
+
 
     // v318p: 渐变背景（至少两个色标才算有效）
     if grad_stops.len() >= 2 {
@@ -6088,7 +6359,7 @@ fn parse_slide_background(
                     return Some(FillStyle::PictureTiled {
                         image: roe_model::common::ImageData {
                             data: bytes.clone(),
-                            mime: "image/png".to_string(),
+                            mime: sniff_image_mime(bytes),
                             crop_l: 0.0, crop_t: 0.0, crop_r: 0.0, crop_b: 0.0,
                         },
                         tile_offset_x: *tile_offset_x,
@@ -6100,7 +6371,7 @@ fn parse_slide_background(
                 }
                 return Some(FillStyle::Picture(roe_model::common::ImageData {
                     data: bytes.clone(),
-                    mime: "image/png".to_string(),
+                    mime: sniff_image_mime(bytes),
                     crop_l: 0.0, crop_t: 0.0, crop_r: 0.0, crop_b: 0.0,
                 }));
             }
@@ -6852,7 +7123,7 @@ mod tests {
             xml_circle, &image_map, &chart_map, &theme_colors, &HashMap::new(), &[], &[], &default_style, &[], &[], &[], None,
         ).expect("should parse circle path gradient");
         match &shapes[0].style.fill {
-            Some(FillStyle::Gradient { kind: GradientKind::Radial, .. }) => {}
+            Some(FillStyle::Gradient { kind: GradientKind::Radial { .. }, .. }) => {}
             other => panic!("path=circle 应识别为 Radial，实际={:?}", other),
         }
     }
@@ -7369,7 +7640,7 @@ mod tests {
             grouping: roe_model::impress::ChartGrouping::Standard,
             hole_size_pct: None,
             data_labels: Default::default(),
-            slice_border_color: None,
+            slice_border_color: None, legend_pos: None,
         });
 
         let theme_colors = HashMap::new();
@@ -7429,7 +7700,7 @@ mod tests {
             grouping: roe_model::impress::ChartGrouping::Standard,
             hole_size_pct: None,
             data_labels: Default::default(),
-            slice_border_color: None,
+            slice_border_color: None, legend_pos: None,
         });
 
         let theme_colors = HashMap::new();

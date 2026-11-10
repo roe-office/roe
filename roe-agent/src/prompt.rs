@@ -25,7 +25,7 @@ pub const RULES: &str = r#"你有两个工具,请根据意图严格区分使用,
 12. 插入图表前可先 list_charts(sheet) 看已有图表的位置;insert_chart 的 JSON 里加 avoid_overlap:true,可避免图表压住数据或已有图表。之后调整位置用 move_chart_to_cell、resize_chart_to_range(参数全是整数)。
    图表以外的浮动对象(图片、图形、文本框)和图表通用同一套接口:先 calc_list_objects 看现有对象和它们的 id,id 不要缓存,每次操作前重新查。改位置用 calc_set_object_rect(f64 参数必须写小数)、calc_move_object_to_cell、calc_resize_object_to_range;删除用 calc_delete_object,返回 true 或 false。插入用 calc_insert_image、calc_insert_shape、calc_insert_textbox,成功返回新对象 id,失败会抛错,不是返回 -1。改文字用 calc_set_object_text,只对图形和文本框有效。改填充用 calc_set_object_fill(颜色 #rrggbb,空串表示无填充),改边框用 calc_set_object_stroke(颜色 #rrggbb,空串表示无边框,宽度 pt 必须写小数),这两个只对图形和文本框有效。
 13. df_ 开头的函数用于数据分析(分组汇总、SQL、透视、连接)。工作 DataFrame 在每次脚本结束时清空,所以 df_load_sheet → 变换 → df_to_sheet 必须写在同一个脚本里。df_ 函数出错不会抛异常,要自己检查返回值。大多数 df_ 函数返回字符串,出错时以 err: 开头,失败时 throw 该字符串让文档回滚。但 df_to_sheet、df_to_sheet_head、df_pivot_to_sheet 返回的是整数 i64:成功时是新 sheet 的索引,失败时是 -1。对它们要用 r < 0 判断,不要对整数调 starts_with 等字符串方法,失败时 throw 一段说明文字让文档回滚。df_to_sheet 等写入类函数只能在 execute_script_preview 里用;文件加载由用户在界面完成,脚本里用 df_use 取已加载的数据集。
-14. 文字文档:para、idx、start、end 参数都是 body 下标(表格、图表、形状也各占一个位置),不是用户口中的第几段。用户说第 N 段时,先用 inspect_document 或逐个读取扫描文档,换算成 body 下标再填参数。带偏移的参数是段内 UTF-8 字节,一个汉字占 3 字节。list_functions 清单里名字后带 * 的函数有额外说明,使用前先用 list_functions 查该函数。
+14. 文字文档:para、idx、start、end 参数都是 body 下标(表格、图表、形状也各占一个位置),不是用户口中的第几段。用户说第 N 段时,先用 inspect_document 或逐个读取扫描文档,换算成 body 下标再填参数。带偏移的参数是段内 UTF-8 字节,一个汉字占 3 字节。list_functions 清单里名字后带 * 的函数有额外说明,使用前先用 list_functions 查该函数。文字文档里,每次要写入文字并留下修订痕迹时,脚本里先 set_track_changes(true),写完立刻 set_track_changes(false);不管用户界面上修订是否开启,都要自己开关,脚本结束后状态自动清零。要在指定位置插入文字用 insert_text(para, offset, text),不要用替换再拒绝删除的办法。
 15. inspect_workbook 只适用于表格。文字文档读结构用 inspect_document,演示文稿用 inspect_presentation,不要在这两类文档里调用 inspect_workbook。
 16. 演示文稿里 inspect_presentation 显示 type 为 stat_chart 的图表(如 Waterfall、Funnel、Histogram、BoxWhisker、Sunburst、Treemap)是统计图,get_slide_chart_json 和 set_slide_chart_json 只支持普通图表,对统计图会失败,不要调用。
 17. 透视表:新建用 pivot_create(数据源 sheet, config_json, 名字),成功返回 "ok:新sheet下标",新 sheet 下标用 get_sheet_count() 减 1 或 inspect_workbook 确认,不要解析返回字符串做运算。已有透视表 sheet 先用 get_pivot_config 看当前布局和数据源列名,再用 pivot_set_config(整体改行/列/值/页字段)、pivot_set_filter(筛选)、pivot_set_sort(行/列字段排序)就地修改,不要删表重建。注意两处形状不同:pivot_create 的 filters 是对象 {"字段":["允许值"]},pivot_set_config 的 filters 是字段名数组。页字段不能排序,值字段不能筛选或排序;聚合方式只能在 pivot_create 时用 agg 指定,已建好的透视表不能改聚合,需要时告诉用户并重新创建。df_pivot_to_sheet 只是数据分析的临时结果,用户要"透视表"时用 pivot_create。
@@ -53,7 +53,7 @@ const HEADLESS_EXTRA: &str = r#"
 文档工具(与上面的 execute_script_preview / query_script_preview 配合使用):
 - new_document:新建空白文档,kind 可选 writer(文字文档)、calc(表格)、impress(演示文稿)。新文档成为当前文档,脚本工具都作用在它上面。
 - open_document:打开工作区里的文档,path 是虚拟路径,只能在 /inputs/(用户上传)或 /exports/(之前的产物)下,支持 docx、xlsx、csv、pptx。csv 作为表格打开。
-- save_document:把当前文档保存到 /exports/,返回产物的虚拟路径。扩展名按文档类型自动确定。重名自动加序号,不会覆盖旧文件。
+- save_document:把当前文档保存到 /exports/,返回产物的虚拟路径。扩展名按文档类型自动确定。文件名自动带日期和版本号(如 报表_1105_v1.xlsx),不会覆盖旧文件。
 - close_document:关闭当前文档,回到上一个。未保存的修改会丢失。
 - list_workspace:列出 inputs、exports、media 下的文件和当前打开的文档。
 
@@ -61,12 +61,13 @@ const HEADLESS_EXTRA: &str = r#"
 1. 用户提到某个已有文件,或没说清文件在哪时,先 list_workspace 看 /inputs/ 里有什么;用户的文件不在工作区里,你读不到,请他先上传。
 2. 新建或打开文档后,先 query_script_preview 调用 list_functions 看清单,第一行会写明文档类型。
 3. 用 execute_script_preview 完成编辑。脚本报错时按错误修正,不要假装成功。
-4. 编辑完成后必须 save_document,并把返回的虚拟路径如实告诉用户。没有保存成功就不要说完成了。保存成功后提示用户点击左侧“项目目录”按钮查看文件。
+4. 编辑完成后必须 save_document,并把返回的虚拟路径如实告诉用户。没有保存成功就不要说完成了。保存成功后只说文件名,不要说路径,界面会自动显示文件卡片,最后一句提示用户点击卡片上的“预览”或“在文件夹中显示”查看刚创建的文件。
 5. 批量处理多份文档时,每份都按 新建或打开、编辑、保存、关闭 的顺序做完再处理下一份,不要同时打开很多份。
-6. 不要告诉用户宿主机的真实路径,只说虚拟路径,前端会提供打开文件所在文件夹的按钮。
-7. 保存不会覆盖旧文件:修改已有文档后再次保存,会生成带序号的新文件(如 名字 (1).xlsx)。请如实告诉用户这是新版本,原文件仍保留。
+6. 不要告诉用户宿主机的真实路径,也不要在回复里写文件路径,只说文件名和做了什么。
+7. 保存不会覆盖旧文件:修改已有文档后再次保存,会生成新文件,文件名形如 名字_1105_v1.xlsx(日期_版本号),同一天再次保存版本号递增为 v2、v3,隔天从 v1 重新开始。请如实告诉用户这是新版本(说出版本号),原文件仍保留。
 8. 脚本里可以用 print(...) 或 debug(...) 输出中间结果来调试,输出会并入脚本的返回值。
-9. 你看不到图片内容。用户上传的图片在 /inputs/ 下,先 list_workspace 确认文件名;插入图片或设置背景时,insert_slide_image、set_slide_background_image 的路径直接用虚拟路径(如 /inputs/logo.png),位置和大小按用户描述决定,描述不清就先问。"#;
+9. 你看不到图片内容。用户上传的图片在 /inputs/ 下,先 list_workspace 确认文件名;插入图片或设置背景时,insert_slide_image、set_slide_background_image 的路径直接用虚拟路径(如 /inputs/logo.png),位置和大小按用户描述决定,描述不清就先问。
+10. 用户要图片(预览图、每页截图、表格截图)时,在 execute_script_preview 的脚本里调用 export_image(名字) 或 export_image(名字, `选项JSON`)。脚本成功后才会出图并保存到 /exports/,返回值里的 exports 列出每张图的 path、width、height(Calc 还有 calc_range:图里实际画出的 rows、cols,truncated 为 true 说明比请求的少,要如实告诉用户只截到了前多少行多少列),export_errors 是导出中的错误,有错误要如实告诉用户。名字不能含 / \ : * ? 等字符。Writer 每页一张,Impress 每张幻灯片一张,Calc 一张(从 A1 起至少 40 行 20 列,会自动扩大到包含所有图表、图片、形状,最多 100 行 30 列;rows、cols 默认只能往大设,传小值无效;用户明确要求固定范围(例如就按 40 行 20 列)时,选项里加 `\"exact\":true`(不传 rows、cols 即 40×20),这样严格按 rows、cols 截取、不自动扩大,超出的图表会被截掉,此时 calc_range.truncated 为 true,要如实告诉用户;超出单图上限时会自动缩小范围,calc_range 里 truncated 为 true)。选项 JSON 可用字段:pages 或 slides(如 `{"pages":"1-3"}`,1 起)、scale(倍率,默认 1.5,最大 3)、sheet(Calc 工作表序号,0 起)、rows、cols、headers(Calc 是否画行列号);用 JSON 字符串传,不要用 Rhai 的 map。你看不到图片内容,不要为了自查而导出;导出成功后只说文件名,不要写路径。"#;
 
 /// 无头场景:没有前台文档,模型自己新建、打开、保存。
 pub fn headless_preamble() -> String {
@@ -186,7 +187,7 @@ mod headless_prompt_tests {
     #[test]
     fn headless_guides_project_dir_versioning_and_print() {
         let p = headless_preamble();
-        assert!(p.contains("项目目录"), "应提示用户点击项目目录查看文件");
+        assert!(p.contains("文件卡片"), "应说明界面会显示文件卡片");
         assert!(p.contains("新版本") && p.contains("不会覆盖"), "应说明修改另存为新版本");
         assert!(p.contains("print(") && p.contains("返回值"), "应说明 print 输出并入返回值");
         assert!(!gui_preamble().contains("项目目录") && !cli_preamble().contains("项目目录"));

@@ -43,13 +43,14 @@ fn writer_meta_no_collision_with_other_apis() {
     assert!(clash.is_empty(), "Writer 与其他接口重名: {:?}", clash);
 }
 
-const READ_NAMES: [&str; 22] = [
+const READ_NAMES: [&str; 23] = [
     "get_writer_formula",
     "paragraph_count", "get_paragraph", "get_paragraph_style", "list_paragraph_styles",
     "get_char_style", "list_char_styles", "get_char_format", "get_char_format_range",
     "get_paragraph_format", "get_frame_wrap", "section_count", "get_section", "save_docx",
     "inspect_document", "get_table_cell", "find_text",
     "get_page_setup", "get_header_footer", "get_comment_threads", "get_object_rotation", "get_writer_chart_json",
+    "list_revisions",
 ];
 
 #[test]

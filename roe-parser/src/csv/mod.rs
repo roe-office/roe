@@ -108,7 +108,9 @@ fn decode_to_utf8(data: &[u8]) -> Result<String, ParseError> {
 }
 
 fn detect_delimiter(text: &str) -> u8 {
-    let sample = &text[..text.len().min(4096)];
+    let mut end = text.len().min(4096);
+    while !text.is_char_boundary(end) { end -= 1; }
+    let sample = &text[..end];
     let tabs   = sample.chars().filter(|&c| c == '\t').count();
     let commas = sample.chars().filter(|&c| c == ',').count();
     let semis  = sample.chars().filter(|&c| c == ';').count();
@@ -225,5 +227,19 @@ mod tests {
         let data = b"x,y\n1,2\n";
         let wb = CsvParser::parse(data, Some("Sales")).unwrap();
         assert_eq!(wb.sheets[0].name, "Sales");
+    }
+}
+
+#[cfg(test)]
+mod delimiter_boundary_tests {
+    use super::*;
+
+    #[test]
+    fn detect_delimiter_does_not_split_multibyte_char() {
+        // 4096 不是 3 的倍数,会正好落在汉字中间
+        let text = "帚".repeat(2000);
+        assert_eq!(detect_delimiter(&text), b'\t');
+        let text2 = format!("{},", "帚".repeat(1365)) + &"帚".repeat(500);
+        let _ = detect_delimiter(&text2);
     }
 }

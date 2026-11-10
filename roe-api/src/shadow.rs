@@ -76,7 +76,7 @@ impl Drop for ShadowGuard {
 /// 操作期间可以独立累积自己的 undo_stack（如果 roe_execute_script
 /// 之类的路径对着 shadow_handle 调用）。
 pub fn create_shadow(original_handle: u64) -> Option<ShadowGuard> {
-    let doc_clone = handle::with_entry(original_handle, |entry| entry.doc.clone())?;
+    let (doc_clone, track_on) = handle::with_entry(original_handle, |entry| (entry.doc.clone(), entry.writer_options.track_changes))?;
 
     let shadow_entry = DocumentEntry {
         doc: doc_clone,
@@ -88,7 +88,13 @@ pub fn create_shadow(original_handle: u64) -> Option<ShadowGuard> {
         writer_font_registry: None,
         undo_stack: Vec::new(),
         redo_stack: Vec::new(),
-        writer_options: Default::default(),
+        // v309: 影子继承修订开关，作者固定为 AI。
+        writer_options: {
+            let mut o: handle::WriterOptions = Default::default();
+            o.track_changes = track_on;
+            o.track_author = "AI".to_string();
+            o
+        },
         impress_font_registry: None,
         writer_parley_font_context: None,
         calc_engine: None,

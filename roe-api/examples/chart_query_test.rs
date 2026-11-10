@@ -57,6 +57,25 @@ fn main() {
     println!("set_chart_style(还原) = {}", roe_api::roe_set_chart_style(handle, 0, chart_id, style3.as_ptr()));
     println!("get_chart_config(还原) = {}", cstr_out(roe_api::roe_get_chart_config(handle, 0, chart_id)));
 
+    // ---- legend_pos 回读验证 ----
+    for (label, body) in [
+        ("legend_pos=Left", r##"{"legend_pos":"Left"}"##),
+        ("legend_pos=Top", r##"{"legend_pos":"Top"}"##),
+        ("legend_pos=null(清除)", r##"{"legend_pos":null}"##),
+        ("legend_pos=Middle(非法,应不生效)", r##"{"legend_pos":"Middle"}"##),
+        ("legend_pos=left(小写,应不生效)", r##"{"legend_pos":"left"}"##),
+    ] {
+        let c = CString::new(body).unwrap();
+        let ok = roe_api::roe_set_chart_style(handle, 0, chart_id, c.as_ptr());
+        let cfg = cstr_out(roe_api::roe_get_chart_config(handle, 0, chart_id));
+        let lp = cfg
+            .split("\"legend_pos\":")
+            .nth(1)
+            .map(|t| t.split(|ch| ch == ',' || ch == '}').next().unwrap_or("").to_string())
+            .unwrap_or_else(|| "<缺失>".to_string());
+        println!("[{}] set={} -> get legend_pos = {}", label, ok, lp);
+    }
+
     let bad_rect = roe_api::roe_get_chart_rect(handle, 0, 9999);
     println!("get_chart_rect (bad id, should be null) = {}", cstr_out(bad_rect));
 

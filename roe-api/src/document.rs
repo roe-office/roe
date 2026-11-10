@@ -49,7 +49,14 @@ pub extern "C" fn roe_open_document_from_bytes(
     }
 
     let bytes = unsafe { slice::from_raw_parts(data, len) };
-    open_document_bytes_impl(bytes, format_hint)
+    // 解析器 panic 不能穿过 FFI(会让整个进程中止),这里拦住并按"打开失败"返回
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| open_document_bytes_impl(bytes, format_hint))) {
+        Ok(h) => h,
+        Err(_) => {
+            set_last_error("roe_open_document_from_bytes: 解析文档时发生内部错误(文件可能损坏或格式不被支持)");
+            0
+        }
+    }
 }
 
 /// 从字节打开文档——内部 Rust 版本,供 roe-agent 等同进程消费者直接调用

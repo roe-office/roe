@@ -31,6 +31,7 @@ fn main() {
         dist_l_pt: 0.0,
         dist_r_pt: 0.0,
         flip_v: None,
+        rotation: None,
     };
 
     // 场景二：anchor 椭圆 + 蓝色描边 + square 环绕，位置偏移 (15pt, 25pt)
@@ -61,6 +62,7 @@ fn main() {
         dist_l_pt: 0.0,
         dist_r_pt: 0.0,
         flip_v: None,
+        rotation: None,
     };
 
     // 场景三：inline 矩形 + 文本框文字 "Hello Shape"
@@ -97,6 +99,7 @@ fn main() {
         dist_l_pt: 0.0,
         dist_r_pt: 0.0,
         flip_v: None,
+        rotation: None,
     };
 
     fn label(text: &str) -> BodyElement {

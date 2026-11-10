@@ -507,7 +507,7 @@ dependencies = [
  "log",
  "num-rational",
  "num-traits",
- "pastey",
+ "pastey 0.1.1",
  "rayon",
  "thiserror 2.0.18",
  "v_frame",
@@ -842,16 +842,16 @@ dependencies = [
 
 [[package]]
 name = "charts-rs"
-version = "1.0.0"
+version = "2.3.0"
 dependencies = [
  "arc-swap",
  "criterion 0.8.2",
- "fontdue",
  "image",
  "pretty_assertions",
- "resvg",
+ "resvg 0.48.1",
  "serde",
  "serde_json",
+ "ttf-parser",
 ]
 
 [[package]]
@@ -1061,7 +1061,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "be17b688510d934ce13f48a2beba700e11583e281e0fda99c22bb256a14eda73"
 dependencies = [
  "bitflags",
- "fontdb",
+ "fontdb 0.23.0",
  "harfrust 0.5.2",
  "linebender_resource_handle",
  "log",
@@ -1694,13 +1694,15 @@ dependencies = [
 ]
 
 [[package]]
-name = "fontdue"
-version = "0.9.4"
+name = "fontdb"
+version = "0.24.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7894823fa221401399e2598f8b63f81ac77ff5c63248b7656779bff1632d7d3d"
+checksum = "2660c5e9157bf76d2db1294e4a9feba604ef610819a3b591088d0d8392a3290f"
 dependencies = [
- "hashbrown 0.15.5",
- "ttf-parser",
+ "fontconfig-parser",
+ "log",
+ "slotmap",
+ "tinyvec",
 ]
 
 [[package]]
@@ -2495,6 +2497,12 @@ name = "imagesize"
 version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "09e54e57b4c48b40f7aec75635392b12b3421fa26fe8b4332e63138ed278459c"
+
+[[package]]
+name = "imagesize"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "65b27460c2c92b037f3f94c538ed9a3342f3fdf923606781629ccb35f82d042a"
 
 [[package]]
 name = "imgref"
@@ -3345,6 +3353,12 @@ name = "pastey"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "35fb2e5f958ec131621fdd531e9fc186ed768cbe395337403ae56c17a74c68ec"
+
+[[package]]
+name = "pastey"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2ee67f1008b1ba2321834326597b8e186293b049a023cdef258527550b9935b4"
 
 [[package]]
 name = "percent-encoding"
@@ -4788,7 +4802,22 @@ dependencies = [
  "rgb",
  "svgtypes",
  "tiny-skia",
- "usvg",
+ "usvg 0.47.0",
+]
+
+[[package]]
+name = "resvg"
+version = "0.48.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "67e3803f97b999e80cbf7c6ecdd07a8102204d92e1633cf48783720c521196bd"
+dependencies = [
+ "bytemuck",
+ "log",
+ "pico-args",
+ "rgb",
+ "svgtypes",
+ "tiny-skia",
+ "usvg 0.48.1",
 ]
 
 [[package]]
@@ -4901,6 +4930,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "rmcp"
+version = "3.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f8be15815186873ea063bf005011d16c356804973489e40c39116ae3a2878d1f"
+dependencies = [
+ "chrono",
+ "futures",
+ "indexmap",
+ "libc",
+ "pastey 0.2.3",
+ "pin-project-lite",
+ "schemars",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "rmp"
 version = "0.8.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4924,10 +4975,12 @@ name = "roe-agent"
 version = "0.1.0"
 dependencies = [
  "cap-std",
+ "chrono",
  "dotenvy",
  "futures",
  "rig-agent",
  "rig-core",
+ "rmcp",
  "roe-api",
  "roe-model",
  "roe-parser",
@@ -4996,7 +5049,7 @@ dependencies = [
  "charts-rs",
  "image",
  "parley",
- "resvg",
+ "resvg 0.47.0",
  "roe-model",
  "roe-parser",
  "roe-polars-bridge",
@@ -5059,7 +5112,7 @@ dependencies = [
  "image",
  "keyframe",
  "parley",
- "resvg",
+ "resvg 0.47.0",
  "roe-core",
  "roe-model",
  "rstar",
@@ -5157,7 +5210,7 @@ dependencies = [
  "parley",
  "ratex-types",
  "regex",
- "resvg",
+ "resvg 0.47.0",
  "roe-core",
  "roe-formula",
  "roe-impress",
@@ -5381,6 +5434,7 @@ version = "1.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "687274d293b6cdc6e73e0fee520bf2049650090d7164f87672d212a3c530cf4a"
 dependencies = [
+ "chrono",
  "dyn-clone",
  "ref-cast",
  "schemars_derive",
@@ -6429,8 +6483,8 @@ dependencies = [
  "base64 0.22.1",
  "data-url",
  "flate2",
- "fontdb",
- "imagesize",
+ "fontdb 0.23.0",
+ "imagesize 0.14.0",
  "kurbo",
  "log",
  "pico-args",
@@ -6442,6 +6496,33 @@ dependencies = [
  "svgtypes",
  "tiny-skia-path",
  "ttf-parser",
+ "unicode-bidi",
+ "unicode-script",
+ "unicode-vo",
+ "xmlwriter",
+]
+
+[[package]]
+name = "usvg"
+version = "0.48.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "977d0a4abdef933f424a99fe09f95576e089b90aebc6f016a3bc813762493e91"
+dependencies = [
+ "base64 0.23.1",
+ "data-url",
+ "fontdb 0.24.0",
+ "harfrust 0.12.0",
+ "imagesize 0.15.0",
+ "kurbo",
+ "log",
+ "pico-args",
+ "roxmltree 0.21.1",
+ "simplecss",
+ "siphasher",
+ "skrifa 0.44.0",
+ "strict-num",
+ "svgtypes",
+ "tiny-skia-path",
  "unicode-bidi",
  "unicode-script",
  "unicode-vo",

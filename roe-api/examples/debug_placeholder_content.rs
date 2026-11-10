@@ -26,7 +26,8 @@ fn main() {
                         ShapeContent::Table(_) => "Table".to_string(),
                         ShapeContent::Image(_) => "Image".to_string(),
                         ShapeContent::Chart(_) => "Chart".to_string(),
-                        ShapeContent::Group(children) => format!("Group({} children)", children.len()),
+                        ShapeContent::StatChart(_) => "StatChart".to_string(),
+                        ShapeContent::Group { children, .. } => format!("Group({} children)", children.len()),
                     };
                     println!("  shape_id={} {} content={}", s.id, ph_desc, text_desc);
                 }

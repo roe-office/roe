@@ -13,6 +13,7 @@ pub mod tile;
 pub mod tile_formula;
 pub mod char_format;
 pub mod find_replace;
+pub mod tracked;
 pub(crate) mod headerfooter;
 
 pub use font_registry::FontRegistry;

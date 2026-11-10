@@ -6,6 +6,9 @@
 pub static DF_API_META: &[(&str, &str, &str, &str, bool)] = &[
     ("df_load_sheet", "sheet_idx: i64", "String",
      r##"把第 sheet_idx 个 sheet 载入为工作 DataFrame,后续 df_* 变换都作用于它。返回 "ok" 或 "err:..."(df_ 函数出错不抛异常,要检查返回值前缀)。典型流程: df_load_sheet(0) → df_groupby_agg / df_with_column 等变换 → df_to_sheet("汇总") 写入新 sheet"##, true),
+    ("df_sheet_tables", "", "String", r##"列出各 sheet 对应的 SQL 表名,返回 JSON 数组 [{"sheet","table"}]。表名规则同 df_register_sheets"##, true),
+    ("df_register_sheets", "sql: String", "String",
+     r##"把 SQL 里用到的 sheet 转成数据集(表名=sheet 名,非字母数字下划线换成 _,数字开头加 _ 前缀),同名覆盖。返回 JSON 数组 [{"sheet","table","cols"}],失败返回 "err:..."。之后用 df_sql_ds(sql) 查询,可多 sheet JOIN。典型: let sql = "SELECT * FROM 销售 JOIN 客户 ON 销售.id = 客户.id"; df_register_sheets(sql); df_sql_ds(sql)"##, true),
     ("df_load_file", "path: String", "String", "按路径加载文件为工作 DataFrame(只读环境不可用)", false),
     ("df_load_csv", "path: String, delimiter: String, has_header: bool", "String", "加载 CSV 文件(只读环境不可用)", false),
     ("df_load_csv_cached", "path: String, delimiter: String, has_header: bool", "String", "加载 CSV 文件并缓存(只读环境不可用)", false),

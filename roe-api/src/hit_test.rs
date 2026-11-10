@@ -101,7 +101,7 @@ pub(crate) fn hit_test_in_entry(
         }
 
         // 用全局 y 坐标定位落在哪个 frame
-        let target_fid = locate_frame_by_y_global(arena, &all_frame_ids, y);
+        let target_fid = locate_frame_at(arena, &all_frame_ids, x, y);
         let frame = &arena.frames[target_fid];
 
         // 在 frame 内用相对 y 坐标定位具体行（y_on_page 现在是全局坐标）。
@@ -122,7 +122,9 @@ pub(crate) fn hit_test_in_entry(
 
         // v95修复：额外算出这一行文字在页面上的绝对起始x坐标（page.margin_left +
         // line.text_x_offset），随其他字段一起带出闭包，供第二阶段做坐标系换算用。
-        let line_abs_x_start = arena.pages[frame.page].margin_left + line.text_x_offset;
+        let col_x_offset = arena.pages[frame.page].columns.col_x_offsets
+            .get(frame.column_index).copied().unwrap_or(0.0);
+        let line_abs_x_start = arena.pages[frame.page].margin_left + col_x_offset + line.text_x_offset;
 
         (line.text.clone(), line.runs.clone(), line.ascent, offset_before_line, frame.para_index, bytes_before, line_abs_x_start)
     };
@@ -171,6 +173,40 @@ pub(crate) fn hit_test_in_entry(
         "{{\"para_index\":{},\"char_offset\":{}}}",
         para_index, char_offset
     ))
+}
+
+/// 按 (x, y) 在所有 frame 中挑最合适的一个：分栏文档里同一高度有多个栏，
+/// 只看 y 会永远选中左栏。
+/// 借鉴 WordCraft（Apache-2.0，v0.13.2 / 2be33e6）crates/layout/src/hit.rs 的 score：
+/// 垂直距离权重 4、水平距离权重 1，水平方向留 4pt 容差。单栏文档下与按 y 定位等价
+/// （段落间空隙改为选距离更近的一段）。
+pub(crate) fn locate_frame_at(
+    arena: &FrameArena,
+    frame_ids: &[roe_core::arena::FrameId],
+    x: f32,
+    y: f32,
+) -> roe_core::arena::FrameId {
+    debug_assert!(!frame_ids.is_empty());
+    let mut best = frame_ids[0];
+    let mut best_score = f32::MAX;
+    for &fid in frame_ids {
+        let f = &arena.frames[fid];
+        let page = &arena.pages[f.page];
+        let top = f.y_on_page;
+        let bottom = top + f.height();
+        let dy = if y < top { top - y } else if y >= bottom { y - bottom } else { 0.0 };
+        let cx = page.columns.col_x_offsets.get(f.column_index).copied().unwrap_or(0.0);
+        let cw = page.columns.col_widths.get(f.column_index).copied().unwrap_or_else(|| page.content_width());
+        let left = page.margin_left + cx;
+        let right = left + cw;
+        let dx = if x < left - 4.0 { left - 4.0 - x } else if x > right + 4.0 { x - right - 4.0 } else { 0.0 };
+        let s = dy * 4.0 + dx;
+        if s < best_score {
+            best_score = s;
+            best = fid;
+        }
+    }
+    best
 }
 
 /// 在所有 frame 中，按全局 y 坐标定位命中的 frame。

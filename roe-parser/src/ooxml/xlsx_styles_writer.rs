@@ -86,7 +86,7 @@ fn builtin_num_fmt_id(fmt: &str) -> Option<u32> {
         "#,##0.00;[Red](#,##0.00)" => Some(40),
         "mm:ss" => Some(45),
         "[h]:mm:ss" => Some(46),
-        "mmss.0" => Some(47),
+        "mm:ss.0" | "mmss.0" => Some(47),
         "##0.0E+0" => Some(48),
         "@" => Some(49),
         _ => None,

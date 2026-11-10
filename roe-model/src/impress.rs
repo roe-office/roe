@@ -307,6 +307,12 @@ pub struct ChartSeries {
     /// 该系列带线性趋势线（<c:trendline> 且 trendlineType=linear）。
     #[serde(default)]
     pub trendline: bool,
+    /// 散点/气泡图的数值型 X(xVal 全为数字时才有);None 时渲染用 1 起的序号。
+    #[serde(default)]
+    pub x_values: Option<Vec<f64>>,
+    /// 气泡图每点大小(bubbleSize);None 表示普通系列。
+    #[serde(default)]
+    pub sizes: Option<Vec<f64>>,
 }
 
 /// OOXML `<c:grouping>`：系列的分组方式。
@@ -331,6 +337,8 @@ pub enum ChartKind {
     Radar,
     Area,
     Doughnut,
+    /// 股票图(stockChart):4 个系列依次为开、高、低、收,类目为日期。
+    Stock,
 }
 
 /// OOXML `<c:dLblPos>`：数据标签位置。
@@ -360,6 +368,15 @@ pub struct DataLabels {
     pub explicit: bool,
     #[serde(default)]
     pub position: DataLabelPos,
+}
+
+/// 图例位置(OOXML `<c:legendPos>` 的 t/b/l/r)。ChartModel.legend_pos 为 None 表示未指定。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LegendPos {
+    Top,
+    Bottom,
+    Left,
+    Right,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -424,6 +441,9 @@ pub struct ChartModel {
     /// OOXML `<c:dLbls>`：数据标签（是否显示数值 + 位置）。旧数据默认不显示。
     #[serde(default)]
     pub data_labels: DataLabels,
+    /// 图例位置;None=未指定(渲染走 charts-rs 默认顶部,存盘按图型默认)。
+    #[serde(default)]
+    pub legend_pos: Option<LegendPos>,
 }
 
 fn default_chart_size() -> f32 { 300.0 }

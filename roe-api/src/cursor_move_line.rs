@@ -29,7 +29,7 @@ use roe_writer::line_shape::{char_offset_to_x, x_to_char_offset};
 use crate::cursor::RoeLocation;
 use crate::error::set_last_error;
 use crate::handle;
-use crate::hit_test::{locate_frame_by_y_global, locate_line_by_y};
+use crate::hit_test::{locate_frame_at, locate_frame_by_y_global, locate_line_by_y};
 
 /// 跨行移动方向。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -212,7 +212,7 @@ fn move_line_in_entry(
             return Err("文档没有任何段落".to_string());
         }
 
-        let target_fid = locate_frame_by_y_global(arena, &all_frame_ids, target_y);
+        let target_fid = locate_frame_at(arena, &all_frame_ids, ideal_x, target_y);
         let frame = &arena.frames[target_fid];
         let y_in_frame = (target_y - frame.y_on_page).max(0.0);
         let (line, offset_before_line) = locate_line_by_y(frame, y_in_frame);
@@ -234,7 +234,9 @@ fn move_line_in_entry(
         // 系统性地把落点钳到行尾字符——这正是 v97 会话中发现的"上下键后
         // 落到字符上/行尾/污染后续左右键"现象的根因。这里补上换算，与
         // hit_test.rs 完全对称。
-        let line_abs_x_start = arena.pages[frame.page].margin_left + line.text_x_offset;
+        let col_x_offset = arena.pages[frame.page].columns.col_x_offsets
+            .get(frame.column_index).copied().unwrap_or(0.0);
+        let line_abs_x_start = arena.pages[frame.page].margin_left + col_x_offset + line.text_x_offset;
 
         (
             frame.para_index,

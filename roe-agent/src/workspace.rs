@@ -12,7 +12,7 @@
 //! 目录结构（v1 设计文档 三、3.2）：
 //!   <workspace_root>/
 //!   ├── media/     媒体资产（图片等），按内容哈希命名（CAS，见 ingest 模块）
-//!   ├── exports/   AI 产物（保留原文件名，重名自动加序号）
+//!   ├── exports/   AI 产物（命名为 名称_MMDD_vN，不覆盖旧文件）
 //!   └── inputs/    用户上传的文档（保留原文件名）
 
 use std::io;
@@ -220,7 +220,8 @@ impl WorkspaceContext {
     }
 
     /// 把字节写入 inputs/ 或 exports/ 下的指定文件名（保留原名）。
-    /// 重名时自动加序号："a.xlsx" -> "a (1).xlsx"；用 create_new 打开，绝不覆盖已有文件。
+    /// inputs 重名时自动加序号："a.xlsx" -> "a (1).xlsx"；exports 改走 write_file_versioned（名称_MMDD_vN）。
+    /// 用 create_new 打开，绝不覆盖已有文件。
     /// 返回实际写入的虚拟路径。
     pub fn write_file(
         &self,
@@ -232,6 +233,10 @@ impl WorkspaceContext {
             return Err(WorkspaceError::InvalidDirectory(dir.to_string()));
         }
         Self::check_file_name(file_name)?;
+        if dir == EXPORTS_DIR {
+            let mmdd = chrono::Local::now().format("%m%d").to_string();
+            return self.write_file_versioned(dir, file_name, bytes, &mmdd);
+        }
         let (stem, ext) = match file_name.rfind('.') {
             Some(i) if i > 0 => (&file_name[..i], &file_name[i..]),
             _ => (file_name, ""),
@@ -264,6 +269,111 @@ impl WorkspaceContext {
             }
         }
         Err(WorkspaceError::TooManyDuplicates(file_name.to_string()))
+    }
+
+    /// 去掉文件名主干末尾已有的 "_MMDD_vN" 后缀，避免叠加成 "报表_0329_v2_0330_v1"。
+    fn strip_version_suffix(stem: &str) -> &str {
+        if let Some(i) = stem.rfind("_v") {
+            let n = &stem[i + 2..];
+            if !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()) {
+                let head = &stem[..i];
+                if let Some(j) = head.rfind('_') {
+                    let d = &head[j + 1..];
+                    if d.len() == 4 && d.chars().all(|c| c.is_ascii_digit()) {
+                        return &head[..j];
+                    }
+                }
+            }
+        }
+        stem
+    }
+
+    /// AI 产物命名："报表.xlsx" -> "报表_1105_v1.xlsx"，重名则 v2、v3…；
+    /// 隔天日期变了从 v1 重新开始。mmdd 由调用方传入（测试可固定日期）。绝不覆盖已有文件。
+    pub fn write_file_versioned(
+        &self,
+        dir: &str,
+        file_name: &str,
+        bytes: &[u8],
+        mmdd: &str,
+    ) -> Result<String, WorkspaceError> {
+        if dir != INPUTS_DIR && dir != EXPORTS_DIR {
+            return Err(WorkspaceError::InvalidDirectory(dir.to_string()));
+        }
+        Self::check_file_name(file_name)?;
+        let (stem, ext) = match file_name.rfind('.') {
+            Some(i) if i > 0 => (&file_name[..i], &file_name[i..]),
+            _ => (file_name, ""),
+        };
+        let base = Self::strip_version_suffix(stem);
+        for n in 1..1000u32 {
+            let candidate = format!("{base}_{mmdd}_v{n}{ext}");
+            let rel = format!("{dir}/{candidate}");
+            let mut opts = cap_std::fs::OpenOptions::new();
+            opts.write(true).create_new(true);
+            match self.root.open_with(&rel, &opts) {
+                Ok(mut f) => {
+                    let virtual_path = format!("/{rel}");
+                    f.write_all(bytes).map_err(|source| WorkspaceError::WriteFailed {
+                        virtual_path: virtual_path.clone(),
+                        source,
+                    })?;
+                    return Ok(virtual_path);
+                }
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(source) => {
+                    return Err(WorkspaceError::WriteFailed {
+                        virtual_path: format!("/{rel}"),
+                        source,
+                    })
+                }
+            }
+        }
+        Err(WorkspaceError::TooManyDuplicates(file_name.to_string()))
+    }
+
+    /// 在 exports/ 下新建文件夹 "名称_MMDD_vN"(重名则 N 递增,绝不复用已有文件夹),返回虚拟路径。
+    pub fn create_export_dir(&self, base: &str) -> Result<String, WorkspaceError> {
+        Self::check_file_name(base)?;
+        let mmdd = chrono::Local::now().format("%m%d").to_string();
+        let base = Self::strip_version_suffix(base);
+        for n in 1..1000u32 {
+            let rel = format!("{EXPORTS_DIR}/{base}_{mmdd}_v{n}");
+            match self.root.create_dir(&rel) {
+                Ok(()) => return Ok(format!("/{rel}")),
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(source) => {
+                    return Err(WorkspaceError::WriteFailed { virtual_path: format!("/{rel}"), source })
+                }
+            }
+        }
+        Err(WorkspaceError::TooManyDuplicates(base.to_string()))
+    }
+
+    /// 往 create_export_dir 建好的文件夹里写文件(create_new,绝不覆盖)。dir 必须形如 /exports/xxx。
+    pub fn write_into_export_dir(
+        &self,
+        dir: &str,
+        file_name: &str,
+        bytes: &[u8],
+    ) -> Result<String, WorkspaceError> {
+        let prefix = format!("/{EXPORTS_DIR}/");
+        let sub = dir
+            .strip_prefix(prefix.as_str())
+            .filter(|s| !s.is_empty() && !s.contains('/') && !s.contains('\\') && *s != "." && *s != "..")
+            .ok_or_else(|| WorkspaceError::InvalidDirectory(dir.to_string()))?;
+        Self::check_file_name(file_name)?;
+        let rel = format!("{EXPORTS_DIR}/{sub}/{file_name}");
+        let mut opts = cap_std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        let virtual_path = format!("/{rel}");
+        let mut f = self
+            .root
+            .open_with(&rel, &opts)
+            .map_err(|source| WorkspaceError::WriteFailed { virtual_path: virtual_path.clone(), source })?;
+        f.write_all(bytes)
+            .map_err(|source| WorkspaceError::WriteFailed { virtual_path: virtual_path.clone(), source })?;
+        Ok(virtual_path)
     }
 
     /// 列出 media/、inputs/ 或 exports/ 下的文件（不含子目录），按文件名排序。
@@ -322,6 +432,18 @@ impl WorkspaceContext {
 impl roe_script::media_context::MediaAssetSource for WorkspaceContext {
     fn read_media(&self, virtual_path: &str) -> Result<Vec<u8>, String> {
         self.read(virtual_path).map_err(|e| e.to_string())
+    }
+
+    fn write_export(&self, file_name: &str, bytes: &[u8]) -> Result<String, String> {
+        self.write_file(EXPORTS_DIR, file_name, bytes).map_err(|e| e.to_string())
+    }
+
+    fn begin_export_dir(&self, base: &str) -> Result<String, String> {
+        self.create_export_dir(base).map_err(|e| e.to_string())
+    }
+
+    fn write_export_file(&self, dir: &str, file_name: &str, bytes: &[u8]) -> Result<String, String> {
+        self.write_into_export_dir(dir, file_name, bytes).map_err(|e| e.to_string())
     }
 }
 
@@ -425,19 +547,33 @@ mod tests_files {
     #[test]
     fn write_keeps_name_and_dedups_with_serial() {
         let (_d, ctx) = ws();
-        assert_eq!(ctx.write_file("exports", "报表.xlsx", b"1").unwrap(), "/exports/报表.xlsx");
-        assert_eq!(ctx.write_file("exports", "报表.xlsx", b"2").unwrap(), "/exports/报表 (1).xlsx");
-        assert_eq!(ctx.write_file("exports", "报表.xlsx", b"3").unwrap(), "/exports/报表 (2).xlsx");
-        assert_eq!(ctx.read("/exports/报表.xlsx").unwrap(), b"1");
-        assert_eq!(ctx.read("/exports/报表 (1).xlsx").unwrap(), b"2");
+        assert_eq!(ctx.write_file("inputs", "报表.xlsx", b"1").unwrap(), "/inputs/报表.xlsx");
+        assert_eq!(ctx.write_file("inputs", "报表.xlsx", b"2").unwrap(), "/inputs/报表 (1).xlsx");
+        assert_eq!(ctx.write_file("inputs", "报表.xlsx", b"3").unwrap(), "/inputs/报表 (2).xlsx");
+        assert_eq!(ctx.read("/inputs/报表.xlsx").unwrap(), b"1");
+        assert_eq!(ctx.read("/inputs/报表 (1).xlsx").unwrap(), b"2");
+    }
+
+    #[test]
+    fn exports_use_date_and_version() {
+        let (_d, ctx) = ws();
+        let p = |name: &str, day: &str| ctx.write_file_versioned("exports", name, b"x", day).unwrap();
+        assert_eq!(p("报表.xlsx", "0329"), "/exports/报表_0329_v1.xlsx");
+        assert_eq!(p("报表.xlsx", "0329"), "/exports/报表_0329_v2.xlsx");
+        // 带旧后缀不叠加，版本接着往上
+        assert_eq!(p("报表_0329_v2.xlsx", "0329"), "/exports/报表_0329_v3.xlsx");
+        // 隔天从 v1 重新开始，旧后缀被换成新日期
+        assert_eq!(p("报表_0329_v3.xlsx", "0330"), "/exports/报表_0330_v1.xlsx");
+        // 无扩展名
+        assert_eq!(p("README", "0329"), "/exports/README_0329_v1");
     }
 
     #[test]
     fn list_skips_office_lock_files() {
         let (_d, ctx) = ws();
-        ctx.write_file("exports", "a.xlsx", b"x").unwrap();
-        ctx.write_file("exports", ".~lock.a.xlsx#", b"lock").unwrap();
-        let names: Vec<String> = ctx.list("exports").unwrap().into_iter().map(|e| e.name).collect();
+        ctx.write_file("inputs", "a.xlsx", b"x").unwrap();
+        ctx.write_file("inputs", ".~lock.a.xlsx#", b"lock").unwrap();
+        let names: Vec<String> = ctx.list("inputs").unwrap().into_iter().map(|e| e.name).collect();
         assert_eq!(names, vec!["a.xlsx".to_string()], "锁文件不应出现在 list 结果里");
     }
 
@@ -485,10 +621,33 @@ mod tests_files {
         let (_d, ctx) = ws();
         let vp = ctx.write_file("exports", "out.xlsx", b"x").unwrap();
         let pp = ctx.physical_path(&vp).unwrap();
-        assert_eq!(pp, ctx.physical_root().join("exports/out.xlsx"));
+        assert_eq!(pp, ctx.physical_root().join(vp.trim_start_matches('/')));
+        assert!(vp.starts_with("/exports/out_") && vp.ends_with("_v1.xlsx"), "{vp}");
         assert!(pp.is_file());
         assert!(matches!(ctx.physical_path("/exports/none.xlsx"), Err(WorkspaceError::PathNotFound(_))));
         assert!(matches!(ctx.physical_path("/exports/../../etc/passwd"), Err(WorkspaceError::PathNotFound(_))));
-        assert!(matches!(ctx.physical_path("exports/out.xlsx"), Err(WorkspaceError::InvalidVirtualPath(_))));
+        assert!(matches!(ctx.physical_path("exports/out_x.xlsx"), Err(WorkspaceError::InvalidVirtualPath(_))));
+    }
+}
+
+#[cfg(test)]
+mod export_dir_tests {
+    use super::*;
+
+    #[test]
+    fn export_dir_versioned_and_files_inside() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let ws = WorkspaceContext::open_or_create(dir.path()).expect("open");
+        let d1 = ws.create_export_dir("封面").unwrap();
+        let d2 = ws.create_export_dir("封面").unwrap();
+        assert!(d1.starts_with("/exports/封面_") && d1.ends_with("_v1"), "{d1}");
+        assert!(d2.ends_with("_v2"), "{d2}");
+        let p = ws.write_into_export_dir(&d1, "page1.png", b"x").unwrap();
+        assert_eq!(p, format!("{d1}/page1.png"));
+        assert!(ws.write_into_export_dir(&d1, "page1.png", b"y").is_err(), "不能覆盖");
+        assert!(ws.write_into_export_dir("/exports", "a.png", b"x").is_err());
+        assert!(ws.write_into_export_dir("/exports/../x", "a.png", b"x").is_err());
+        assert!(ws.write_into_export_dir("/inputs/a", "a.png", b"x").is_err());
+        assert!(ws.create_export_dir("a/b").is_err());
     }
 }

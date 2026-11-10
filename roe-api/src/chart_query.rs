@@ -154,54 +154,75 @@ pub extern "C" fn roe_get_chart_rect(handle: u64, sheet_idx: u32, chart_id: u64)
 #[no_mangle]
 pub extern "C" fn roe_get_chart_config(handle: u64, sheet_idx: u32, chart_id: u64) -> *mut c_char {
     let json = with_sheet(handle, sheet_idx, "roe_get_chart_config", |sheet| {
-        // 统计图(chartEx)只暴露与普通图共有的三项;"stat":true 供前台置灰其余控件
+        // 统计图(chartEx)只暴露与普通图共有的几项;"stat":true 供前台置灰其余控件
         if let Some(sc) = sheet.floating_stat_charts.iter().find(|c| c.id == chart_id) {
-            let m = &sc.model;
-            let title = match &m.title {
-                Some(t) => serde_json::to_string(t).unwrap_or_else(|_| "null".to_string()),
-                None => "null".to_string(),
-            };
-            return Ok(format!(
-                "{{\"id\":{},\"stat\":true,\"kind\":\"{:?}\",\"title\":{},\"show_legend\":{},\"show_grid\":{}}}",
-                sc.id, m.kind, title, m.show_legend, m.show_grid
-            ));
+            return Ok(stat_chart_config_json(sc.id, &sc.model));
         }
         let chart = find_chart(sheet, chart_id)
             .ok_or_else(|| format!("chart_id={chart_id} 不存在"))?;
-        let kind_str = match chart.kind {
-            roe_model::impress::ChartKind::Bar => "Bar",
-            roe_model::impress::ChartKind::HorizontalBar => "HorizontalBar",
-            roe_model::impress::ChartKind::Line => "Line",
-            roe_model::impress::ChartKind::Pie => "Pie",
-            roe_model::impress::ChartKind::Scatter => "Scatter",
-            roe_model::impress::ChartKind::Radar => "Radar",
-            roe_model::impress::ChartKind::Area => "Area",
-            roe_model::impress::ChartKind::Doughnut => "Doughnut",
-        };
-        let opt_f32 = |o: Option<f32>| o.map(|v| format!("{:.2}", v)).unwrap_or_else(|| "null".to_string());
-        #[allow(unreachable_patterns)]
-        let grouping_str = match chart.grouping {
-            roe_model::impress::ChartGrouping::Standard => "Standard",
-            roe_model::impress::ChartGrouping::Stacked => "Stacked",
-            roe_model::impress::ChartGrouping::PercentStacked => "PercentStacked",
-            _ => "Standard",
-        };
-        let title_json = serde_json::to_string(&chart.title).unwrap_or_else(|_| "null".to_string());
-        let x_label_json = serde_json::to_string(&chart.x_axis_label).unwrap_or_else(|_| "\"\"".to_string());
-        let y_label_json = serde_json::to_string(&chart.y_axis_label).unwrap_or_else(|_| "\"\"".to_string());
-        Ok(format!(
-            "{{\"id\":{},\"kind\":\"{}\",\"title\":{},\"x_pt\":{:.2},\"y_pt\":{:.2},\"width_pt\":{:.2},\"height_pt\":{:.2},\"show_legend\":{},\"show_grid\":{},\"x_axis_label\":{},\"y_axis_label\":{},\"border_color\":\"{}\",\"border_width\":{:.2},\"grouping\":\"{}\",\"show_val\":{},\"gap_width_pct\":{},\"overlap_pct\":{},\"hole_size_pct\":{}}}",
-            chart.id, kind_str, title_json, chart.x_pt, chart.y_pt, chart.width_pt, chart.height_pt,
-            chart.show_legend, chart.show_grid, x_label_json, y_label_json,
-            color_to_hex(&chart.border_color), chart.border_width,
-            grouping_str, chart.data_labels.show_val,
-            opt_f32(chart.gap_width_pct), opt_f32(chart.overlap_pct), opt_f32(chart.hole_size_pct)
-        ))
+        Ok(chart_config_json(chart))
     });
     match json {
         Some(j) => json_to_cstring(j, "roe_get_chart_config"),
         None => std::ptr::null_mut(),
     }
+}
+
+/// 统计图配置 JSON(Calc/Impress/Writer 共用)。Writer 内联图无 id,调用方自行传值。
+pub(crate) fn stat_chart_config_json(id: u64, m: &roe_model::stat_chart::StatChartModel) -> String {
+    let title = match &m.title {
+        Some(t) => serde_json::to_string(t).unwrap_or_else(|_| "null".to_string()),
+        None => "null".to_string(),
+    };
+    format!(
+        "{{\"id\":{},\"stat\":true,\"kind\":\"{:?}\",\"title\":{},\"show_legend\":{},\"show_grid\":{},\"legend_pos\":{}}}",
+        id, m.kind, title, m.show_legend, m.show_grid,
+        match m.legend_pos.as_deref() {
+            Some("t") => "\"Top\"", Some("b") => "\"Bottom\"",
+            Some("l") => "\"Left\"", Some("r") => "\"Right\"", _ => "null",
+        }
+    )
+}
+
+/// 普通图配置 JSON(Calc/Impress/Writer 共用)。
+pub(crate) fn chart_config_json(chart: &roe_model::impress::ChartModel) -> String {
+    let kind_str = match chart.kind {
+        roe_model::impress::ChartKind::Bar => "Bar",
+        roe_model::impress::ChartKind::HorizontalBar => "HorizontalBar",
+        roe_model::impress::ChartKind::Line => "Line",
+        roe_model::impress::ChartKind::Pie => "Pie",
+        roe_model::impress::ChartKind::Scatter => "Scatter",
+        roe_model::impress::ChartKind::Radar => "Radar",
+        roe_model::impress::ChartKind::Area => "Area",
+        roe_model::impress::ChartKind::Doughnut => "Doughnut",
+        roe_model::impress::ChartKind::Stock => "Stock",
+    };
+    let opt_f32 = |o: Option<f32>| o.map(|v| format!("{:.2}", v)).unwrap_or_else(|| "null".to_string());
+    #[allow(unreachable_patterns)]
+    let grouping_str = match chart.grouping {
+        roe_model::impress::ChartGrouping::Standard => "Standard",
+        roe_model::impress::ChartGrouping::Stacked => "Stacked",
+        roe_model::impress::ChartGrouping::PercentStacked => "PercentStacked",
+        _ => "Standard",
+    };
+    let title_json = serde_json::to_string(&chart.title).unwrap_or_else(|_| "null".to_string());
+    let x_label_json = serde_json::to_string(&chart.x_axis_label).unwrap_or_else(|_| "\"\"".to_string());
+    let y_label_json = serde_json::to_string(&chart.y_axis_label).unwrap_or_else(|_| "\"\"".to_string());
+    format!(
+        "{{\"id\":{},\"kind\":\"{}\",\"title\":{},\"x_pt\":{:.2},\"y_pt\":{:.2},\"width_pt\":{:.2},\"height_pt\":{:.2},\"show_legend\":{},\"show_grid\":{},\"x_axis_label\":{},\"y_axis_label\":{},\"border_color\":\"{}\",\"border_width\":{:.2},\"grouping\":\"{}\",\"show_val\":{},\"gap_width_pct\":{},\"overlap_pct\":{},\"hole_size_pct\":{},\"legend_pos\":{}}}",
+        chart.id, kind_str, title_json, chart.x_pt, chart.y_pt, chart.width_pt, chart.height_pt,
+        chart.show_legend, chart.show_grid, x_label_json, y_label_json,
+        color_to_hex(&chart.border_color), chart.border_width,
+        grouping_str, chart.data_labels.show_val,
+        opt_f32(chart.gap_width_pct), opt_f32(chart.overlap_pct), opt_f32(chart.hole_size_pct),
+        match chart.legend_pos {
+            Some(roe_model::impress::LegendPos::Top) => "\"Top\"",
+            Some(roe_model::impress::LegendPos::Bottom) => "\"Bottom\"",
+            Some(roe_model::impress::LegendPos::Left) => "\"Left\"",
+            Some(roe_model::impress::LegendPos::Right) => "\"Right\"",
+            None => "null",
+        }
+    )
 }
 
 /// 修改图表尺寸。成功返回 true，失败（含 chart_id 不存在）返回 false。
@@ -542,6 +563,7 @@ fn chart_kind_name(k: &roe_model::impress::ChartKind) -> &'static str {
         K::Radar => "Radar",
         K::Area => "Area",
         K::Doughnut => "Doughnut",
+        K::Stock => "Stock",
     }
 }
 
@@ -639,7 +661,7 @@ mod tests {
             grouping: roe_model::impress::ChartGrouping::Standard,
             hole_size_pct: None,
             data_labels: Default::default(),
-            slice_border_color: None,
+            slice_border_color: None, legend_pos: None,
         };
         let chart_id = 1u64;
         let mut chart = chart;

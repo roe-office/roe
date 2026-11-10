@@ -67,6 +67,8 @@ pub struct FormulaBoxPosition {
     pub y: f32,
     /// 盒子基线，相对盒子顶部（pt）。None时使用height（盒子底边即基线）。
     pub baseline: Option<f32>,
+    /// 公式盒子宽度（pt），光标定位用
+    pub width: f32,
 }
 
 /// WROOT-100（表格边框BorderStyle重构）：单条边框线的完整渲染信息，
@@ -173,6 +175,7 @@ pub struct LineBox {
     /// Option）：没有rStyle引用时，"不是上标"本身就是明确、无歧义的
     /// 默认值，不需要Option区分"未设置"和"设置为false"。
     pub list_label_superscript: bool,
+    pub list_label_bold: bool,
     /// v313：单元格行的来源（表格在body中的序号, 行, 列, 单元格内段落号）；正文行为None。
     /// 设计借鉴 WordCraft（Apache-2.0）的"每行带路径"思路。
     pub cell_ref: Option<(u32, u32, u32, u32)>,

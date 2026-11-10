@@ -34,6 +34,24 @@ fn with_doc<R, F: FnOnce(&mut WriterDocument) -> R>(f: F) -> Option<R> {
     })
 }
 
+thread_local! {
+    /// 修订作者：Some(作者) 表示脚本编辑记成修订；None 表示直接改文档。由 roe-api 在执行脚本前设置。
+    static TRACK_AUTHOR: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+pub fn set_track_author(a: Option<String>) {
+    TRACK_AUTHOR.with(|c| *c.borrow_mut() = a);
+}
+
+pub fn track_author() -> Option<String> {
+    TRACK_AUTHOR.with(|c| c.borrow().clone())
+}
+
+/// 修订上下文：(作者, 下一个修订 id, 当前时间)。未开启修订返回 None。
+fn track_ctx(doc: &WriterDocument) -> Option<(String, u32, String)> {
+    track_author().map(|a| (a, roe_writer::tracked::next_revision_id(doc), roe_writer::tracked::now_iso_utc()))
+}
+
 /// 写函数统一回报:Some(Ok)->"ok";Some(Err(m))->m(已带 err: 前缀);None(未绑定文档)->err。
 fn write_ret(r: Option<Result<(), String>>) -> String {
     match r {
@@ -118,10 +136,16 @@ pub fn register(engine: &mut Engine) {
 
     engine.register_fn("set_paragraph", |idx: i64, text: String| -> String {
         write_ret(with_doc(|doc| -> Result<(), String> {
+            let tctx = track_ctx(doc);
             let n = doc.body.len();
             match doc.body.get_mut(idx as usize) {
                 Some(BodyElement::Paragraph(p)) => {
-                    p.runs = vec![Run { text: text.clone(), ..Default::default() }];
+                    if let Some((a, mut id, d)) = tctx {
+                        roe_writer::tracked::tracked_set_paragraph_text(p, &text, &a, &mut id, &d)
+                            .map_err(|e| format!("err:{}", e))?;
+                    } else {
+                        p.runs = vec![Run { text: text.clone(), ..Default::default() }];
+                    }
                     Ok(())
                 }
                 Some(_) => Err(format!("err:body[{}] 不是段落(是表格/图表/形状)", idx)),
@@ -137,6 +161,10 @@ pub fn register(engine: &mut Engine) {
                 runs: vec![Run { text: text.clone(), ..Default::default() }],
                 ..Default::default()
             };
+            let mut para = para;
+            if let Some((a, mut id, d)) = track_ctx(doc) {
+                roe_writer::tracked::mark_new_paragraph(&mut para, &a, &mut id, &d);
+            }
             let pos = (idx.max(0) as usize).min(doc.body.len());
             doc.body.insert(pos, BodyElement::Paragraph(para));
             Ok(())
@@ -150,6 +178,10 @@ pub fn register(engine: &mut Engine) {
                 runs: vec![Run { text: text.clone(), ..Default::default() }],
                 ..Default::default()
             };
+            let mut para = para;
+            if let Some((a, mut id, d)) = track_ctx(doc) {
+                roe_writer::tracked::mark_new_paragraph(&mut para, &a, &mut id, &d);
+            }
             doc.body.push(BodyElement::Paragraph(para));
             Ok(())
         }))
@@ -506,7 +538,10 @@ pub fn register(engine: &mut Engine) {
         };
 
         let result = with_doc(|doc| {
-            roe_writer::find_replace::replace_text_in_document(doc, &regex, &replacement, para_range)
+            match track_author() {
+                Some(a) => roe_writer::tracked::tracked_replace_in_document(doc, &regex, &replacement, para_range, &a),
+                None => roe_writer::find_replace::replace_text_in_document(doc, &regex, &replacement, para_range),
+            }
         });
 
         match result {
@@ -1892,13 +1927,14 @@ fn register_read_fns(engine: &mut Engine) {
 
 /// 只读引擎用:只注册纯查询函数(13 个),不注册任何写函数。
 /// 只读函数白名单(与 register_read_fns 注册的名单一致,有测试守着)。
-pub(crate) const READ_FN_NAMES: [&str; 22] = [
+pub(crate) const READ_FN_NAMES: [&str; 23] = [
     "get_writer_formula",
     "paragraph_count", "get_paragraph", "get_paragraph_style", "list_paragraph_styles",
     "get_char_style", "list_char_styles", "get_char_format", "get_char_format_range",
     "get_paragraph_format", "get_frame_wrap", "section_count", "get_section", "save_docx",
     "inspect_document", "get_table_cell", "find_text",
     "get_page_setup", "get_header_footer", "get_comment_threads", "get_object_rotation", "get_writer_chart_json",
+    "list_revisions",
 ];
 
 #[cfg(test)]

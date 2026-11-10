@@ -22,6 +22,7 @@ impl ScriptEngine {
         crate::calc_df_api::register(&mut engine);
         crate::writer_api::register(&mut engine);
         crate::impress_api::register(&mut engine);
+        crate::export_queue::register(&mut engine);
         let print_buf = install_print_capture(&mut engine);
         engine.set_max_operations(MAX_SCRIPT_OPERATIONS);
         Self { engine, print_buf }

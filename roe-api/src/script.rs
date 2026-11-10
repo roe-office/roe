@@ -182,7 +182,11 @@ pub fn execute_script_impl(
             // 只读脚本:不推撤销快照、不标脏、不失效布局缓存(拿不准一律按写处理)
             let ro = roe_script::script_kind::is_readonly_script(roe_script::script_kind::Kind::Writer, script);
             calc_noop.set(ro);
-            engine.run_writer(script, doc).map(|ret| {
+            // v309: 脚本开始时修订一律为关，由脚本自己 set_track_changes(true/false)；执行完一定清零。
+            roe_script::writer_api::set_track_author(None);
+            let run_r = engine.run_writer(script, doc);
+            roe_script::writer_api::set_track_author(None);
+            run_r.map(|ret| {
                 if ro { (vec![], vec![], false, ret) } else { (vec![0usize], vec![], true, ret) }
             })
         }
@@ -253,6 +257,7 @@ pub fn readonly_query_script_impl(handle: u64, script: &str) -> Option<Result<Js
             RoeDocument::Calc(wb) => {
                 {
                     // 绑定 handle 持有的数据集容器(用户已加载的数据可 df_use);
+                    // 例外:df_register_sheets 会把 sheet 快照写入容器(只读语义:不改工作簿)。
                     // 只读引擎里写容器的函数已被桩覆盖,put 回去的内容不变。
                     let mut ds = handle::take_datasets(handle);
                     let r = engine.run_calc_ds(script, wb, &mut ds).map(|(_dirty, ret)| ret);
@@ -1127,9 +1132,15 @@ fn df_opts(opts_json: *const c_char) -> Result<serde_json::Value, String> {
     serde_json::from_str(&s).map_err(|e| format!("opts_json 解析失败: {e}"))
 }
 
-fn df_load_source(path: &str, kind: &str, opts: &serde_json::Value) -> Result<roe_polars_bridge::LoadedSource, String> {
+/// 从 opts_json 解析 CSV 的分隔符(None=自动探测)与是否有表头(默认 true)。
+fn df_csv_opts(opts: &serde_json::Value) -> (Option<char>, bool) {
     let delim = opts.get("delimiter").and_then(|v| v.as_str()).and_then(|s| s.chars().next());
     let has_header = opts.get("has_header").and_then(|v| v.as_bool()).unwrap_or(true);
+    (delim, has_header)
+}
+
+fn df_load_source(path: &str, kind: &str, opts: &serde_json::Value) -> Result<roe_polars_bridge::LoadedSource, String> {
+    let (delim, has_header) = df_csv_opts(opts);
     roe_polars_bridge::load_file_source(path, kind, delim, has_header, &roe_script::calc_df_api::csv_cache_dir())
         .map_err(|e| format!("{e}"))
 }
@@ -1139,6 +1150,19 @@ fn df_finish(r: Result<serde_json::Value, String>) -> *mut c_char {
         Ok(v) => { clear_last_error(); query_result_json(Ok(v)) }
         Err(e) => { set_last_error(e.clone()); query_result_json(Err(e)) }
     }
+}
+
+/// 前台:预热外部文件(xlsx 整表物化并落 IPC 缓存;csv/parquet 几乎瞬间)。不碰句柄,可在后台线程调用。
+/// 返回 {"ok":true}。之后 roe_df_register_file 命中缓存,注册只剩 scan。
+#[no_mangle]
+pub extern "C" fn roe_df_prepare_file(path: *const c_char, kind: *const c_char, opts_json: *const c_char) -> *mut c_char {
+    df_finish((|| {
+        let path = df_cstr_arg(path)?;
+        let kind = df_cstr_arg(kind)?;
+        let opts = df_opts(opts_json)?;
+        df_load_source(&path, &kind, &opts)?;
+        Ok(serde_json::json!({ "ok": true }))
+    })())
 }
 
 /// 前台:预览外部文件(只返回概览 JSON,不碰任何句柄/数据集容器)。
@@ -1151,6 +1175,11 @@ pub extern "C" fn roe_df_preview_file(path: *const c_char, kind: *const c_char, 
         let kind = df_cstr_arg(kind)?;
         let opts = df_opts(opts_json)?;
         let head = opts.get("head").and_then(|v| v.as_u64()).unwrap_or(10).min(1000) as u32;
+        if kind == "xlsx" && path.to_lowercase().ends_with(".xlsx") {
+            // xlsx 预览:流式只读前几行,不物化整表(xls/ods 仍走下面的整表路径)
+            let s = roe_polars_bridge::xlsx_preview_head(&path, head as usize).map_err(|e| format!("{e}"))?;
+            return serde_json::from_str::<serde_json::Value>(&s).map_err(|e| format!("预览解析失败: {e}"));
+        }
         let lf = df_load_source(&path, &kind, &opts)?.into_lazy();
         let s = roe_polars_bridge::lazy_overview(lf, head).map_err(|e| format!("{e}"))?;
         serde_json::from_str::<serde_json::Value>(&s).map_err(|e| format!("概览解析失败: {e}"))
@@ -1255,8 +1284,18 @@ mod df_open_tests {
         let pv = take(roe_df_preview_file(ps.as_ptr(), kind.as_ptr(), opts.as_ptr()));
         println!("preview => {pv}");
         assert_eq!(pv["ok"], true, "{pv}");
-        assert_eq!(pv["value"]["rows"], 3, "{pv}");
+        assert!(pv["value"].get("rows").is_none(), "csv 预览不应给总行数: {pv}");
+        assert_eq!(pv["value"]["preview_only"], true, "{pv}");
+        assert_eq!(pv["value"]["cols"], 2, "{pv}");
+        assert_eq!(pv["value"]["columns"][0]["dtype"], "String", "{pv}");
         assert_eq!(pv["value"]["head"]["rows"].as_array().unwrap().len(), 2, "{pv}");
+        // 预览不落 IPC 缓存:预览前后缓存目录的 .arrow 数量不变(此时尚未 register)
+        let arrow_count = || std::fs::read_dir(roe_script::calc_df_api::csv_cache_dir())
+            .map(|d| d.filter_map(|e| e.ok()).filter(|e| e.path().extension().map_or(false, |x| x == "arrow")).count())
+            .unwrap_or(0);
+        let n_before = arrow_count();
+        let _ = take(roe_df_preview_file(ps.as_ptr(), kind.as_ptr(), opts.as_ptr()));
+        assert_eq!(arrow_count(), n_before, "预览不应产生缓存文件");
 
         let h = crate::document::new_document_impl(2);
         let r1 = take(roe_df_register_file(h, ps.as_ptr(), kind.as_ptr(), std::ptr::null()));

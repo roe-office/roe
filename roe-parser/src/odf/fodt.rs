@@ -362,7 +362,7 @@ impl ParseCtx {
             }
             "list-style" => {
                 let name = attr(e, b"style:name").unwrap_or_default();
-                self.cur_list_style = Some(roe_model::writer::ListStyle { name, levels: Vec::new() });
+                self.cur_list_style = Some(roe_model::writer::ListStyle { name, levels: Vec::new(), ..Default::default() });
             }
             "list-level-style-number" if self.cur_list_style.is_some() => {
                 self.cur_list_level_num = attr(e, b"text:level").and_then(|v| v.parse::<u8>().ok());
@@ -385,7 +385,7 @@ impl ParseCtx {
                         prefix: self.cur_list_level_prefix.clone(),
                         suffix: self.cur_list_level_suffix.clone(),
                         start_value,
-                        display_levels,
+                        template: None, display_levels,
                         indent: self.cur_list_level_indent,
                     };
                     ls.levels.push(roe_model::writer::ListLevelStyle::Number(level));

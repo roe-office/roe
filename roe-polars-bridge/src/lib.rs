@@ -215,6 +215,14 @@ pub fn sheet_info(workbook: &Workbook, sheet_idx: usize) -> Result<String, Bridg
 // Sheet -> DataFrame
 // ════════════════════════════════════════════════════════════
 
+/// 公式单元格取缓存值(求值结果),其余原样返回。数据分析只关心结果,不关心公式原文。
+fn resolve_formula(v: CellValue) -> CellValue {
+    match v {
+        CellValue::Formula { cached, .. } => resolve_formula(*cached),
+        other => other,
+    }
+}
+
 /// Sheet -> DataFrame，第一行作为表头（列名）；剩余行为数据。
 /// 每列按内容自动判定为数值列（全部 Number/Empty）或文本列（其余情况，混合类型转文本）。
 pub fn sheet_to_dataframe(sheet: &Sheet) -> Result<DataFrame, BridgeError> {
@@ -226,12 +234,12 @@ pub fn sheet_to_dataframe(sheet: &Sheet) -> Result<DataFrame, BridgeError> {
 
     let mut columns: Vec<Column> = Vec::with_capacity(width as usize);
     for c in 0..width {
-        let header = match get_cell(&sheet.cells, 0, c) {
+        let header = match resolve_formula(get_cell(&sheet.cells, 0, c)) {
             CellValue::Text(s) if !s.is_empty() => s,
             _ => format!("col{}", c + 1),
         };
 
-        let cells: Vec<CellValue> = (1..height).map(|r| get_cell(&sheet.cells, r, c)).collect();
+        let cells: Vec<CellValue> = (1..height).map(|r| resolve_formula(get_cell(&sheet.cells, r, c))).collect();
         let all_numeric = cells
             .iter()
             .all(|v| matches!(v, CellValue::Number(_) | CellValue::Empty));
@@ -245,6 +253,89 @@ pub fn sheet_to_dataframe(sheet: &Sheet) -> Result<DataFrame, BridgeError> {
                 })
                 .collect();
             Series::new(header.as_str().into(), data)
+        } else {
+            let data: Vec<Option<String>> = cells.iter().map(cell_to_opt_string).collect();
+            Series::new(header.as_str().into(), data)
+        };
+        columns.push(series.into());
+    }
+
+    let data_height = height.saturating_sub(1) as usize;
+    Ok(DataFrame::new(data_height, columns)?)
+}
+
+/// 与 sheet_to_dataframe 相同,但按单元格数字格式识别日期列,转成 Polars Date/Datetime。
+/// 只给 SQL 路径用;透视等老路径继续用 sheet_to_dataframe(日期保持 f64),避免键的字符串化变化。
+pub fn sheet_to_dataframe_typed(sheet: &Sheet) -> Result<DataFrame, BridgeError> {
+    use roe_model::num_format_class::{classify_num_format, NumFormatClass};
+
+    let (height, width) = grid_dimensions(&sheet.cells);
+    if width == 0 {
+        return Ok(DataFrame::empty());
+    }
+    // 序列号 → Unix 纪元天数的偏移(1900 系统 25569,1904 系统 24107)
+    let offset: f64 = if sheet.date1904 { 24107.0 } else { 25569.0 };
+
+    let mut columns: Vec<Column> = Vec::with_capacity(width as usize);
+    for c in 0..width {
+        let header = match resolve_formula(get_cell(&sheet.cells, 0, c)) {
+            CellValue::Text(s) if !s.is_empty() => s,
+            _ => format!("col{}", c + 1),
+        };
+        let cells: Vec<CellValue> = (1..height).map(|r| resolve_formula(get_cell(&sheet.cells, r, c))).collect();
+        let all_numeric = cells
+            .iter()
+            .all(|v| matches!(v, CellValue::Number(_) | CellValue::Empty));
+
+        let series: Series = if all_numeric {
+            // 数据格里格式为日期类的占多数,才认定为日期列
+            let mut num_n = 0usize;
+            let mut date_n = 0usize;
+            for (i, v) in cells.iter().enumerate() {
+                if let CellValue::Number(_) = v {
+                    num_n += 1;
+                    let r = (i + 1) as u32;
+                    if let Some(f) = sheet.cell_formats.get(&(r, c)).and_then(|f| f.num_format.as_deref()) {
+                        if matches!(classify_num_format(f), NumFormatClass::Date | NumFormatClass::DateTime) {
+                            date_n += 1;
+                        }
+                    }
+                }
+            }
+            let is_date_col = num_n > 0 && date_n * 2 > num_n;
+            let has_time = cells
+                .iter()
+                .any(|v| matches!(v, CellValue::Number(n) if n.fract().abs() > 1e-9));
+
+            if is_date_col && has_time {
+                let data: Vec<Option<i64>> = cells
+                    .iter()
+                    .map(|v| match v {
+                        CellValue::Number(n) => Some(((*n - offset) * 86_400_000.0).round() as i64),
+                        _ => None,
+                    })
+                    .collect();
+                Series::new(header.as_str().into(), data)
+                    .cast(&DataType::Datetime(polars::prelude::TimeUnit::Milliseconds, None))?
+            } else if is_date_col {
+                let data: Vec<Option<i32>> = cells
+                    .iter()
+                    .map(|v| match v {
+                        CellValue::Number(n) => Some((n.floor() - offset) as i32),
+                        _ => None,
+                    })
+                    .collect();
+                Series::new(header.as_str().into(), data).cast(&DataType::Date)?
+            } else {
+                let data: Vec<Option<f64>> = cells
+                    .iter()
+                    .map(|v| match v {
+                        CellValue::Number(n) => Some(*n),
+                        _ => None,
+                    })
+                    .collect();
+                Series::new(header.as_str().into(), data)
+            }
         } else {
             let data: Vec<Option<String>> = cells.iter().map(cell_to_opt_string).collect();
             Series::new(header.as_str().into(), data)
@@ -285,8 +376,7 @@ pub fn compute_pivot_data_matrix(
     df: &DataFrame,
     row_fields: &[String],
     col_fields: &[String],
-    value_fields: &[PivotValueFieldSpec],
-) -> Result<roe_model::calc::PivotDataMatrix, BridgeError> {
+    value_fields: &[PivotValueFieldSpec], row_subtotals: bool, col_subtotals: bool) -> Result<roe_model::calc::PivotDataMatrix, BridgeError> {
     let mut matrix = roe_model::calc::PivotDataMatrix::default();
 
     let mut group_cols: Vec<String> = Vec::new();
@@ -337,140 +427,138 @@ pub fn compute_pivot_data_matrix(
         }
     }
 
-    // v151新增：行方向小计聚合（仅最外层，见 pivot_v2_insert_row_subtotals 注释）。
-    // 分组字段只用 row_fields 第一层 + 全部 col_fields，实现"该外层分组下所有子路径求和"。
-    // 写入 matrix 时 row_path 补齐到 row_fields.len() 长度：第0位=真实分组值，其余层补空字符串，
-    // 与树渲染层（tile.rs 第1015行左右）小计节点查值时的 path 构造方式保持一致约定。
-    if !row_fields.is_empty() {
-        let subtotal_group_cols: Vec<String> = {
-            let mut v = vec![row_fields[0].clone()];
-            v.extend(col_fields.iter().cloned());
-            v
-        };
-        let subtotal_group_exprs: Vec<Expr> = subtotal_group_cols.iter().map(|c| col(c.as_str())).collect();
+    // v337：行方向多级小计聚合。N 个行字段得 N-1 级：k=1..N-1，
+    // 分组字段 = row_fields[..k] + 全部 col_fields，
+    // 键 = 前缀 k 个值 + 一个空串（长度 k+1，与渲染层“小计路径=父路径+[""]”一致）。
+    // row_subtotals=false 时整块跳过（树里也不插小计节点）。
+    if row_subtotals && row_fields.len() >= 2 {
+        for k in 1..row_fields.len() {
+            let mut group_cols: Vec<String> = row_fields[..k].to_vec();
+            group_cols.extend(col_fields.iter().cloned());
+            let group_exprs: Vec<Expr> = group_cols.iter().map(|c| col(c.as_str())).collect();
 
-        for (vidx, vf) in value_fields.iter().enumerate() {
-            let agg_expr = build_agg_expr(&vf.source_column, &vf.agg);
-            let grouped = lf.clone()
-                .group_by(subtotal_group_exprs.clone())
-                .agg([agg_expr])
-                .collect()?;
+            for (vidx, vf) in value_fields.iter().enumerate() {
+                let agg_expr = build_agg_expr(&vf.source_column, &vf.agg);
+                let grouped = lf.clone()
+                    .group_by(group_exprs.clone())
+                    .agg([agg_expr])
+                    .collect()?;
 
-            let n_rows = grouped.height();
-            for i in 0..n_rows {
-                let outer_val = {
-                    let s = grouped.column(&row_fields[0])?;
-                    anyvalue_to_display_string(&s.get(i)?)
-                };
-                let mut row_path: Vec<String> = vec![String::new(); row_fields.len()];
-                row_path[0] = outer_val;
+                let n_rows = grouped.height();
+                for i in 0..n_rows {
+                    let mut row_path: Vec<String> = Vec::with_capacity(k + 1);
+                    for fname in row_fields[..k].iter() {
+                        let s = grouped.column(fname)?;
+                        row_path.push(anyvalue_to_display_string(&s.get(i)?));
+                    }
+                    row_path.push(String::new());
 
-                let mut col_path: Vec<String> = Vec::with_capacity(col_fields.len());
-                for fname in col_fields.iter() {
-                    let s = grouped.column(fname)?;
-                    col_path.push(anyvalue_to_display_string(&s.get(i)?));
+                    let mut col_path: Vec<String> = Vec::with_capacity(col_fields.len());
+                    for fname in col_fields.iter() {
+                        let s = grouped.column(fname)?;
+                        col_path.push(anyvalue_to_display_string(&s.get(i)?));
+                    }
+
+                    let result_col_name = format!("{}_agg", vf.source_column);
+                    let val_series = grouped.column(&result_col_name)
+                        .or_else(|_| grouped.column(&vf.source_column))?;
+                    if let AnyValue::Null = val_series.get(i)? {
+                        continue;
+                    }
+                    let val: f64 = val_series.get(i)?.try_extract::<f64>().unwrap_or(0.0);
+                    matrix.insert(row_path, col_path, vidx, val);
                 }
-
-                let result_col_name = format!("{}_agg", vf.source_column);
-                let val_series = grouped.column(&result_col_name)
-                    .or_else(|_| grouped.column(&vf.source_column))?;
-                if let AnyValue::Null = val_series.get(i)? {
-                    continue;
-                }
-                let val: f64 = val_series.get(i)?.try_extract::<f64>().unwrap_or(0.0);
-                matrix.insert(row_path, col_path, vidx, val);
             }
         }
     }
 
-    // v152：列方向小计聚合（仅最外层，对称于上面的行方向小计分支）。
-    // 分组字段只用 col_fields 第一层 + 全部 row_fields，实现"该外层列分组下
-    // 所有子路径求和"。写入 matrix 时 col_path 补齐到 col_fields.len() 长度：
-    // 第0位=真实分组值，其余层补空字符串；row_path 照常填满完整路径。
-    if !col_fields.is_empty() {
-        let col_subtotal_group_cols: Vec<String> = {
-            let mut v = vec![col_fields[0].clone()];
-            v.extend(row_fields.iter().cloned());
-            v
-        };
-        let col_subtotal_group_exprs: Vec<Expr> = col_subtotal_group_cols.iter().map(|c| col(c.as_str())).collect();
+    // v338：列方向多级小计聚合。M 个列字段得 M-1 级：kc=1..M-1，
+    // 分组 = col_fields[..kc] + 全部 row_fields，键 = 列前缀 kc 个值 + 一个空串（长度 kc+1），
+    // 与渲染层"小计路径=父路径+[""]"一致；行键为完整行路径。M=1 时无小计节点，整块跳过。
+    if col_subtotals && col_fields.len() >= 2 {
+        for kc in 1..col_fields.len() {
+            let mut group_cols: Vec<String> = col_fields[..kc].to_vec();
+            group_cols.extend(row_fields.iter().cloned());
+            let group_exprs: Vec<Expr> = group_cols.iter().map(|c| col(c.as_str())).collect();
 
-        for (vidx, vf) in value_fields.iter().enumerate() {
-            let agg_expr = build_agg_expr(&vf.source_column, &vf.agg);
-            let grouped = lf.clone()
-                .group_by(col_subtotal_group_exprs.clone())
-                .agg([agg_expr])
-                .collect()?;
+            for (vidx, vf) in value_fields.iter().enumerate() {
+                let agg_expr = build_agg_expr(&vf.source_column, &vf.agg);
+                let grouped = lf.clone()
+                    .group_by(group_exprs.clone())
+                    .agg([agg_expr])
+                    .collect()?;
 
-            let n_rows = grouped.height();
-            for i in 0..n_rows {
-                let outer_val = {
-                    let s = grouped.column(&col_fields[0])?;
-                    anyvalue_to_display_string(&s.get(i)?)
-                };
-                let mut col_path: Vec<String> = vec![String::new(); col_fields.len()];
-                col_path[0] = outer_val;
+                let n_rows = grouped.height();
+                for i in 0..n_rows {
+                    let mut col_path: Vec<String> = Vec::with_capacity(kc + 1);
+                    for fname in col_fields[..kc].iter() {
+                        let sc = grouped.column(fname)?;
+                        col_path.push(anyvalue_to_display_string(&sc.get(i)?));
+                    }
+                    col_path.push(String::new());
 
-                let mut row_path: Vec<String> = Vec::with_capacity(row_fields.len());
-                for fname in row_fields.iter() {
-                    let s = grouped.column(fname)?;
-                    row_path.push(anyvalue_to_display_string(&s.get(i)?));
+                    let mut row_path: Vec<String> = Vec::with_capacity(row_fields.len());
+                    for fname in row_fields.iter() {
+                        let sr = grouped.column(fname)?;
+                        row_path.push(anyvalue_to_display_string(&sr.get(i)?));
+                    }
+
+                    let result_col_name = format!("{}_agg", vf.source_column);
+                    let val_series = grouped.column(&result_col_name)
+                        .or_else(|_| grouped.column(&vf.source_column))?;
+                    if let AnyValue::Null = val_series.get(i)? {
+                        continue;
+                    }
+                    let val: f64 = val_series.get(i)?.try_extract::<f64>().unwrap_or(0.0);
+                    matrix.insert(row_path, col_path, vidx, val);
                 }
-
-                let result_col_name = format!("{}_agg", vf.source_column);
-                let val_series = grouped.column(&result_col_name)
-                    .or_else(|_| grouped.column(&vf.source_column))?;
-                if let AnyValue::Null = val_series.get(i)? {
-                    continue;
-                }
-                let val: f64 = val_series.get(i)?.try_extract::<f64>().unwrap_or(0.0);
-                matrix.insert(row_path, col_path, vidx, val);
             }
         }
     }
 
-    // v152：行列小计交汇点（仅当 row_fields 和 col_fields 都非空时才存在这个格子）。
-    // 分组字段 = row_fields[0] + col_fields[0]（两头都只取最外层）。这是唯一
-    // 一个"行小计"分支和"列小计"分支都不会生成的 key 组合（前者 col_path 是
-    // 完整路径，后者 row_path 是完整路径，唯独两者同时半空的组合没人写）。
-    // 正确性要求：这个值必须同时等于"该行小计横向求和"和"该列小计纵向求和"
-    // （用户用真实数据截图验证过的关系，见 v152 交接记录），因为两条聚合路径
-    // 都是从原始明细 df 现场 group_by 出来的，数学上必然相等，不需要额外交叉验证代码，
-    // 但单元测试应显式断言这一点。
-    if !row_fields.is_empty() && !col_fields.is_empty() {
-        let corner_group_cols = vec![row_fields[0].clone(), col_fields[0].clone()];
-        let corner_group_exprs: Vec<Expr> = corner_group_cols.iter().map(|c| col(c.as_str())).collect();
+    // v338：行小计 × 列小计交汇点。行前缀 k=1..N-1 与列前缀 kc=1..M-1 双循环，
+    // 键 = 行前缀 + [""]，列前缀 + [""]。行字段只有 1 个时，叶子行 × 列小计已由上面的
+    // 列小计块覆盖，这里不重复；M=1 同理跳过。
+    if col_subtotals && row_subtotals && row_fields.len() >= 2 && col_fields.len() >= 2 {
+        for k in 1..row_fields.len() {
+            for kc in 1..col_fields.len() {
+                let mut group_cols: Vec<String> = row_fields[..k].to_vec();
+                group_cols.extend(col_fields[..kc].iter().cloned());
+                let group_exprs: Vec<Expr> = group_cols.iter().map(|c| col(c.as_str())).collect();
 
-        for (vidx, vf) in value_fields.iter().enumerate() {
-            let agg_expr = build_agg_expr(&vf.source_column, &vf.agg);
-            let grouped = lf.clone()
-                .group_by(corner_group_exprs.clone())
-                .agg([agg_expr])
-                .collect()?;
+                for (vidx, vf) in value_fields.iter().enumerate() {
+                    let agg_expr = build_agg_expr(&vf.source_column, &vf.agg);
+                    let grouped = lf.clone()
+                        .group_by(group_exprs.clone())
+                        .agg([agg_expr])
+                        .collect()?;
 
-            let n_rows = grouped.height();
-            for i in 0..n_rows {
-                let row_outer_val = {
-                    let s = grouped.column(&row_fields[0])?;
-                    anyvalue_to_display_string(&s.get(i)?)
-                };
-                let col_outer_val = {
-                    let s = grouped.column(&col_fields[0])?;
-                    anyvalue_to_display_string(&s.get(i)?)
-                };
-                let mut row_path: Vec<String> = vec![String::new(); row_fields.len()];
-                row_path[0] = row_outer_val;
-                let mut col_path: Vec<String> = vec![String::new(); col_fields.len()];
-                col_path[0] = col_outer_val;
+                    let n_rows = grouped.height();
+                    for i in 0..n_rows {
+                        let mut row_path: Vec<String> = Vec::with_capacity(k + 1);
+                        for fname in row_fields[..k].iter() {
+                            let sr = grouped.column(fname)?;
+                            row_path.push(anyvalue_to_display_string(&sr.get(i)?));
+                        }
+                        row_path.push(String::new());
 
-                let result_col_name = format!("{}_agg", vf.source_column);
-                let val_series = grouped.column(&result_col_name)
-                    .or_else(|_| grouped.column(&vf.source_column))?;
-                if let AnyValue::Null = val_series.get(i)? {
-                    continue;
+                        let mut col_path: Vec<String> = Vec::with_capacity(kc + 1);
+                        for fname in col_fields[..kc].iter() {
+                            let sc = grouped.column(fname)?;
+                            col_path.push(anyvalue_to_display_string(&sc.get(i)?));
+                        }
+                        col_path.push(String::new());
+
+                        let result_col_name = format!("{}_agg", vf.source_column);
+                        let val_series = grouped.column(&result_col_name)
+                            .or_else(|_| grouped.column(&vf.source_column))?;
+                        if let AnyValue::Null = val_series.get(i)? {
+                            continue;
+                        }
+                        let val: f64 = val_series.get(i)?.try_extract::<f64>().unwrap_or(0.0);
+                        matrix.insert(row_path, col_path, vidx, val);
+                    }
                 }
-                let val: f64 = val_series.get(i)?.try_extract::<f64>().unwrap_or(0.0);
-                matrix.insert(row_path, col_path, vidx, val);
             }
         }
     }
@@ -631,66 +719,68 @@ pub fn compute_pivot_data_matrix(
         }
     }
 
-    // v152：总计行 × 列小计 的交汇点（row_path=[]，col_path=[列小计外层值,"",...]）。
-    // 之前只写了 row_path=[] 配完整col_path（ColTotal分支）和 row_path=col_path=[]（GrandTotal单点），
-    // 缺了"总计跟列小计交汇"这一格——分组字段只用 col_fields[0]（不含任何row字段，
-    // 相当于在总计口径下按最外层列分组）。仅当 col_fields 非空时才存在这个格子。
-    if !col_fields.is_empty() {
-        let col_field_group_exprs: Vec<Expr> = vec![col(col_fields[0].as_str())];
-        for (vidx, vf) in value_fields.iter().enumerate() {
-            let agg_expr = build_agg_expr(&vf.source_column, &vf.agg);
-            let grouped = lf.clone()
-                .group_by(col_field_group_exprs.clone())
-                .agg([agg_expr])
-                .collect()?;
-            let n_rows = grouped.height();
-            for i in 0..n_rows {
-                let outer_val = {
-                    let s = grouped.column(&col_fields[0])?;
-                    anyvalue_to_display_string(&s.get(i)?)
-                };
-                let mut col_path: Vec<String> = vec![String::new(); col_fields.len()];
-                col_path[0] = outer_val;
+    // v338：总计行 × 列小计（row_path=[]，col_path=列前缀 kc 个值 + [""]），kc=1..M-1。
+    if col_subtotals && col_fields.len() >= 2 {
+        for kc in 1..col_fields.len() {
+            let group_exprs: Vec<Expr> = col_fields[..kc].iter().map(|c| col(c.as_str())).collect();
+            for (vidx, vf) in value_fields.iter().enumerate() {
+                let agg_expr = build_agg_expr(&vf.source_column, &vf.agg);
+                let grouped = lf.clone()
+                    .group_by(group_exprs.clone())
+                    .agg([agg_expr])
+                    .collect()?;
+                let n_rows = grouped.height();
+                for i in 0..n_rows {
+                    let mut col_path: Vec<String> = Vec::with_capacity(kc + 1);
+                    for fname in col_fields[..kc].iter() {
+                        let sc = grouped.column(fname)?;
+                        col_path.push(anyvalue_to_display_string(&sc.get(i)?));
+                    }
+                    col_path.push(String::new());
 
-                let result_col_name = format!("{}_agg", vf.source_column);
-                let val_series = grouped.column(&result_col_name)
-                    .or_else(|_| grouped.column(&vf.source_column))?;
-                if let AnyValue::Null = val_series.get(i)? {
-                    continue;
+                    let result_col_name = format!("{}_agg", vf.source_column);
+                    let val_series = grouped.column(&result_col_name)
+                        .or_else(|_| grouped.column(&vf.source_column))?;
+                    if let AnyValue::Null = val_series.get(i)? {
+                        continue;
+                    }
+                    let val: f64 = val_series.get(i)?.try_extract::<f64>().unwrap_or(0.0);
+                    matrix.insert(vec![], col_path, vidx, val);
                 }
-                let val: f64 = val_series.get(i)?.try_extract::<f64>().unwrap_or(0.0);
-                matrix.insert(vec![], col_path, vidx, val);
             }
         }
     }
 
     // v152：行小计 × 总计列 的交汇点（row_path=[行小计外层值,"",...]，col_path=[]）。
     // 对称于上面的"总计 × 列小计"，分组字段只用 row_fields[0]。仅当 row_fields 非空时才存在。
-    if !row_fields.is_empty() {
-        let row_field_group_exprs: Vec<Expr> = vec![col(row_fields[0].as_str())];
-        for (vidx, vf) in value_fields.iter().enumerate() {
-            let agg_expr = build_agg_expr(&vf.source_column, &vf.agg);
-            let grouped = lf.clone()
-                .group_by(row_field_group_exprs.clone())
-                .agg([agg_expr])
-                .collect()?;
-            let n_rows = grouped.height();
-            for i in 0..n_rows {
-                let outer_val = {
-                    let s = grouped.column(&row_fields[0])?;
-                    anyvalue_to_display_string(&s.get(i)?)
-                };
-                let mut row_path: Vec<String> = vec![String::new(); row_fields.len()];
-                row_path[0] = outer_val;
+    // v337：行小计 × 总计列，按前缀 k 循环，键 = 前缀 + [""]，col_path=[]。
+    if row_subtotals && row_fields.len() >= 2 && !col_fields.is_empty() {
+        for k in 1..row_fields.len() {
+            let group_exprs: Vec<Expr> = row_fields[..k].iter().map(|c| col(c.as_str())).collect();
+            for (vidx, vf) in value_fields.iter().enumerate() {
+                let agg_expr = build_agg_expr(&vf.source_column, &vf.agg);
+                let grouped = lf.clone()
+                    .group_by(group_exprs.clone())
+                    .agg([agg_expr])
+                    .collect()?;
+                let n_rows = grouped.height();
+                for i in 0..n_rows {
+                    let mut row_path: Vec<String> = Vec::with_capacity(k + 1);
+                    for fname in row_fields[..k].iter() {
+                        let sr = grouped.column(fname)?;
+                        row_path.push(anyvalue_to_display_string(&sr.get(i)?));
+                    }
+                    row_path.push(String::new());
 
-                let result_col_name = format!("{}_agg", vf.source_column);
-                let val_series = grouped.column(&result_col_name)
-                    .or_else(|_| grouped.column(&vf.source_column))?;
-                if let AnyValue::Null = val_series.get(i)? {
-                    continue;
+                    let result_col_name = format!("{}_agg", vf.source_column);
+                    let val_series = grouped.column(&result_col_name)
+                        .or_else(|_| grouped.column(&vf.source_column))?;
+                    if let AnyValue::Null = val_series.get(i)? {
+                        continue;
+                    }
+                    let val: f64 = val_series.get(i)?.try_extract::<f64>().unwrap_or(0.0);
+                    matrix.insert(row_path, vec![], vidx, val);
                 }
-                let val: f64 = val_series.get(i)?.try_extract::<f64>().unwrap_or(0.0);
-                matrix.insert(row_path, vec![], vidx, val);
             }
         }
     }
@@ -757,13 +847,61 @@ fn anyvalue_to_display_string(v: &AnyValue) -> String {
 pub fn dataframe_to_sheet(name: String, df: &DataFrame) -> Result<Sheet, BridgeError> {
     let height = df.height();
     let mut grid = SparseGrid::default();
+    let mut cell_formats: std::collections::HashMap<(u32, u32), roe_model::calc::CellFormat> =
+        std::collections::HashMap::new();
 
     for (c, col) in df.columns().iter().enumerate() {
         let mut values: SmallVec<[CellValue; 8]> = smallvec![];
         values.push(CellValue::Text(col.name().to_string()));
-        for i in 0..height {
-            let av = col.get(i).unwrap_or(AnyValue::Null);
-            values.push(anyvalue_to_cell(&av));
+
+        // 日期列:回写为 Excel 序列号(1900 系统,偏移 25569) + 日期数字格式
+        let series = col.as_materialized_series();
+        let (date_nums, date_fmt): (Option<Vec<Option<f64>>>, &str) = match series.dtype() {
+            DataType::Date => {
+                let nums = series
+                    .cast(&DataType::Int32)?
+                    .i32()
+                    .map(|ca| ca.iter().map(|v| v.map(|d| d as f64 + 25569.0)).collect::<Vec<_>>())
+                    .ok();
+                (nums, "yyyy-mm-dd")
+            }
+            DataType::Datetime(unit, _) => {
+                let per_day: f64 = match unit {
+                    polars::prelude::TimeUnit::Milliseconds => 86_400_000.0,
+                    polars::prelude::TimeUnit::Microseconds => 86_400_000_000.0,
+                    polars::prelude::TimeUnit::Nanoseconds => 86_400_000_000_000.0,
+                };
+                let nums = series
+                    .cast(&DataType::Int64)?
+                    .i64()
+                    .map(|ca| ca.iter().map(|v| v.map(|t| t as f64 / per_day + 25569.0)).collect::<Vec<_>>())
+                    .ok();
+                (nums, "yyyy-mm-dd hh:mm:ss")
+            }
+            _ => (None, ""),
+        };
+
+        if let Some(nums) = date_nums {
+            for (i, v) in nums.into_iter().enumerate() {
+                match v {
+                    Some(n) => {
+                        values.push(CellValue::Number(n));
+                        cell_formats.insert(
+                            ((i + 1) as u32, c as u32),
+                            roe_model::calc::CellFormat {
+                                num_format: Some(date_fmt.to_string()),
+                                ..Default::default()
+                            },
+                        );
+                    }
+                    None => values.push(CellValue::Empty),
+                }
+            }
+        } else {
+            for i in 0..height {
+                let av = col.get(i).unwrap_or(AnyValue::Null);
+                values.push(anyvalue_to_cell(&av));
+            }
         }
         grid.cols.insert(
             c as u32,
@@ -790,7 +928,7 @@ pub fn dataframe_to_sheet(name: String, df: &DataFrame) -> Result<Sheet, BridgeE
         col_outline_level: vec![],
         row_outline_level: vec![],
         sparkline_groups: vec![],
-            cell_formats:     std::collections::HashMap::new(),
+            cell_formats,
             cond_formats:     vec![],
             data_validations: vec![],
             auto_filter:      None,
@@ -827,43 +965,23 @@ fn pivot_v2_insert_path(root: &mut PivotHeaderNode, path: &[String]) {
     pivot_v2_insert_path(child, &path[1..]);
 }
 
-/// v151新增：为row_tree的最外层分组节点追加小计节点（本版本范围：仅最外层，仅行方向）。
-/// 小计节点 value = "{父节点值} Total"，与明细子节点作为兄弟节点并列插入，
-/// 排在该分组的所有子节点之后（对应 subtotalTop="0"，固定显示在底部）。
-/// 只处理"有子节点"的最外层节点——若某个分组下没有子节点（异常数据），跳过不加小计。
-fn pivot_v2_insert_row_subtotals(row_tree: &mut PivotHeaderNode) {
-    for outer_node in row_tree.children.iter_mut() {
-        if outer_node.children.is_empty() {
-            continue;
-        }
-        let subtotal_label = format!("{} Total", outer_node.value);
-        let subtotal_node = PivotHeaderNode {
-            value: subtotal_label,
-            is_subtotal: true,
-            ..Default::default()
-        };
-        outer_node.children.push(subtotal_node);
+/// v337：行方向多级小计的树生成。先递归子节点，再给“非根且有子节点”的节点
+/// 在 children 末尾追加小计叶子（value="{节点值} Total"，is_subtotal=true）。
+/// N 个字段得 N-1 级；最内层叶子无子节点，不加。小计叶子在递归之后才追加，
+/// 不会被再次处理。
+fn pivot_v2_insert_subtotals_rec(node: &mut PivotHeaderNode, is_root: bool) {
+    for child in node.children.iter_mut() {
+        pivot_v2_insert_subtotals_rec(child, false);
     }
-}
-
-/// v152：列方向小计（阶段2），对称于 pivot_v2_insert_row_subtotals。
-/// 仅处理 col_tree 最外层：为每个有子节点的外层列分组，在其 children 末尾
-/// 追加一个小计节点（value = "{父节点值} Total"，is_subtotal = true）。
-/// 没有子节点的分组（异常数据）跳过不加。约定与行方向完全一致，故直接
-/// 复用同一套 PivotHeaderNode 结构，无需额外字段区分行/列小计。
-fn pivot_v2_insert_col_subtotals(col_tree: &mut PivotHeaderNode) {
-    for outer_node in col_tree.children.iter_mut() {
-        if outer_node.children.is_empty() {
-            continue;
-        }
-        let subtotal_label = format!("{} Total", outer_node.value);
-        let subtotal_node = PivotHeaderNode {
-            value: subtotal_label,
-            is_subtotal: true,
-            ..Default::default()
-        };
-        outer_node.children.push(subtotal_node);
+    if is_root || node.children.is_empty() {
+        return;
     }
+    let label = node.value.clone();
+    node.children.push(PivotHeaderNode {
+        value: label,
+        is_subtotal: true,
+        ..Default::default()
+    });
 }
 
 /// 获取 DataFrame 某列的去重取值（字符串化，排序）
@@ -874,7 +992,26 @@ fn pivot_v2_unique_sorted(df: &DataFrame, field: &str) -> Result<Vec<String>, Br
     for i in 0..unique.len() {
         vals.push(anyvalue_to_display_string(&unique.get(i)?));
     }
-    vals.sort();
+    // 非空取值全部是数字 → 按数值排序(空值排最后);否则保持字典序
+    let numeric = vals
+        .iter()
+        .filter(|v| !v.is_empty())
+        .all(|v| v.trim().parse::<f64>().is_ok());
+    let has_number = vals.iter().any(|v| !v.is_empty());
+    if numeric && has_number {
+        vals.sort_by(|a, b| match (a.is_empty(), b.is_empty()) {
+            (true, true) => std::cmp::Ordering::Equal,
+            (true, false) => std::cmp::Ordering::Greater,
+            (false, true) => std::cmp::Ordering::Less,
+            (false, false) => {
+                let x = a.trim().parse::<f64>().unwrap_or(0.0);
+                let y = b.trim().parse::<f64>().unwrap_or(0.0);
+                x.total_cmp(&y)
+            }
+        });
+    } else {
+        vals.sort();
+    }
     Ok(vals)
 }
 
@@ -928,6 +1065,34 @@ pub fn pivot_sheet_into_workbook_v2_ex(
     result_sheet_name: String,
     sort: &[(String, bool)],
 ) -> Result<usize, BridgeError> {
+    pivot_sheet_into_workbook_v2_opt(workbook, sheet_idx, cfg, result_sheet_name, sort, PivotOpts::default())
+}
+
+/// v337：透视表构建选项（小计开关）。默认两个方向都显示（保持现有行为）。
+#[derive(Debug, Clone, Copy)]
+pub struct PivotOpts {
+    pub row_subtotals: bool,
+    pub col_subtotals: bool,
+}
+
+impl Default for PivotOpts {
+    fn default() -> Self {
+        Self { row_subtotals: true, col_subtotals: true }
+    }
+}
+
+/// v337：带小计开关的构建入口。row_subtotals=false 时不插小计节点、不算小计键，
+/// 并把 meta.hide_row_subtotals / hide_col_subtotals 按开关写入。
+pub fn pivot_sheet_into_workbook_v2_opt(
+    workbook: &mut Workbook,
+    sheet_idx: usize,
+    cfg: &PivotConfig,
+    result_sheet_name: String,
+    sort: &[(String, bool)],
+    opts: PivotOpts,
+) -> Result<usize, BridgeError> {
+    let row_subtotals = opts.row_subtotals;
+    let col_subtotals = opts.col_subtotals;
     let sheet = workbook
         .sheets
         .get(sheet_idx)
@@ -981,12 +1146,12 @@ pub fn pivot_sheet_into_workbook_v2_ex(
         pivot_v2_insert_path(&mut col_tree, path);
     }
 
-    // v151：仅行方向、仅最外层的小计节点插入（见 pivot_v2_insert_row_subtotals 注释）
-    pivot_v2_insert_row_subtotals(&mut row_tree);
-    // v152：列方向、仅最外层的小计节点插入（见 pivot_v2_insert_col_subtotals 注释）
-    pivot_v2_insert_col_subtotals(&mut col_tree);
+    // v337：行方向多级小计(见 pivot_v2_insert_subtotals_rec 注释)
+    if row_subtotals { pivot_v2_insert_subtotals_rec(&mut row_tree, true); }
+    // v338：列方向多级小计,M 个列字段得 M-1 级(与行方向共用递归版)
+    if col_subtotals { pivot_v2_insert_subtotals_rec(&mut col_tree, true); }
 
-    let data = compute_pivot_data_matrix(&df, &row_field_names, &col_field_names, &value_fields)?;
+    let data = compute_pivot_data_matrix(&df, &row_field_names, &col_field_names, &value_fields, row_subtotals, col_subtotals)?;
 
     let filter_fields: Vec<PivotFieldDef> = cfg.filters.keys()
         .map(|k| PivotFieldDef::new(k.clone()))
@@ -995,7 +1160,7 @@ pub fn pivot_sheet_into_workbook_v2_ex(
     let col_header_rows = col_field_names.len() as u32
         + if n_values > 1 { 1 } else { 0 };
     let data_row_start = filter_row_count + 1 + col_header_rows;
-    let data_col_start = (row_field_names.len() as u32).max(1);
+    let data_col_start = pivot_data_col_start(&roe_model::calc::PivotLayoutMode::default(), row_field_names.len());
 
     let agg_suffix = match cfg.agg.as_str() {
         "sum" => "Sum",
@@ -1037,6 +1202,8 @@ pub fn pivot_sheet_into_workbook_v2_ex(
         row_grand_totals: true,
         col_grand_totals: true,
         data,
+        hide_row_subtotals: !row_subtotals,
+        hide_col_subtotals: !col_subtotals,
         ..Default::default()
     };
     meta.compute_spans();
@@ -1104,12 +1271,16 @@ pub fn refresh_pivot_in_place(workbook: &mut Workbook, sheet_idx: usize) -> Resu
         filters,
     };
 
-    let tmp_idx = pivot_sheet_into_workbook_v2_ex(
+    let tmp_idx = pivot_sheet_into_workbook_v2_opt(
         workbook,
         source_idx,
         &cfg,
         "__pivot_refresh_tmp__".to_string(),
         &old.sort,
+        PivotOpts {
+            row_subtotals: !old.hide_row_subtotals,
+            col_subtotals: !old.hide_col_subtotals,
+        },
     )?;
     let taken = workbook.sheets[tmp_idx].pivot.take();
     workbook.sheets.remove(tmp_idx);
@@ -1122,8 +1293,14 @@ pub fn refresh_pivot_in_place(workbook: &mut Workbook, sheet_idx: usize) -> Resu
     new_meta.name = old.name.clone();
     new_meta.style_name = old.style_name.clone();
     new_meta.layout_mode = old.layout_mode.clone();
+    new_meta.subtotals_bottom = old.subtotals_bottom;
+    // 重建时按默认(大纲)模式算的数据区起点,拷回模式后必须按新模式重算
+    new_meta.data_col_start = pivot_data_col_start(&new_meta.layout_mode, new_meta.row_field_names.len());
+    new_meta.last_col = new_meta.data_col_start + new_meta.col_tree.cached_span.max(1) - 1;
     new_meta.field_filters = old.field_filters.clone();
     new_meta.sort = old.sort.clone();
+    new_meta.row_grand_totals = old.row_grand_totals;
+    new_meta.col_grand_totals = old.col_grand_totals;
     // materialize 靠 cells_rect 清旧区域,必须换回旧的
     new_meta.cells_rect = old.cells_rect;
 
@@ -1269,6 +1446,17 @@ pub fn pivot_config_value(workbook: &Workbook, sheet_idx: usize) -> Result<serde
         "filters": filters,
         "source_idx": source_idx.map(|i| i as i64).unwrap_or(-1),
         "fields": fields,
+        // 正向语义：true = 显示。grand_bottom=最下面一行总计，grand_right=最右边一列总计
+        "subtotals_row": !pivot.hide_row_subtotals,
+        "subtotals_col": !pivot.hide_col_subtotals,
+        "grand_bottom": pivot.row_grand_totals,
+        "grand_right": pivot.col_grand_totals,
+        "subtotals_top": !pivot.subtotals_bottom,
+        "layout": match pivot.layout_mode {
+            roe_model::calc::PivotLayoutMode::Compact => "compact",
+            roe_model::calc::PivotLayoutMode::Outline => "outline",
+            roe_model::calc::PivotLayoutMode::Tabular => "tabular",
+        },
     }))
 }
 
@@ -1300,6 +1488,114 @@ pub fn pivot_set_filter_in_place(
     } else {
         meta.field_filters.insert(field.to_string(), values);
     }
+    if let Err(e) = refresh_pivot_in_place(workbook, sheet_idx) {
+        workbook.sheets[sheet_idx].pivot = Some(old);
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// v337：就地开关透视表的总计并刷新。
+/// bottom_row = 最下面一行总计（meta.row_grand_totals）；
+/// right_col = 最右边一列总计（meta.col_grand_totals）。失败时 meta 回滚。
+pub fn pivot_set_grand_totals_in_place(
+    workbook: &mut Workbook,
+    sheet_idx: usize,
+    bottom_row: bool,
+    right_col: bool,
+) -> Result<(), BridgeError> {
+    let sheet = workbook
+        .sheets
+        .get_mut(sheet_idx)
+        .ok_or_else(|| BridgeError::Other(format!("sheet_idx={sheet_idx} 越界")))?;
+    let meta = sheet
+        .pivot
+        .as_mut()
+        .ok_or_else(|| BridgeError::Other(format!("sheet_idx={sheet_idx} 无透视表元数据")))?;
+    let old = meta.clone();
+    meta.row_grand_totals = bottom_row;
+    meta.col_grand_totals = right_col;
+    if let Err(e) = refresh_pivot_in_place(workbook, sheet_idx) {
+        workbook.sheets[sheet_idx].pivot = Some(old);
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// v337：就地开关透视表的分类小计并刷新。on=true 显示（默认），false 隐藏。
+/// 失败时 meta 回滚。
+pub fn pivot_set_subtotals_in_place(
+    workbook: &mut Workbook,
+    sheet_idx: usize,
+    row_on: bool,
+    col_on: bool,
+) -> Result<(), BridgeError> {
+    let sheet = workbook
+        .sheets
+        .get_mut(sheet_idx)
+        .ok_or_else(|| BridgeError::Other(format!("sheet_idx={sheet_idx} 越界")))?;
+    let meta = sheet
+        .pivot
+        .as_mut()
+        .ok_or_else(|| BridgeError::Other(format!("sheet_idx={sheet_idx} 无透视表元数据")))?;
+    let old = meta.clone();
+    meta.hide_row_subtotals = !row_on;
+    meta.hide_col_subtotals = !col_on;
+    if let Err(e) = refresh_pivot_in_place(workbook, sheet_idx) {
+        workbook.sheets[sheet_idx].pivot = Some(old);
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// 数据区起始列(相对 base_col):紧凑模式行字段只占 1 列,大纲/表格每个行字段一列。
+pub fn pivot_data_col_start(mode: &roe_model::calc::PivotLayoutMode, n_row_fields: usize) -> u32 {
+    match mode {
+        roe_model::calc::PivotLayoutMode::Compact => 1,
+        _ => (n_row_fields as u32).max(1),
+    }
+}
+
+/// 就地切换透视表布局形态(紧凑/大纲/表格)并刷新。失败时 meta 回滚。
+pub fn pivot_set_layout_in_place(
+    workbook: &mut Workbook,
+    sheet_idx: usize,
+    mode: roe_model::calc::PivotLayoutMode,
+) -> Result<(), BridgeError> {
+    let sheet = workbook
+        .sheets
+        .get_mut(sheet_idx)
+        .ok_or_else(|| BridgeError::Other(format!("sheet_idx={sheet_idx} 越界")))?;
+    let meta = sheet
+        .pivot
+        .as_mut()
+        .ok_or_else(|| BridgeError::Other(format!("sheet_idx={sheet_idx} 无透视表元数据")))?;
+    let old = meta.clone();
+    meta.layout_mode = mode;
+    if let Err(e) = refresh_pivot_in_place(workbook, sheet_idx) {
+        workbook.sheets[sheet_idx].pivot = Some(old);
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// 就地设置大纲/紧凑形式下小计位置并刷新。top=true 小计在上(并入上级行,默认),false 在组底。
+/// 表格形式恒在组末,不受影响。失败时 meta 回滚。
+pub fn pivot_set_subtotals_position_in_place(
+    workbook: &mut Workbook,
+    sheet_idx: usize,
+    top: bool,
+) -> Result<(), BridgeError> {
+    let sheet = workbook
+        .sheets
+        .get_mut(sheet_idx)
+        .ok_or_else(|| BridgeError::Other(format!("sheet_idx={sheet_idx} 越界")))?;
+    let meta = sheet
+        .pivot
+        .as_mut()
+        .ok_or_else(|| BridgeError::Other(format!("sheet_idx={sheet_idx} 无透视表元数据")))?;
+    let old = meta.clone();
+    meta.subtotals_bottom = !top;
     if let Err(e) = refresh_pivot_in_place(workbook, sheet_idx) {
         workbook.sheets[sheet_idx].pivot = Some(old);
         return Err(e);
@@ -1481,18 +1777,28 @@ fn read_utf8_csv(path: &str, delimiter: Option<char>, has_header: bool) -> Resul
             detect_csv_separator(&head)
         }
     };
-    let file = std::fs::File::open(path).map_err(io)?;
-    let df = polars::prelude::CsvReadOptions::default()
-        .with_has_header(has_header)
-        .with_infer_schema_length(Some(100_000))
-        .with_parse_options(
-            polars::prelude::CsvParseOptions::default()
-                .with_separator(sep)
-                .with_truncate_ragged_lines(true),
-        )
-        .into_reader_with_file_handle(file)
-        .finish()?;
-    Ok(df)
+    // 先按 polars 默认(前 100 行)推断:快。仅当推断过窄导致解析失败(ComputeError)时,
+    // 才改为全表推断重读一次,避免"小数晚于推断窗口出现"时整份文件打不开。
+    let read = |full: bool| -> Result<DataFrame, BridgeError> {
+        let file = std::fs::File::open(path).map_err(io)?;
+        let mut o = polars::prelude::CsvReadOptions::default().with_has_header(has_header);
+        if full {
+            o = o.with_infer_schema_length(None);
+        }
+        let df = o
+            .with_parse_options(
+                polars::prelude::CsvParseOptions::default()
+                    .with_separator(sep)
+                    .with_truncate_ragged_lines(true),
+            )
+            .into_reader_with_file_handle(file)
+            .finish()?;
+        Ok(df)
+    };
+    match read(false) {
+        Err(BridgeError::Polars(polars::prelude::PolarsError::ComputeError(_))) => read(true),
+        other => other,
+    }
 }
 
 /// 从 CSV 文件读取 DataFrame。delimiter=None 时自动探测;编码自动识别(UTF-8/BOM/UTF-16/GBK)。
@@ -1605,10 +1911,102 @@ pub fn csv_to_ipc_cache(
     Ok(target.to_string_lossy().to_string())
 }
 
+/// xlsx 整表物化后落成 IPC 缓存(键沿用 csv_cache_path,分隔符用 \u{1} 标记避免与 CSV 撞键)。命中则不重读。
+pub fn xlsx_to_ipc_cache(path: &str, cache_dir: &std::path::Path) -> Result<String, BridgeError> {
+    use polars::prelude::{IpcWriter, SerWriter};
+    let io = |e: std::io::Error| BridgeError::Other(format!("写 IPC 缓存失败: {e}"));
+    std::fs::create_dir_all(cache_dir).map_err(io)?;
+    let target = csv_cache_path(path, Some('\u{1}'), true, cache_dir)?;
+    if target.exists() {
+        return Ok(target.to_string_lossy().to_string());
+    }
+    let mut df = df_from_xlsx_file(path)?;
+    let tmp = target.with_extension(format!("tmp{}", std::process::id()));
+    {
+        let file = std::fs::File::create(&tmp).map_err(io)?;
+        let mut w = std::io::BufWriter::new(file);
+        IpcWriter::new(&mut w).finish(&mut df)?;
+        std::io::Write::flush(&mut w).map_err(io)?;
+    }
+    std::fs::rename(&tmp, &target).map_err(io)?;
+    Ok(target.to_string_lossy().to_string())
+}
+
+/// CSV 预览读取窗口(字节)。
+const CSV_PREVIEW_WINDOW: usize = 1 << 20;
+
+/// 预览用:只读文件头窗口,全按字符串解析,不走 IPC 缓存、不做全表统计。
+/// 返回 {"cols","columns":[{"name","dtype":"String"}],"head":{"columns","rows"},"preview_only":true}。
+/// 不含总行数/空值数/min/max/mean(这些由确认导入后的 df_dataset_overview 提供)。
+pub fn csv_preview_head(
+    path: &str,
+    delimiter: Option<char>,
+    has_header: bool,
+    n_rows: usize,
+) -> Result<String, BridgeError> {
+    use polars::prelude::SerReader as _;
+    use std::io::Read;
+    let io = |e: std::io::Error| BridgeError::Other(format!("读取 CSV 失败: {e}"));
+    let mut buf = Vec::new();
+    std::fs::File::open(path)
+        .map_err(io)?
+        .take(CSV_PREVIEW_WINDOW as u64)
+        .read_to_end(&mut buf)
+        .map_err(io)?;
+    let truncated = buf.len() >= CSV_PREVIEW_WINDOW;
+    if truncated {
+        match buf.iter().rposition(|&b| b == b'\n') {
+            Some(i) => buf.truncate(i + 1),
+            None => return Err(BridgeError::Other("CSV 首行超过预览窗口".to_string())),
+        }
+    }
+    let enc = sniff_csv_encoding(&buf);
+    let body: &[u8] = match encoding_rs::Encoding::for_bom(&buf) {
+        Some((_, bom_len)) => &buf[bom_len..],
+        None => &buf[..],
+    };
+    let (text, _) = enc.decode_without_bom_handling(body);
+    let text = text.into_owned();
+    let sep = match delimiter {
+        Some(c) if c.is_ascii() => c as u8,
+        _ => detect_csv_separator(text.as_bytes()),
+    };
+    let df = polars::prelude::CsvReadOptions::default()
+        .with_has_header(has_header)
+        .with_infer_schema_length(Some(0))
+        .with_n_rows(Some(n_rows))
+        .with_parse_options(
+            polars::prelude::CsvParseOptions::default()
+                .with_separator(sep)
+                .with_truncate_ragged_lines(true),
+        )
+        .into_reader_with_file_handle(std::io::Cursor::new(text.into_bytes()))
+        .finish()?;
+    let columns: Vec<serde_json::Value> = df
+        .get_column_names()
+        .iter()
+        .map(|n| serde_json::json!({ "name": n.to_string(), "dtype": "String" }))
+        .collect();
+    let head_json = df_preview(&df, n_rows)?;
+    let mut head: serde_json::Value = serde_json::from_str(&head_json)
+        .map_err(|e| BridgeError::Other(format!("预览 JSON 解析失败: {e}")))?;
+    if let Some(o) = head.as_object_mut() {
+        o.remove("total_rows");
+    }
+    Ok(serde_json::json!({
+        "cols": df.width(),
+        "columns": columns,
+        "head": head,
+        "preview_only": true,
+    })
+    .to_string())
+}
+
 /// 数据集概览(类似 df.info() + df.head()):行数、列数、每列真实类型/空值数
 /// (数值列另含 min/max/mean)、前 head_n 行。行数/空值/统计量合并为一次惰性聚合。
 /// 返回 {"rows","cols","columns":[{"name","dtype","nulls","min"?,"max"?,"mean"?}],"head":{"columns","rows","offset"?}}
 pub fn lazy_overview(lf: LazyFrame, head_n: u32) -> Result<String, BridgeError> {
+    let lf_all = lf.clone();
     let mut schema_lf = lf.clone();
     let schema = schema_lf.collect_schema().map_err(BridgeError::Polars)?;
     let fields: Vec<(String, DataType)> =
@@ -1658,12 +2056,90 @@ pub fn lazy_overview(lf: LazyFrame, head_n: u32) -> Result<String, BridgeError> 
     let mut head: serde_json::Value = serde_json::from_str(&head_json)
         .map_err(|e| BridgeError::Other(format!("概览 JSON 解析失败: {e}")))?;
     if let Some(o) = head.as_object_mut() { o.remove("total_rows"); }
+    let describe: serde_json::Value = serde_json::from_str(&lazy_describe_opt(lf_all, false)?)
+        .map_err(|e| BridgeError::Other(format!("describe JSON 解析失败: {e}")))?;
     Ok(serde_json::json!({
         "rows": rows,
         "cols": fields.len(),
         "columns": columns,
         "head": head,
+        "describe": describe,
     }).to_string())
+}
+
+/// 等价 polars 的 df.describe():9 行 × (1+列数) 的字符串表。
+/// 行依次为 count / null_count / mean / std / min / 25% / 50% / 75% / max。
+/// 数值列全算;String/Boolean/Date/Datetime/Time 只算 count/null_count/min/max;其余格为 "null"。
+/// 一次惰性 select 完成,不物化全表。返回 {"columns":["statistic",..],"rows":[[..],..]}。
+pub fn lazy_describe(lf: LazyFrame) -> Result<String, BridgeError> {
+    lazy_describe_opt(lf, true)
+}
+
+/// full_quantiles=false 时不算 25%/75%(最贵的聚合),对应两行填 "null"。
+pub fn lazy_describe_opt(lf: LazyFrame, full_quantiles: bool) -> Result<String, BridgeError> {
+    use polars::prelude::{lit, QuantileMethod};
+    let mut schema_lf = lf.clone();
+    let schema = schema_lf.collect_schema().map_err(BridgeError::Polars)?;
+    let fields: Vec<(String, DataType)> =
+        schema.iter().map(|(n, d)| (n.to_string(), d.clone())).collect();
+    let is_num = |d: &DataType| {
+        matches!(
+            d,
+            DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
+                | DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64
+                | DataType::Float32 | DataType::Float64
+        )
+    };
+    let is_ord = |d: &DataType| {
+        matches!(
+            d,
+            DataType::String | DataType::Boolean | DataType::Date | DataType::Datetime(_, _) | DataType::Time
+        )
+    };
+    let mut exprs = Vec::new();
+    for (i, (name, dt)) in fields.iter().enumerate() {
+        let c = || col(name.as_str());
+        exprs.push(c().count().alias(format!("count{i}")));
+        exprs.push(c().null_count().alias(format!("null_count{i}")));
+        if is_num(dt) {
+            let f = || c().cast(DataType::Float64);
+            exprs.push(f().mean().alias(format!("mean{i}")));
+            exprs.push(f().std(1).alias(format!("std{i}")));
+            exprs.push(c().min().alias(format!("min{i}")));
+            if full_quantiles { exprs.push(f().quantile(lit(0.25), QuantileMethod::Linear).alias(format!("25%{i}"))); }
+            exprs.push(f().quantile(lit(0.5), QuantileMethod::Linear).alias(format!("50%{i}")));
+            if full_quantiles { exprs.push(f().quantile(lit(0.75), QuantileMethod::Linear).alias(format!("75%{i}"))); }
+            exprs.push(c().max().alias(format!("max{i}")));
+        } else if is_ord(dt) {
+            exprs.push(c().min().alias(format!("min{i}")));
+            exprs.push(c().max().alias(format!("max{i}")));
+        }
+    }
+    let agg = lf.select(exprs).collect()?;
+    let cell = |k: &str| -> String {
+        match agg.column(k).ok().and_then(|c| c.get(0).ok()) {
+            None => "null".to_string(),
+            Some(av) => match anyvalue_to_json(&av) {
+                serde_json::Value::Null => "null".to_string(),
+                serde_json::Value::String(t) => t,
+                v => v.to_string(),
+            },
+        }
+    };
+    let stats = ["count", "null_count", "mean", "std", "min", "25%", "50%", "75%", "max"];
+    let mut columns = vec!["statistic".to_string()];
+    columns.extend(fields.iter().map(|(n, _)| n.clone()));
+    let rows: Vec<Vec<String>> = stats
+        .iter()
+        .map(|st| {
+            let mut r = vec![st.to_string()];
+            for i in 0..fields.len() {
+                r.push(cell(&format!("{st}{i}")));
+            }
+            r
+        })
+        .collect();
+    Ok(serde_json::json!({ "columns": columns, "rows": rows }).to_string())
 }
 
 /// 惰性计算行数(select len() 聚合,不物化全表)。
@@ -1690,6 +2166,92 @@ impl LoadedSource {
     }
 }
 
+/// xlsx 预览:流式只读前 n_rows 行数据(+表头),不物化整表、不做统计。
+/// 仅支持 .xlsx(xls/ods 由调用方走整表路径)。全部按 String 返回,契约同 csv_preview_head,
+/// 另附 approx_rows(工作表声明范围内的数据行数,可能含尾部空行,仅供显示"约 N 行")。
+pub fn xlsx_preview_head(path: &str, n_rows: usize) -> Result<String, BridgeError> {
+    use calamine::{open_workbook, DataRef, Reader, Xlsx};
+    let err = |m: String| BridgeError::Other(m);
+    let mut wb: Xlsx<_> = open_workbook(path).map_err(|e| err(format!("打开 xlsx 失败: {e}")))?;
+    let name = wb.sheet_names().first().cloned().ok_or_else(|| err("文件没有 sheet".to_string()))?;
+    let mut rd = wb.worksheet_cells_reader(&name).map_err(|e| err(format!("读取 sheet 失败: {e}")))?;
+    let dims = rd.dimensions();
+    let (r0, c0) = dims.start;
+    let width = (dims.end.1 + 1).saturating_sub(c0) as usize;
+    if width == 0 {
+        return Err(err("文件为空".to_string()));
+    }
+    let mut grid: Vec<Vec<String>> = vec![vec![String::new(); width]; n_rows + 1];
+    while let Some(cell) = rd.next_cell().map_err(|e| err(format!("读取单元格失败: {e}")))? {
+        let (r, c) = cell.get_position();
+        let rr = r.saturating_sub(r0) as usize;
+        if rr > n_rows {
+            break;
+        }
+        let cc = c.saturating_sub(c0) as usize;
+        if cc >= width {
+            continue;
+        }
+        grid[rr][cc] = match cell.get_value() {
+            DataRef::Int(n) => n.to_string(),
+            DataRef::Float(f) => {
+                if f.fract() == 0.0 && f.abs() < 1e15 { format!("{}", *f as i64) } else { format!("{}", f) }
+            }
+            DataRef::String(x) => x.clone(),
+            DataRef::SharedString(x) => x.to_string(),
+            DataRef::Bool(b) => b.to_string(),
+            DataRef::DateTime(dt) => format!("{}", dt),
+            DataRef::DateTimeIso(x) => x.clone(),
+            DataRef::DurationIso(x) => x.clone(),
+            _ => String::new(),
+        };
+    }
+    // 表头:空名/重名补 column_N,避免 DataFrame 构建失败
+    let mut seen = std::collections::HashSet::new();
+    let headers: Vec<String> = grid[0]
+        .iter()
+        .enumerate()
+        .map(|(i, h)| {
+            let mut n = if h.is_empty() { format!("column_{}", i + 1) } else { h.clone() };
+            if !seen.insert(n.clone()) {
+                n = format!("{}_{}", n, i + 1);
+                seen.insert(n.clone());
+            }
+            n
+        })
+        .collect();
+    let data_rows = &grid[1..];
+    let cols: Vec<polars::prelude::Column> = headers
+        .iter()
+        .enumerate()
+        .map(|(i, h)| {
+            let v: Vec<&str> = data_rows.iter().map(|r| r[i].as_str()).collect();
+            polars::prelude::Column::new(h.as_str().into(), v.as_slice())
+        })
+        .collect();
+    let df = polars::prelude::DataFrame::new_infer_height(cols)
+        .map_err(|e| err(format!("DataFrame 构建失败: {e}")))?;
+    let columns: Vec<serde_json::Value> = df
+        .get_column_names()
+        .iter()
+        .map(|n| serde_json::json!({ "name": n.to_string(), "dtype": "String" }))
+        .collect();
+    let head_json = df_preview(&df, n_rows)?;
+    let mut head: serde_json::Value = serde_json::from_str(&head_json)
+        .map_err(|e| err(format!("预览 JSON 解析失败: {e}")))?;
+    if let Some(o) = head.as_object_mut() {
+        o.remove("total_rows");
+    }
+    Ok(serde_json::json!({
+        "cols": df.width(),
+        "columns": columns,
+        "head": head,
+        "preview_only": true,
+        "approx_rows": (dims.end.0 - r0) as u64,
+    })
+    .to_string())
+}
+
 /// 按类型打开外部文件。kind: "csv"(经 IPC 缓存后惰性 scan) | "parquet"(文件或目录) | "xlsx"(物化,第一个 sheet)。
 pub fn load_file_source(
     path: &str,
@@ -1704,7 +2266,10 @@ pub fn load_file_source(
             Ok(LoadedSource::Lazy(scan_ipc_cache(&ipc)?))
         }
         "parquet" => Ok(LoadedSource::Lazy(scan_parquet_dir(path)?)),
-        "xlsx" => Ok(LoadedSource::Mem(df_from_xlsx_file(path)?)),
+        "xlsx" => {
+            let ipc = xlsx_to_ipc_cache(path, cache_dir)?;
+            Ok(LoadedSource::Lazy(scan_ipc_cache(&ipc)?))
+        }
         other => Err(BridgeError::Other(format!("不支持的文件类型: {other}"))),
     }
 }
@@ -1895,6 +2460,84 @@ mod csv_import_tests {
         let _ = std::fs::remove_file(&p);
         assert_eq!(df.height(), 2);
     }
+
+    /// 小数晚于旧推断窗口(100_000 行)才出现:窗口推断会把列判成 i64 并解析失败。
+    #[test]
+    fn csv_infer_late_float_after_100k_rows() {
+        let mut s = String::from("id,amt\n");
+        for i in 0..100_050u32 {
+            if i < 100_020 {
+                s.push_str(&format!("{i},{i}\n"));
+            } else {
+                s.push_str(&format!("{i},2.75\n"));
+            }
+        }
+        let p = write_tmp("late_float", s.as_bytes());
+        let r = df_from_csv_file(&p, None, true);
+        let _ = std::fs::remove_file(&p);
+        let df = r.expect("晚出现的小数不应导致读取失败");
+        assert_eq!(df.height(), 100_050);
+        assert!(df.columns()[1].dtype().is_float(), "amt 列应为浮点,实际 {:?}", df.columns()[1].dtype());
+    }
+
+    fn preview_json(p: &str, n: usize) -> serde_json::Value {
+        let s = csv_preview_head(p, None, true, n).expect("预览应成功");
+        serde_json::from_str(&s).unwrap()
+    }
+
+    /// 预览全按字符串读:前导零保持原样,所有列 dtype 为 String,且不含全表统计字段。
+    #[test]
+    fn csv_preview_head_all_string_keeps_leading_zeros() {
+        let p = write_tmp("pv_str", b"id,code\n1,007\n2,008\n");
+        let v = preview_json(&p, 10);
+        let _ = std::fs::remove_file(&p);
+        assert_eq!(v["head"]["rows"][0][1], "007");
+        assert_eq!(v["head"]["rows"][0][0], "1");
+        assert_eq!(v["cols"], 2);
+        for c in v["columns"].as_array().unwrap() {
+            assert_eq!(c["dtype"], "String");
+            assert!(c.get("nulls").is_none() && c.get("min").is_none() && c.get("mean").is_none());
+        }
+        assert!(v.get("rows").is_none(), "预览不应给出总行数");
+        assert_eq!(v["preview_only"], true);
+    }
+
+    /// n_rows 限制生效。
+    #[test]
+    fn csv_preview_head_limits_rows() {
+        let mut s = String::from("a,b\n");
+        for i in 0..1000 { s.push_str(&format!("{i},{i}\n")); }
+        let p = write_tmp("pv_n", s.as_bytes());
+        let v = preview_json(&p, 5);
+        let _ = std::fs::remove_file(&p);
+        assert_eq!(v["head"]["rows"].as_array().unwrap().len(), 5);
+    }
+
+    /// GBK 文件:列名与内容正确解码。
+    #[test]
+    fn csv_preview_head_gbk() {
+        let (bytes, _, _) = encoding_rs::GBK.encode("姓名,金额\n张三,10\n");
+        let p = write_tmp("pv_gbk", &bytes);
+        let v = preview_json(&p, 10);
+        let _ = std::fs::remove_file(&p);
+        assert_eq!(v["head"]["columns"][0], "姓名");
+        assert_eq!(v["head"]["rows"][0][0], "张三");
+    }
+
+    /// 文件大于读取窗口:截断在整行边界,不产生半行。
+    #[test]
+    fn csv_preview_head_truncates_on_line_boundary() {
+        let mut s = String::from("id,tag\n");
+        for i in 0..200_000u32 { s.push_str(&format!("{i},{i}x\n")); }
+        let p = write_tmp("pv_big", s.as_bytes());
+        let v = preview_json(&p, 1_000_000);
+        let _ = std::fs::remove_file(&p);
+        let rows = v["head"]["rows"].as_array().unwrap();
+        assert!(!rows.is_empty() && rows.len() < 200_000, "应只读到窗口内的行,实际 {}", rows.len());
+        for r in rows {
+            assert!(r[1].as_str().unwrap_or("").ends_with('x'), "出现半行: {r}");
+        }
+    }
 }
 
 // ════════════════════════════════════════════════════════════
@@ -1903,6 +2546,522 @@ mod csv_import_tests {
 
 #[cfg(test)]
 mod tests {
+
+    // ===== v337 红测试：行方向多级小计（3 个行字段，无列字段）=====
+    // 数据取 2 的幂，任何一层的和都能唯一对应到参与项。
+    // Region | Product | Size | Sales
+    // East Apple S=1, East Apple L=2, East Banana S=4, East Banana L=8
+    // West Apple S=16, West Apple L=32, West Banana S=64, West Banana L=128
+    fn make_test_sheet_3row() -> Sheet {
+        let mut grid = SparseGrid::default();
+        grid.cols.insert(
+            0,
+            SparseColumn {
+                blocks: sv![CellBlock {
+                    start_row: 0,
+                    values: sv![
+                        CellValue::Text("Region".into()),
+                        CellValue::Text("East".into()),
+                        CellValue::Text("East".into()),
+                        CellValue::Text("East".into()),
+                        CellValue::Text("East".into()),
+                        CellValue::Text("West".into()),
+                        CellValue::Text("West".into()),
+                        CellValue::Text("West".into()),
+                        CellValue::Text("West".into()),
+                    ],
+                }],
+            },
+        );
+        grid.cols.insert(
+            1,
+            SparseColumn {
+                blocks: sv![CellBlock {
+                    start_row: 0,
+                    values: sv![
+                        CellValue::Text("Product".into()),
+                        CellValue::Text("Apple".into()),
+                        CellValue::Text("Apple".into()),
+                        CellValue::Text("Banana".into()),
+                        CellValue::Text("Banana".into()),
+                        CellValue::Text("Apple".into()),
+                        CellValue::Text("Apple".into()),
+                        CellValue::Text("Banana".into()),
+                        CellValue::Text("Banana".into()),
+                    ],
+                }],
+            },
+        );
+        grid.cols.insert(
+            2,
+            SparseColumn {
+                blocks: sv![CellBlock {
+                    start_row: 0,
+                    values: sv![
+                        CellValue::Text("Size".into()),
+                        CellValue::Text("S".into()),
+                        CellValue::Text("L".into()),
+                        CellValue::Text("S".into()),
+                        CellValue::Text("L".into()),
+                        CellValue::Text("S".into()),
+                        CellValue::Text("L".into()),
+                        CellValue::Text("S".into()),
+                        CellValue::Text("L".into()),
+                    ],
+                }],
+            },
+        );
+        grid.cols.insert(
+            3,
+            SparseColumn {
+                blocks: sv![CellBlock {
+                    start_row: 0,
+                    values: sv![
+                        CellValue::Text("Sales".into()),
+                        CellValue::Number(1.0),
+                        CellValue::Number(2.0),
+                        CellValue::Number(4.0),
+                        CellValue::Number(8.0),
+                        CellValue::Number(16.0),
+                        CellValue::Number(32.0),
+                        CellValue::Number(64.0),
+                        CellValue::Number(128.0),
+                    ],
+                }],
+            },
+        );
+        let mut s = make_test_sheet_2val();
+        s.cells = grid;
+        s
+    }
+
+    fn p3(v: &[&str]) -> Vec<String> {
+        v.iter().map(|x| x.to_string()).collect()
+    }
+
+    fn build_3level_pivot(agg: &str) -> Workbook {
+        let mut wb = Workbook {
+            sheets: vec![make_test_sheet_3row()],
+            named_ranges: Default::default(),
+            named_formulas: HashMap::new(),
+            styles: Default::default(),
+            formula_dialect_source: Default::default(),
+        };
+        let cfg = PivotConfig {
+            rows: vec!["Region".into(), "Product".into(), "Size".into()],
+            cols: vec![],
+            values: vec!["Sales".into()],
+            agg: agg.into(),
+            filters: Default::default(),
+        };
+        pivot_sheet_into_workbook_v2(&mut wb, 0, &cfg, "Pivot3Level".into()).unwrap();
+        wb
+    }
+
+    fn count_subtotal_nodes(n: &PivotHeaderNode) -> usize {
+        (if n.is_subtotal { 1 } else { 0 })
+            + n.children.iter().map(count_subtotal_nodes).sum::<usize>()
+    }
+
+    #[test]
+    fn test_pivot_set_subtotals_in_place_toggle() {
+        let mut wb = build_3level_pivot("sum");
+        let idx = wb.sheets.len() - 1;
+        let g = |wb: &Workbook, path: &[&str]| {
+            wb.sheets[idx].pivot.as_ref().unwrap().data.get(&p3(path), &[], 0)
+        };
+        // 初始：2 个外层小计 + 4 个中层小计
+        assert_eq!(count_subtotal_nodes(&wb.sheets[idx].pivot.as_ref().unwrap().row_tree), 6);
+
+        // 关闭
+        pivot_set_subtotals_in_place(&mut wb, idx, false, false).unwrap();
+        let meta = wb.sheets[idx].pivot.as_ref().unwrap();
+        assert!(meta.hide_row_subtotals);
+        assert_eq!(count_subtotal_nodes(&meta.row_tree), 0, "关闭后树中不应有小计节点");
+        assert_eq!(g(&wb, &["East", ""]), None, "关闭后不应有外层小计键");
+        assert_eq!(g(&wb, &["East", "Apple", ""]), None, "关闭后不应有中层小计键");
+        assert_eq!(g(&wb, &["East", "Apple", "S"]), Some(1.0), "明细不受影响");
+        assert_eq!(wb.sheets[idx].pivot.as_ref().unwrap().data.get(&[], &[], 0), Some(255.0));
+
+        // 再打开
+        pivot_set_subtotals_in_place(&mut wb, idx, true, true).unwrap();
+        let meta = wb.sheets[idx].pivot.as_ref().unwrap();
+        assert!(!meta.hide_row_subtotals);
+        assert_eq!(count_subtotal_nodes(&meta.row_tree), 6);
+        assert_eq!(g(&wb, &["East", ""]), Some(15.0));
+        assert_eq!(g(&wb, &["East", "Apple", ""]), Some(3.0));
+        assert_eq!(wb.sheets[idx].pivot.as_ref().unwrap().data.get(&[], &[], 0), Some(255.0));
+    }
+
+    #[test]
+    fn test_pivot_set_layout_in_place_toggle() {
+        use roe_model::calc::PivotLayoutMode as M;
+        let mut wb = build_3level_pivot("sum");
+        let idx = wb.sheets.len() - 1;
+        let layout_key = |wb: &Workbook| {
+            pivot_config_value(wb, idx).unwrap()["layout"].as_str().unwrap().to_string()
+        };
+        let m0 = wb.sheets[idx].pivot.as_ref().unwrap();
+        let (dcs0, lc0) = (m0.data_col_start, m0.last_col);
+        assert_eq!(dcs0, 3, "默认大纲:3 个行字段占 3 列");
+        assert_eq!(layout_key(&wb), "outline");
+
+        // 紧凑
+        pivot_set_layout_in_place(&mut wb, idx, M::Compact).unwrap();
+        let m = wb.sheets[idx].pivot.as_ref().unwrap();
+        assert_eq!(m.layout_mode, M::Compact);
+        assert_eq!(m.data_col_start, 1, "紧凑:行字段只占 1 列");
+        assert_eq!(m.last_col, lc0 - 2, "last_col 随数据区起点前移 2 列");
+        assert_eq!(count_subtotal_nodes(&m.row_tree), 6, "小计节点不受布局影响");
+        assert_eq!(m.data.get(&[], &[], 0), Some(255.0));
+        assert_eq!(m.data.get(&p3(&["East", "Apple", "S"]), &[], 0), Some(1.0));
+        assert_eq!(layout_key(&wb), "compact");
+
+        // 表格
+        pivot_set_layout_in_place(&mut wb, idx, M::Tabular).unwrap();
+        let m = wb.sheets[idx].pivot.as_ref().unwrap();
+        assert_eq!(m.data_col_start, 3);
+        assert_eq!(layout_key(&wb), "tabular");
+
+        // 回大纲,与初始一致
+        pivot_set_layout_in_place(&mut wb, idx, M::Outline).unwrap();
+        let m = wb.sheets[idx].pivot.as_ref().unwrap();
+        assert_eq!((m.data_col_start, m.last_col), (dcs0, lc0));
+        assert_eq!(layout_key(&wb), "outline");
+    }
+
+    #[test]
+    fn test_pivot_set_subtotals_position_in_place_toggle() {
+        use roe_model::calc::PivotLayoutMode as M;
+        let mut wb = build_3level_pivot("sum");
+        let idx = wb.sheets.len() - 1;
+        let top_key = |wb: &Workbook| {
+            pivot_config_value(wb, idx).unwrap()["subtotals_top"].as_bool().unwrap()
+        };
+        assert!(top_key(&wb), "默认小计在上");
+        assert!(!wb.sheets[idx].pivot.as_ref().unwrap().subtotals_bottom);
+
+        pivot_set_subtotals_position_in_place(&mut wb, idx, false).unwrap();
+        assert!(!top_key(&wb));
+        assert!(wb.sheets[idx].pivot.as_ref().unwrap().subtotals_bottom);
+
+        // 刷新类操作后开关不丢(回灌)
+        pivot_set_layout_in_place(&mut wb, idx, M::Compact).unwrap();
+        assert!(wb.sheets[idx].pivot.as_ref().unwrap().subtotals_bottom, "切布局后开关不丢");
+        pivot_set_subtotals_in_place(&mut wb, idx, true, true).unwrap();
+        assert!(wb.sheets[idx].pivot.as_ref().unwrap().subtotals_bottom, "切小计后开关不丢");
+
+        // 探针:数据矩阵里是否有中间层键(ROOT-063 重复值风险),只打印不断言
+        let m = wb.sheets[idx].pivot.as_ref().unwrap();
+        eprintln!("PROBE [East]={:?} [East,Apple]={:?} [East,\"\"]={:?}",
+            m.data.get(&p3(&["East"]), &[], 0),
+            m.data.get(&p3(&["East", "Apple"]), &[], 0),
+            m.data.get(&p3(&["East", ""]), &[], 0));
+
+        // 切回在上
+        pivot_set_subtotals_position_in_place(&mut wb, idx, true).unwrap();
+        assert!(top_key(&wb));
+    }
+
+    #[test]
+    fn test_pivot_set_layout_in_place_rejects_bad_input() {
+        let mut wb = build_3level_pivot("sum");
+        assert!(pivot_set_layout_in_place(&mut wb, 0, roe_model::calc::PivotLayoutMode::Compact).is_err(), "非透视 sheet");
+        assert!(pivot_set_layout_in_place(&mut wb, 99, roe_model::calc::PivotLayoutMode::Compact).is_err(), "越界");
+    }
+
+    #[test]
+    fn test_pivot_set_subtotals_in_place_rejects_bad_input() {
+        let mut wb = build_3level_pivot("sum");
+        assert!(pivot_set_subtotals_in_place(&mut wb, 0, false, false).is_err(), "非透视 sheet");
+        assert!(pivot_set_subtotals_in_place(&mut wb, 99, false, false).is_err(), "越界");
+    }
+
+    #[test]
+    fn test_pivot_set_grand_totals_in_place_toggle_and_survive_refresh() {
+        let mut wb = build_3level_pivot("sum");
+        let idx = wb.sheets.len() - 1;
+        let flags = |wb: &Workbook| {
+            let m = wb.sheets[idx].pivot.as_ref().unwrap();
+            (m.row_grand_totals, m.col_grand_totals)
+        };
+        assert_eq!(flags(&wb), (true, true), "默认显示");
+
+        pivot_set_grand_totals_in_place(&mut wb, idx, false, true).unwrap();
+        assert_eq!(flags(&wb), (false, true));
+
+        // 刷新（改排序触发）后开关不能丢
+        pivot_set_sort_in_place(&mut wb, idx, "Region", false).unwrap();
+        assert_eq!(flags(&wb), (false, true), "刷新后总计开关应保持");
+
+        pivot_set_grand_totals_in_place(&mut wb, idx, true, true).unwrap();
+        assert_eq!(flags(&wb), (true, true));
+        // 数据层总计键始终保留
+        assert_eq!(wb.sheets[idx].pivot.as_ref().unwrap().data.get(&[], &[], 0), Some(255.0));
+
+        assert!(pivot_set_grand_totals_in_place(&mut wb, 0, false, false).is_err(), "非透视 sheet");
+        assert!(pivot_set_grand_totals_in_place(&mut wb, 99, false, false).is_err(), "越界");
+    }
+
+    #[test]
+    fn test_pivot_subtotal_3level_with_col_field() {
+        // 3 个行字段 + 1 个列字段 Ch(X/Y 交替)，Sales 为 2 的幂。
+        let mut sheet = make_test_sheet_3row();
+        let chs = ["Ch", "X", "Y", "X", "Y", "X", "Y", "X", "Y"];
+        sheet.cells.cols.insert(
+            4,
+            SparseColumn {
+                blocks: sv![CellBlock {
+                    start_row: 0,
+                    values: chs.iter().map(|t| CellValue::Text((*t).into())).collect(),
+                }],
+            },
+        );
+        let mut wb = Workbook {
+            sheets: vec![sheet],
+            named_ranges: Default::default(),
+            named_formulas: HashMap::new(),
+            styles: Default::default(),
+            formula_dialect_source: Default::default(),
+        };
+        let cfg = PivotConfig {
+            rows: vec!["Region".into(), "Product".into(), "Size".into()],
+            cols: vec!["Ch".into()],
+            values: vec!["Sales".into()],
+            agg: "sum".into(),
+            filters: Default::default(),
+        };
+        let idx = pivot_sheet_into_workbook_v2(&mut wb, 0, &cfg, "P3c".into()).unwrap();
+        let meta = wb.sheets[idx].pivot.as_ref().unwrap();
+        let g = |r: &[&str], c: &[&str]| meta.data.get(&p3(r), &p3(c), 0);
+        // 中层小计行 × 各列
+        assert_eq!(g(&["East", "Apple", ""], &["X"]), Some(1.0));
+        assert_eq!(g(&["East", "Apple", ""], &["Y"]), Some(2.0));
+        // 中层小计行 × 总计列
+        assert_eq!(g(&["East", "Apple", ""], &[]), Some(3.0), "行小计x总计列(中层)");
+        // 外层小计行 × 各列 / 总计列
+        assert_eq!(g(&["East", ""], &["X"]), Some(5.0));
+        assert_eq!(g(&["East", ""], &["Y"]), Some(10.0));
+        assert_eq!(g(&["East", ""], &[]), Some(15.0), "行小计x总计列(外层)");
+        assert_eq!(g(&["West", "Banana", ""], &[]), Some(192.0));
+        assert_eq!(g(&[], &[]), Some(255.0));
+    }
+
+    fn build_ch_wb() -> Workbook {
+        let mut sheet = make_test_sheet_3row();
+        let chs = ["Ch", "X", "Y", "X", "Y", "X", "Y", "X", "Y"];
+        sheet.cells.cols.insert(
+            4,
+            SparseColumn {
+                blocks: sv![CellBlock {
+                    start_row: 0,
+                    values: chs.iter().map(|t| CellValue::Text((*t).into())).collect(),
+                }],
+            },
+        );
+        Workbook {
+            sheets: vec![sheet],
+            named_ranges: Default::default(),
+            named_formulas: HashMap::new(),
+            styles: Default::default(),
+            formula_dialect_source: Default::default(),
+        }
+    }
+
+    #[test]
+    fn test_pivot_col_subtotal_3level() {
+        // 3 个列字段 Region/Product/Size + 1 个行字段 Ch。Ch 由 Size 决定(S->X, L->Y)。
+        let mut wb = build_ch_wb();
+        let cfg = PivotConfig {
+            rows: vec!["Ch".into()],
+            cols: vec!["Region".into(), "Product".into(), "Size".into()],
+            values: vec!["Sales".into()],
+            agg: "sum".into(),
+            filters: Default::default(),
+        };
+        let idx = pivot_sheet_into_workbook_v2(&mut wb, 0, &cfg, "PCol3".into()).unwrap();
+        let meta = wb.sheets[idx].pivot.as_ref().unwrap();
+
+        // 树:Region 2 个;每个 Region 子节点 = Apple、Banana、小计;每个 Product = S、L、小计
+        assert_eq!(meta.col_tree.children.len(), 2);
+        for region in &meta.col_tree.children {
+            assert_eq!(region.children.len(), 3, "{} 应有 2 Product + 1 小计", region.value);
+            let last = region.children.last().unwrap();
+            assert!(last.is_subtotal);
+            assert_eq!(last.value, region.value);
+            for prod in region.children.iter().filter(|c| !c.is_subtotal) {
+                assert_eq!(prod.children.len(), 3, "{}/{} 应有 2 Size + 1 小计", region.value, prod.value);
+                assert!(prod.children.last().unwrap().is_subtotal);
+            }
+        }
+
+        let g = |r: &[&str], c: &[&str]| meta.data.get(&p3(r), &p3(c), 0);
+        // 叶子
+        assert_eq!(g(&["X"], &["East", "Apple", "S"]), Some(1.0));
+        // 中层列小计(键长 3)
+        assert_eq!(g(&["X"], &["East", "Apple", ""]), Some(1.0));
+        assert_eq!(g(&["Y"], &["East", "Apple", ""]), Some(2.0));
+        assert_eq!(g(&["X"], &["West", "Banana", ""]), Some(64.0));
+        assert_eq!(g(&["Y"], &["West", "Banana", ""]), Some(128.0));
+        // 外层列小计(键长 2)
+        assert_eq!(g(&["X"], &["East", ""]), Some(5.0));
+        assert_eq!(g(&["Y"], &["East", ""]), Some(10.0));
+        assert_eq!(g(&["X"], &["West", ""]), Some(80.0));
+        assert_eq!(g(&["Y"], &["West", ""]), Some(160.0));
+        // 小计格 = 下属叶子之和(列方向特有的正确性检查)
+        let mut sum = 0.0;
+        for prod in ["Apple", "Banana"] {
+            for size in ["S", "L"] {
+                if let Some(v) = g(&["X"], &["East", prod, size]) { sum += v; }
+            }
+        }
+        assert_eq!(g(&["X"], &["East", ""]), Some(sum), "East 外层小计应等于下属叶子之和");
+        // 总计行 × 列小计(行键 [])
+        assert_eq!(g(&[], &["East", "Apple", ""]), Some(3.0));
+        assert_eq!(g(&[], &["West", "Banana", ""]), Some(192.0));
+        assert_eq!(g(&[], &["East", ""]), Some(15.0));
+        assert_eq!(g(&[], &["West", ""]), Some(240.0));
+        // 行 × 总计列、总计
+        assert_eq!(g(&["X"], &[]), Some(85.0));
+        assert_eq!(g(&["Y"], &[]), Some(170.0));
+        assert_eq!(g(&[], &[]), Some(255.0), "总计不应把小计重复计入");
+    }
+
+    #[test]
+    fn test_pivot_col_subtotal_corner_2row_2col() {
+        // 行 Region/Product(2 级),列 Size/Ch(2 级):覆盖行小计 × 列小计角落格
+        let mut wb = build_ch_wb();
+        let cfg = PivotConfig {
+            rows: vec!["Region".into(), "Product".into()],
+            cols: vec!["Size".into(), "Ch".into()],
+            values: vec!["Sales".into()],
+            agg: "sum".into(),
+            filters: Default::default(),
+        };
+        let idx = pivot_sheet_into_workbook_v2(&mut wb, 0, &cfg, "PCorner".into()).unwrap();
+        let meta = wb.sheets[idx].pivot.as_ref().unwrap();
+        let g = |r: &[&str], c: &[&str]| meta.data.get(&p3(r), &p3(c), 0);
+        // 列小计 × 叶子行
+        assert_eq!(g(&["East", "Apple"], &["S", ""]), Some(1.0));
+        assert_eq!(g(&["East", "Banana"], &["S", ""]), Some(4.0));
+        // 角落:行小计 × 列小计
+        assert_eq!(g(&["East", ""], &["S", ""]), Some(5.0));
+        assert_eq!(g(&["East", ""], &["L", ""]), Some(10.0));
+        assert_eq!(g(&["West", ""], &["S", ""]), Some(80.0));
+        assert_eq!(g(&["West", ""], &["L", ""]), Some(160.0));
+        // 行小计 × 叶子列
+        assert_eq!(g(&["East", ""], &["S", "X"]), Some(5.0));
+        // 总计行 × 列小计;行小计 × 总计列
+        assert_eq!(g(&[], &["S", ""]), Some(85.0));
+        assert_eq!(g(&["East", ""], &[]), Some(15.0));
+        assert_eq!(g(&[], &[]), Some(255.0));
+    }
+
+    #[test]
+    fn test_pivot_col_subtotal_3level_off() {
+        let mut wb = build_ch_wb();
+        let cfg = PivotConfig {
+            rows: vec!["Ch".into()],
+            cols: vec!["Region".into(), "Product".into(), "Size".into()],
+            values: vec!["Sales".into()],
+            agg: "sum".into(),
+            filters: Default::default(),
+        };
+        let idx = pivot_sheet_into_workbook_v2_opt(
+            &mut wb, 0, &cfg, "PColOff".into(), &[],
+            PivotOpts { row_subtotals: true, col_subtotals: false },
+        ).unwrap();
+        let meta = wb.sheets[idx].pivot.as_ref().unwrap();
+        assert_eq!(count_subtotal_nodes(&meta.col_tree), 0, "关闭列小计后列树不应有小计节点");
+        assert!(meta.data.get(&p3(&["X"]), &p3(&["East", ""]), 0).is_none());
+        assert!(meta.data.get(&p3(&["X"]), &p3(&["East", "Apple", ""]), 0).is_none());
+        assert_eq!(meta.data.get(&p3(&["X"]), &p3(&["East", "Apple", "S"]), 0), Some(1.0));
+        assert_eq!(meta.data.get(&[], &[], 0), Some(255.0));
+    }
+
+    #[test]
+    fn test_pivot_col_subtotals_off() {
+        let mut wb = Workbook {
+            sheets: vec![make_test_sheet_2row2col()],
+            named_ranges: Default::default(),
+            named_formulas: HashMap::new(),
+            styles: Default::default(),
+            formula_dialect_source: Default::default(),
+        };
+        let cfg = PivotConfig {
+            rows: vec!["Category".into(), "Item".into()],
+            cols: vec!["Region".into(), "Channel".into()],
+            values: vec!["Sales".into()],
+            agg: "sum".into(),
+            filters: Default::default(),
+        };
+        let idx = pivot_sheet_into_workbook_v2_opt(
+            &mut wb, 0, &cfg, "ColOff".into(), &[],
+            PivotOpts { row_subtotals: true, col_subtotals: false },
+        ).unwrap();
+        let meta = wb.sheets[idx].pivot.as_ref().unwrap();
+        assert!(meta.hide_col_subtotals && !meta.hide_row_subtotals);
+        assert_eq!(count_subtotal_nodes(&meta.col_tree), 0, "列树不应有小计节点");
+        assert!(count_subtotal_nodes(&meta.row_tree) > 0, "行小计仍在");
+        let g = |r: &[&str], c: &[&str]| meta.data.get(&p3(r), &p3(c), 0);
+        assert_eq!(g(&[], &["东", ""]), None, "总计x列小计应消失");
+        assert_eq!(g(&["服装", ""], &["东", ""]), None, "角落应消失");
+        assert_eq!(g(&["服装", "上衣"], &["东", ""]), None, "叶子行x列小计应消失");
+        assert_eq!(g(&["服装", ""], &[]), Some(360.0), "行小计x总计列仍在");
+        assert_eq!(g(&[], &[]), Some(1360.0));
+        assert_eq!(g(&["服装", "上衣"], &["东", "线上"]), Some(10.0), "明细不受影响");
+    }
+
+    #[test]
+    fn test_pivot_subtotal_3level_sum() {
+        let wb = build_3level_pivot("sum");
+        let meta = wb.sheets.last().unwrap().pivot.as_ref().expect("pivot meta");
+
+        // 树：Region 层 2 个节点；每个 Region 的子节点 = Apple、Banana、"{Region} Total"
+        assert_eq!(meta.row_tree.children.len(), 2);
+        for region in &meta.row_tree.children {
+            assert!(!region.is_subtotal);
+            assert_eq!(region.children.len(), 3, "{} 应有 2 个 Product + 1 个小计", region.value);
+            let last = region.children.last().unwrap();
+            assert!(last.is_subtotal, "{} 的最后一个子节点应是小计", region.value);
+            assert_eq!(last.value, region.value);
+            // 中层：每个 Product 的子节点 = S、L、"{Product} Total"
+            for prod in region.children.iter().filter(|c| !c.is_subtotal) {
+                assert_eq!(prod.children.len(), 3, "{}/{} 应有 2 个 Size + 1 个小计", region.value, prod.value);
+                let plast = prod.children.last().unwrap();
+                assert!(plast.is_subtotal, "{}/{} 中层小计缺失", region.value, prod.value);
+                assert_eq!(plast.value, prod.value);
+                // 最内层叶子不应再有小计
+                for leaf in prod.children.iter().filter(|c| !c.is_subtotal) {
+                    assert!(leaf.children.is_empty());
+                }
+            }
+        }
+
+        // 矩阵：渲染层小计路径 = 父路径 + [""]（长度 k+1，不补到 N 位）
+        let g = |path: &[&str]| meta.data.get(&p3(path), &[], 0);
+        assert_eq!(g(&["East", "Apple", "S"]), Some(1.0));
+        assert_eq!(g(&["East", "Apple", ""]), Some(3.0), "East/Apple 中层小计 = 1+2");
+        assert_eq!(g(&["East", "Banana", ""]), Some(12.0), "East/Banana 中层小计 = 4+8");
+        assert_eq!(g(&["West", "Apple", ""]), Some(48.0), "West/Apple 中层小计 = 16+32");
+        assert_eq!(g(&["West", "Banana", ""]), Some(192.0), "West/Banana 中层小计 = 64+128");
+        assert_eq!(g(&["East", ""]), Some(15.0), "East 外层小计 = 1+2+4+8");
+        assert_eq!(g(&["West", ""]), Some(240.0), "West 外层小计 = 16+32+64+128");
+        // 总计不翻倍
+        assert_eq!(meta.data.get(&[], &[], 0), Some(255.0), "总计不应把小计重复计入");
+    }
+
+    #[test]
+    fn test_pivot_subtotal_3level_mean() {
+        let wb = build_3level_pivot("mean");
+        let meta = wb.sheets.last().unwrap().pivot.as_ref().expect("pivot meta");
+        let g = |path: &[&str]| meta.data.get(&p3(path), &[], 0);
+        // 均值必须回原始明细计算，不是子均值的均值
+        assert_eq!(g(&["East", "Apple", ""]), Some(1.5), "East/Apple 均值 = (1+2)/2");
+        assert_eq!(g(&["East", ""]), Some(3.75), "East 均值 = (1+2+4+8)/4");
+        assert_eq!(g(&["West", ""]), Some(60.0), "West 均值 = 240/4");
+        assert_eq!(meta.data.get(&[], &[], 0), Some(31.875), "总计均值 = 255/8");
+    }
     use super::*;
     use std::collections::HashMap;
     use smallvec::smallvec as sv;
@@ -2112,6 +3271,130 @@ mod tests {
     }
 
     #[test]
+    fn test_sheet_to_dataframe_formula_uses_cached() {
+        // 在基础表上追加第 4 列:表头 + 4 个公式格(缓存值为数字),应成为数值列而不是公式文本
+        let mut sheet = make_test_sheet();
+        let mut vals: smallvec::SmallVec<[CellValue; 8]> = smallvec::SmallVec::new();
+        vals.push(CellValue::Text("Double".into()));
+        for n in [200.0, 400.0, 300.0, 100.0] {
+            vals.push(CellValue::Formula {
+                source: "=C2*2".into(),
+                cached: Box::new(CellValue::Number(n)),
+            });
+        }
+        sheet.cells.cols.insert(
+            3,
+            SparseColumn { blocks: sv![CellBlock { start_row: 0, values: vals.into_iter().collect() }] },
+        );
+        let df = sheet_to_dataframe(&sheet).unwrap();
+        assert_eq!(df.height(), 4);
+        let col = df.column("Double").unwrap().as_materialized_series().clone();
+        assert_eq!(col.dtype(), &DataType::Float64);
+        let sum: f64 = col.f64().unwrap().iter().flatten().sum();
+        assert_eq!(sum, 1000.0);
+    }
+
+    fn make_date_test_sheet() -> Sheet {
+        // 基础表 + 第 4 列 "Day":表头 + 4 个数据格(序列号,第 3 格为空),数据格带 m/d/yyyy 格式
+        let mut sheet = make_test_sheet();
+        let mut vals: smallvec::SmallVec<[CellValue; 8]> = smallvec::SmallVec::new();
+        vals.push(CellValue::Text("Day".into()));
+        vals.push(CellValue::Number(45292.0)); // 2024-01-01
+        vals.push(CellValue::Number(45293.0)); // 2024-01-02
+        vals.push(CellValue::Empty);
+        vals.push(CellValue::Number(45658.0)); // 2025-01-01
+        sheet.cells.cols.insert(
+            3,
+            SparseColumn { blocks: sv![CellBlock { start_row: 0, values: vals.into_iter().collect() }] },
+        );
+        for r in 1..=4u32 {
+            sheet.cell_formats.insert(
+                (r, 3),
+                roe_model::calc::CellFormat {
+                    num_format: Some("m/d/yyyy".into()),
+                    ..Default::default()
+                },
+            );
+        }
+        sheet
+    }
+
+    #[test]
+    fn test_sheet_to_dataframe_typed_date_column() {
+        let sheet = make_date_test_sheet();
+        let df = sheet_to_dataframe_typed(&sheet).unwrap();
+        let col = df.column("Day").unwrap().as_materialized_series().clone();
+        assert_eq!(col.dtype(), &DataType::Date);
+        let days = col.cast(&DataType::Int32).unwrap();
+        let days = days.i32().unwrap();
+        assert_eq!(days.get(0), Some(19723)); // 45292 - 25569
+        assert_eq!(days.get(1), Some(19724));
+        assert_eq!(days.get(2), None);
+        assert_eq!(days.get(3), Some(20089)); // 45658 - 25569
+        // 其它列不受影响
+        assert_eq!(df.height(), 4);
+    }
+
+    #[test]
+    fn test_sheet_to_dataframe_typed_datetime_column() {
+        // 带小数部分(时间)的日期列 → Datetime(ms)
+        let mut sheet = make_date_test_sheet();
+        sheet.cells.cols.get_mut(&3).unwrap().blocks[0].values[1] = CellValue::Number(45292.5);
+        for r in 1..=4u32 {
+            sheet.cell_formats.insert(
+                (r, 3),
+                roe_model::calc::CellFormat {
+                    num_format: Some("yyyy-mm-dd hh:mm".into()),
+                    ..Default::default()
+                },
+            );
+        }
+        let df = sheet_to_dataframe_typed(&sheet).unwrap();
+        let col = df.column("Day").unwrap().as_materialized_series().clone();
+        assert_eq!(col.dtype(), &DataType::Datetime(polars::prelude::TimeUnit::Milliseconds, None));
+        let ms = col.cast(&DataType::Int64).unwrap();
+        let ms = ms.i64().unwrap();
+        assert_eq!(ms.get(0), Some(1_704_110_400_000)); // 2024-01-01 12:00
+        assert_eq!(ms.get(1), Some(1_704_153_600_000)); // 2024-01-02 00:00
+        assert_eq!(ms.get(2), None);
+    }
+
+    #[test]
+    fn test_dataframe_to_sheet_date_columns() {
+        // Date 列 → 序列号 + yyyy-mm-dd;Datetime(ms) 列 → 序列号(含小数) + yyyy-mm-dd hh:mm:ss
+        let d = Series::new("d".into(), vec![Some(19723i32), None, Some(20089)])
+            .cast(&DataType::Date).unwrap();
+        let t = Series::new("t".into(), vec![Some(1_704_110_400_000i64), Some(1_704_153_600_000), None])
+            .cast(&DataType::Datetime(polars::prelude::TimeUnit::Milliseconds, None)).unwrap();
+        let n = Series::new("n".into(), vec![1.5f64, 2.5, 3.5]);
+        let df = DataFrame::new(3, vec![d.into(), t.into(), n.into()]).unwrap();
+        let sheet = dataframe_to_sheet("r".into(), &df).unwrap();
+
+        assert_eq!(get_cell(&sheet.cells, 1, 0), CellValue::Number(45292.0));
+        assert_eq!(get_cell(&sheet.cells, 2, 0), CellValue::Empty);
+        assert_eq!(get_cell(&sheet.cells, 3, 0), CellValue::Number(45658.0));
+        assert_eq!(get_cell(&sheet.cells, 1, 1), CellValue::Number(45292.5));
+        assert_eq!(get_cell(&sheet.cells, 2, 1), CellValue::Number(45293.0));
+        assert_eq!(get_cell(&sheet.cells, 3, 1), CellValue::Empty);
+
+        let fmt = |r: u32, c: u32| sheet.cell_formats.get(&(r, c)).and_then(|f| f.num_format.clone());
+        assert_eq!(fmt(1, 0).as_deref(), Some("yyyy-mm-dd"));
+        assert_eq!(fmt(3, 0).as_deref(), Some("yyyy-mm-dd"));
+        assert_eq!(fmt(1, 1).as_deref(), Some("yyyy-mm-dd hh:mm:ss"));
+        assert_eq!(fmt(1, 2), None);
+        assert_eq!(fmt(0, 0), None); // 表头不设格式
+    }
+
+    #[test]
+    fn test_sheet_to_dataframe_untyped_keeps_float_for_date_column() {
+        // 老函数行为不变:日期列仍是 Float64(透视等老路径依赖这一点)
+        let sheet = make_date_test_sheet();
+        let df = sheet_to_dataframe(&sheet).unwrap();
+        let col = df.column("Day").unwrap().as_materialized_series().clone();
+        assert_eq!(col.dtype(), &DataType::Float64);
+    }
+
+    #[test]
     fn test_pivot_into_workbook_v2() {
         let mut wb = make_workbook();
         let cfg = PivotConfig {
@@ -2172,6 +3455,20 @@ mod tests {
         let meta = wb.sheets[idx].pivot.as_ref().expect("pivot meta should be set");
         assert_eq!(meta.filter_fields.len(), 1, "filter_fields 应该被填充，不应为空");
         assert_eq!(meta.filter_fields[0].name, "Region");
+    }
+
+    #[test]
+    fn test_pivot_v2_unique_sorted_numeric_and_blank() {
+        let n = Series::new("n".into(), vec![10.0f64, 2.0, 1.0, 2.0, 100.0]);
+        let m = Series::new("m".into(), vec![Some(10.0f64), None, Some(2.0), Some(10.0), Some(1.0)]);
+        let s_col = Series::new("s".into(), vec!["b", "a", "c", "a", "10"]);
+        let df = DataFrame::new(5, vec![n.into(), m.into(), s_col.into()]).unwrap();
+        // 数值列按数值排序,不是字典序
+        assert_eq!(pivot_v2_unique_sorted(&df, "n").unwrap(), vec!["1", "2", "10", "100"]);
+        // 含空值:数值排序,空值排最后
+        assert_eq!(pivot_v2_unique_sorted(&df, "m").unwrap(), vec!["1", "2", "10", ""]);
+        // 文本列保持字典序
+        assert_eq!(pivot_v2_unique_sorted(&df, "s").unwrap(), vec!["10", "a", "b", "c"]);
     }
 
     #[test]
@@ -2330,6 +3627,18 @@ mod tests {
         assert_eq!(v["filters"], serde_json::json!([]));
         assert_eq!(v["source_idx"], serde_json::json!(0));
         assert_eq!(v["fields"], serde_json::json!(["Region", "Product", "Sales"]));
+        // 小计/总计开关的读回（base_pivot 走 v2 默认：小计显示、总计显示）
+        assert_eq!(v["subtotals_row"], serde_json::json!(true));
+        assert_eq!(v["subtotals_col"], serde_json::json!(true));
+        assert_eq!(v["grand_bottom"], serde_json::json!(true));
+        assert_eq!(v["grand_right"], serde_json::json!(true));
+        pivot_set_subtotals_in_place(&mut wb, idx, false, true).unwrap();
+        pivot_set_grand_totals_in_place(&mut wb, idx, true, false).unwrap();
+        let v2 = pivot_config_value(&wb, idx).unwrap();
+        assert_eq!(v2["subtotals_row"], serde_json::json!(false));
+        assert_eq!(v2["subtotals_col"], serde_json::json!(true));
+        assert_eq!(v2["grand_bottom"], serde_json::json!(true));
+        assert_eq!(v2["grand_right"], serde_json::json!(false));
         assert!(pivot_config_value(&wb, 0).is_err(), "非透视 sheet 应报错");
         assert!(pivot_config_value(&wb, 99).is_err(), "越界应报错");
     }
@@ -2464,14 +3773,14 @@ mod tests {
         // 行表头
         assert_eq!(sh.cells.get(3, 0).to_display_string(), "East");
         assert_eq!(sh.cells.get(4, 1).to_display_string(), "Apple");
-        assert_eq!(sh.cells.get(6, 0).to_display_string(), "East Total");
-        assert_eq!(sh.cells.get(10, 0).to_display_string(), "West Total");
-        // 数据与小计
+        assert_eq!(sh.cells.get(6, 0).to_display_string(), "West");
+        // 数据与小计(大纲:小计并入上级行,East 行带小计值)
+        assert!(matches!(sh.cells.get(3, 2), CellValue::Number(v) if v == 300.0));
         assert!(matches!(sh.cells.get(4, 2), CellValue::Number(v) if v == 100.0));
-        assert!(matches!(sh.cells.get(6, 2), CellValue::Number(v) if v == 300.0));
+        assert!(matches!(sh.cells.get(6, 2), CellValue::Number(v) if v == 200.0));
         // 总计
-        assert_eq!(sh.cells.get(11, 0).to_display_string(), "总计");
-        assert!(matches!(sh.cells.get(11, 2), CellValue::Number(v) if v == 500.0));
+        assert_eq!(sh.cells.get(9, 0).to_display_string(), "总计");
+        assert!(matches!(sh.cells.get(9, 2), CellValue::Number(v) if v == 500.0));
     }
 
     #[test]
@@ -2505,7 +3814,7 @@ mod tests {
             let subtotal_children: Vec<_> = outer.children.iter().filter(|c| c.is_subtotal).collect();
             assert_eq!(subtotal_children.len(), 1, "应恰好有1个小计子节点");
             let subtotal_node = subtotal_children[0];
-            assert_eq!(subtotal_node.value, format!("{} Total", outer.value));
+            assert_eq!(subtotal_node.value, outer.value);
             // 小计节点应排在最后（子节点末尾追加）
             assert!(outer.children.last().unwrap().is_subtotal, "小计节点应位于子节点末尾");
         }
@@ -2881,5 +4190,110 @@ mod cjk_sql_tests {
     fn cjk_self_join_with_alias() {
         let out = run("SELECT u.姓名 FROM 用户表 u JOIN 用户表 v ON u.姓名 = v.姓名").unwrap();
         assert_eq!(out.height(), 3);
+    }
+}
+
+#[cfg(test)]
+mod xlsx_preview_tests {
+    use super::*;
+
+    fn make_xlsx(name: &str) -> String {
+        let p = std::env::temp_dir().join(format!("roe_{}_{}.xlsx", name, std::process::id()));
+        let mut wb = rust_xlsxwriter::Workbook::new();
+        let ws = wb.add_worksheet();
+        ws.write_string(0, 0, "a").unwrap();
+        ws.write_string(0, 1, "b").unwrap();
+        ws.write_string(0, 2, "c").unwrap();
+        for i in 1..=30u32 {
+            ws.write_string(i, 0, format!("r{i}")).unwrap();
+            ws.write_number(i, 1, i as f64).unwrap();
+            if i % 2 == 0 {
+                ws.write_string(i, 2, "x").unwrap();
+            }
+        }
+        wb.save(&p).unwrap();
+        p.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn xlsx_preview_head_streams_and_keeps_sparse_columns() {
+        let path = make_xlsx("prev");
+        let s = xlsx_preview_head(&path, 10).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["preview_only"], true);
+        assert_eq!(v["cols"], 3);
+        assert_eq!(v["approx_rows"], 30);
+        let rows = v["head"]["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 10);
+        assert_eq!(rows[0][0], "r1");
+        assert_eq!(rows[0][1], "1");
+        assert_eq!(rows[0][2], "", "稀疏单元格应补空串而不是错位");
+        assert_eq!(rows[1][2], "x");
+        assert!(v["head"].get("total_rows").is_none());
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+
+#[cfg(test)]
+mod describe_tests {
+    use super::*;
+
+    #[test]
+    fn lazy_describe_numeric_and_text() {
+        let df = polars::prelude::df!(
+            "n" => [Some(1i64), Some(2), Some(3), Some(4), None],
+            "s" => [Some("a"), Some("b"), None, Some("d"), Some("c")]
+        )
+        .unwrap();
+        let out = lazy_describe(df.lazy()).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["columns"], serde_json::json!(["statistic", "n", "s"]));
+        let rows = v["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 9);
+        let row = |k: &str| rows.iter().find(|r| r[0] == k).unwrap().clone();
+        assert_eq!(row("count")[1], "4");
+        assert_eq!(row("null_count")[1], "1");
+        assert_eq!(row("mean")[1], "2.5");
+        assert_eq!(row("50%")[1], "2.5");
+        assert_eq!(row("mean")[2], "null");
+        assert_eq!(row("min")[2], "a");
+        assert_eq!(row("max")[2], "d");
+        assert_eq!(row("count")[2], "4");
+    }
+
+    #[test]
+    fn lazy_overview_contains_describe() {
+        let df = polars::prelude::df!(
+            "n" => [1i64, 2, 3],
+            "s" => ["a", "b", "c"]
+        )
+        .unwrap();
+        let out = lazy_overview(df.lazy(), 2).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["rows"], 3);
+        assert_eq!(v["describe"]["columns"], serde_json::json!(["statistic", "n", "s"]));
+        assert_eq!(v["describe"]["rows"].as_array().unwrap().len(), 9);
+        assert_eq!(v["head"]["rows"].as_array().unwrap().len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod layout_mode_tests {
+    use super::pivot_data_col_start;
+    use roe_model::calc::PivotLayoutMode as M;
+
+    #[test]
+    fn data_col_start_by_mode() {
+        assert_eq!(pivot_data_col_start(&M::Compact, 3), 1);
+        assert_eq!(pivot_data_col_start(&M::Outline, 3), 3);
+        assert_eq!(pivot_data_col_start(&M::Tabular, 3), 3);
+        assert_eq!(pivot_data_col_start(&M::Outline, 0), 1);
+        assert_eq!(pivot_data_col_start(&M::Compact, 0), 1);
+    }
+
+    #[test]
+    fn default_is_outline() {
+        assert_eq!(M::default(), M::Outline);
     }
 }

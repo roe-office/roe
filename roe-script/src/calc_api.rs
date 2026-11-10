@@ -705,7 +705,7 @@ fn parse_chart_spec(val: &serde_json::Value) -> Result<(
             data,
             color,
             as_line: so.get("as_line").and_then(|v| v.as_bool()).unwrap_or(false),
-            trendline: so.get("trendline").and_then(|v| v.as_bool()).unwrap_or(false),
+            trendline: so.get("trendline").and_then(|v| v.as_bool()).unwrap_or(false), x_values: None, sizes: None,
         });
     }
     Ok((kind, title, x_labels, series))
@@ -845,6 +845,21 @@ fn define_and_register_apis(engine: &mut Engine, is_readonly_env: bool) {
             let Some(s) = wb.sheets.get_mut(sheet as usize) else { return "err:sheet 越界".to_string(); };
             s.frozen_rows = rows as u32;
             s.frozen_cols = cols as u32;
+            "ok".to_string()
+        }).unwrap_or_else(|| "err:无打开的工作簿".to_string())
+    }, false;
+
+    fn "get_gridlines" => |sheet: i64| -> bool {
+        with_wb(|wb| {
+            let s = wb.sheets.get(sheet as usize)?;
+            Some(s.show_grid_lines != Some(false))
+        }).flatten().unwrap_or(true)
+    }, true;
+
+    fn "set_gridlines" => |sheet: i64, on: bool| -> String {
+        with_wb(|wb| {
+            let Some(s) = wb.sheets.get_mut(sheet as usize) else { return "err:sheet 越界".to_string(); };
+            s.show_grid_lines = if on { None } else { Some(false) };
             "ok".to_string()
         }).unwrap_or_else(|| "err:无打开的工作簿".to_string())
     }, false;
@@ -3662,8 +3677,7 @@ fn define_and_register_apis(engine: &mut Engine, is_readonly_env: bool) {
                 header_col: header_col as u32,
                 end_col: header_col as u32 + max_offset,
                 col_filters,
-                hidden_buttons: std::collections::HashSet::new(),
-            });
+                hidden_buttons: std::collections::HashSet::new(), other_filtered_cols: Default::default() });
             Some(())
         }).flatten().is_some();
         if !ok {
@@ -3784,8 +3798,7 @@ fn define_and_register_apis(engine: &mut Engine, is_readonly_env: bool) {
                 header_col: hc,
                 end_col: ec,
                 col_filters,
-                hidden_buttons,
-            });
+                hidden_buttons, other_filtered_cols: Default::default() });
             let hidden = hide.iter().filter(|b| **b).count();
             Some(format!(r#"{{"ok":true,"hidden":{},"visible":{}}}"#, hidden, n - hidden))
         })
@@ -4137,7 +4150,7 @@ fn define_and_register_apis(engine: &mut Engine, is_readonly_env: bool) {
                 grouping,
                 hole_size_pct,
                 data_labels,
-                slice_border_color: None,
+                slice_border_color: None, legend_pos: None,
             });
             Some(new_id)
         });
@@ -4699,8 +4712,8 @@ fn define_and_register_apis(engine: &mut Engine, is_readonly_env: bool) {
     // 与 roe_save_document_to_ooxml_bytes（C-ABI）走同一条 XlsxWriter。
     // 写出范围：cell值(Number/Text/Formula/Bool/Error/RichText) +
     // merged_cells + cell_formats/conditional_formatting + sheet_view +
-    // col/row hidden+outline_level；不含 col_widths/row_heights/
-    // frozen_rows/frozen_cols（详见 xlsx_writer.rs 及
+    // col/row hidden+outline_level + 冻结窗格(<pane>)；不含 col_widths/
+    // row_heights（详见 xlsx_writer.rs 及
     // roe-save-design.md §五记录的真实范围核实结果）。失败返回空字符串。
     fn "save_xlsx" => || -> String {
         with_wb(|wb| {
@@ -5747,8 +5760,7 @@ fn table_create_impl(
             header_col: c1,
             end_col: c2,
             col_filters: std::collections::HashMap::new(),
-            hidden_buttons: std::collections::HashSet::new(),
-        })
+            hidden_buttons: std::collections::HashSet::new(), other_filtered_cols: Default::default() })
     } else {
         None
     };
@@ -6497,6 +6509,42 @@ mod tests {
             let n: i64 = e.eval("get_sheet_count()").unwrap();
             assert_eq!(n, 1);
         });
+    }
+
+    #[test]
+    fn test_gridlines_get_set() {
+        let mut wb = empty_wb();
+        let mut e = rhai::Engine::new();
+        register(&mut e);
+        with_workbook(&mut wb, || {
+            // 默认(None)视为显示
+            let g: bool = e.eval("get_gridlines(0)").unwrap();
+            assert!(g, "默认应显示网格线");
+            // 关闭
+            let r: String = e.eval("set_gridlines(0, false)").unwrap();
+            assert_eq!(r, "ok");
+            let g: bool = e.eval("get_gridlines(0)").unwrap();
+            assert!(!g, "关闭后应为 false");
+            // 重新打开
+            let r: String = e.eval("set_gridlines(0, true)").unwrap();
+            assert_eq!(r, "ok");
+            let g: bool = e.eval("get_gridlines(0)").unwrap();
+            assert!(g, "重新打开应为 true");
+            // 越界:setter 报错,getter 回默认 true
+            let r: String = e.eval("set_gridlines(99, false)").unwrap();
+            assert!(r.starts_with("err:"), "{r}");
+            let g: bool = e.eval("get_gridlines(99)").unwrap();
+            assert!(g);
+        });
+        // 打开应写回 None(保存时不多写 showGridLines="1")
+        wb.sheets[0].show_grid_lines = Some(false);
+        let mut e2 = rhai::Engine::new();
+        register(&mut e2);
+        with_workbook(&mut wb, || {
+            let r: String = e2.eval("set_gridlines(0, true)").unwrap();
+            assert_eq!(r, "ok");
+        });
+        assert_eq!(wb.sheets[0].show_grid_lines, None, "打开应复位为 None");
     }
 
     #[test]
@@ -9961,8 +10009,7 @@ mod tests {
         wb.sheets[0].auto_filter = Some(roe_model::calc::AutoFilter {
             header_row: 0, header_col: 0, end_col: 1,
             col_filters: std::collections::HashMap::new(),
-            hidden_buttons: [1u32].into_iter().collect(),
-        });
+            hidden_buttons: [1u32].into_iter().collect(), other_filtered_cols: Default::default() });
         af_run(&mut wb, r#"apply_auto_filter_rows(0, 0, 0, 1, 6, `{"col_filters":{"0":["A"]}}`)"#);
         assert!(wb.sheets[0].auto_filter.as_ref().unwrap().hidden_buttons.contains(&1),
             "同表头位置应保留 hidden_buttons");

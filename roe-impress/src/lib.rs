@@ -6,3 +6,4 @@ pub mod placeholder_hints;
 pub mod animation;
 pub mod culling;
 pub mod chart;
+pub use roe_model::pattern;

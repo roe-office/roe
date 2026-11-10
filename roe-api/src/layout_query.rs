@@ -209,11 +209,14 @@ fn locate_in_frame(
                 resolved.italic,
                 offset_in_line,
             );
-            let line_abs_x_start = arena.pages[frame.page].margin_left + line.text_x_offset;
+            // 分栏：文字 x 要加上所在栏的 x 偏移，与 tile.rs 渲染一致；单栏时偏移为 0
+            let col_x_offset = arena.pages[frame.page].columns.col_x_offsets
+                .get(frame.column_index).copied().unwrap_or(0.0);
+            let line_abs_x_start = arena.pages[frame.page].margin_left + col_x_offset + line.text_x_offset;
             let x = x_in_line + line_abs_x_start;
-            eprintln!("[V96-ROE-DEBUG] locate_in_frame: offset_in_frame={} consumed={} line_len={} offset_in_line={} line.text={:?} x_in_line={:.2} margin_left={:.2} line.text_x_offset={:.2} line_abs_x_start={:.2} final_x={:.2}",
+            /*DBGOFF eprintln!("[V96-ROE-DEBUG] locate_in_frame: offset_in_frame={} consumed={} line_len={} offset_in_line={} line.text={:?} x_in_line={:.2} margin_left={:.2} line.text_x_offset={:.2} line_abs_x_start={:.2} final_x={:.2}",
                 offset_in_frame, consumed, line_len, offset_in_line, line.text, x_in_line,
-                arena.pages[frame.page].margin_left, line.text_x_offset, line_abs_x_start, x);
+                arena.pages[frame.page].margin_left, line.text_x_offset, line_abs_x_start, x); DBGOFF*/
 
             let page_idx = arena.page_order.iter().position(|&pid| pid == frame.page).unwrap_or(0);
             let y = frame.y_on_page + space_before + consumed_line_height(frame.text_lines(), line);

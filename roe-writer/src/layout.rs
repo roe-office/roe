@@ -1830,6 +1830,8 @@ impl ParagraphLayoutEngine {
                             }
                             _ => "1".to_string(), // 不应到达，兜底保留阶段A行为
                         }
+                    } else if r.formula.is_some() {
+                        "\u{FFFC}".to_string()
                     } else {
                         r.text.clone()
                     };
@@ -1890,7 +1892,11 @@ impl ParagraphLayoutEngine {
             for t in expanded_run_texts.iter_mut() {
                 *t = crate::hyphenation::preprocess_hyphenation(t);
             }
+            // 公式占位（U+FFFC 专项）：公式 Run 在段落文字里占 1 个 U+FFFC（3 字节），
+            // 光标/选区/命中才能区分公式前后。交给 Parley 的文本里它被换成同为 3 字节的
+            // 零宽空格 U+200B，字节偏移一一对齐，InlineBox 的 index 不变。
             let full_text: String = expanded_run_texts.join("");
+            let parley_text: String = full_text.replace('\u{FFFC}', "\u{200B}");
 
             // DOCX-8 公式渲染修复（真正根因）：公式run的text是空格占位符
             // （Step2占位符改造后的产物），trim()后为空。如果一个段落全部
@@ -1947,31 +1953,19 @@ impl ParagraphLayoutEngine {
                                  b.indent.margin_left, b.indent.text_indent)
                             }
                             roe_model::writer::ListLevelStyle::Number(n) => {
-                                let counters = list_counters.entry(li.list_id.clone()).or_default();
-                                let level = li.level as usize;
-                                while counters.len() <= level { counters.push(n.start_value); }
-                                counters.truncate(level + 1);
-                                let count = counters[level];
-                                counters[level] += 1;
-                                let num_str = match n.format {
-                                    roe_model::writer::NumFormat::Arabic => count.to_string(),
-                                    roe_model::writer::NumFormat::LowerAlpha => roe_parser::ooxml::docx::format_num(count, "lowerLetter"),
-                                    roe_model::writer::NumFormat::UpperAlpha => roe_parser::ooxml::docx::format_num(count, "upperLetter"),
-                                    roe_model::writer::NumFormat::LowerRoman => roe_parser::ooxml::docx::format_num(count, "lowerRoman"),
-                                    roe_model::writer::NumFormat::UpperRoman => roe_parser::ooxml::docx::format_num(count, "upperRoman"),
-                                    roe_model::writer::NumFormat::None => String::new(),
-                                };
-                                (format!("{}{}{}", n.prefix, num_str, n.suffix),
+                                let __lbl = list_number_label(doc.styles.list_styles.get(&li.style_name), n, li.level as usize, list_counters.entry(li.list_id.clone()).or_default());
+                                (__lbl,
                                  n.indent.margin_left, n.indent.text_indent)
                             }
                         });
                     if let Some((label, ml, ti)) = eb {
                         if let Some(line) = lines.first_mut() {
                             line.x_offset = ml;
-                            line.text_x_offset = ml + ti;
+                            let roe_hang = ti < 0.0;
+                            line.text_x_offset = if roe_hang { ml } else { ml + ti };
                             line.list_label = Some(label);
-                            line.list_label_x = ml + ti
-                                - if li.style_name.starts_with("ROE_") { 18.0 } else { 0.0 };
+                            line.list_label_x = ml + ti;
+                            line.list_label_color = doc.styles.list_styles.get(&li.style_name).and_then(|ls| ls.label_colors.get(li.level as usize).copied().flatten());
                         }
                     }
                 }
@@ -2041,26 +2035,8 @@ impl ParagraphLayoutEngine {
                             // 计数器状态机最简路径：只支持 Arabic，无 continue-numbering，
                             // 无 display_levels。子级（level 更深）重置为 start_value，
                             // 回到父级/同级延续原计数。
-                            let counters = list_counters.entry(li.list_id.clone())
-                                .or_default();
-                            let level = li.level as usize;
-                            // 补齐到当前 level 长度，新出现的更深 level 用 start_value 初始化
-                            while counters.len() <= level {
-                                counters.push(n.start_value);
-                            }
-                            // 截断比当前 level 更深的旧计数（回到浅层后，深层计数失效）
-                            counters.truncate(level + 1);
-                            let count = counters[level];
-                            counters[level] += 1;
-                            let num_str = match n.format {
-                                roe_model::writer::NumFormat::Arabic => count.to_string(),
-                                roe_model::writer::NumFormat::LowerAlpha => roe_parser::ooxml::docx::format_num(count, "lowerLetter"),
-                                roe_model::writer::NumFormat::UpperAlpha => roe_parser::ooxml::docx::format_num(count, "upperLetter"),
-                                roe_model::writer::NumFormat::LowerRoman => roe_parser::ooxml::docx::format_num(count, "lowerRoman"),
-                                roe_model::writer::NumFormat::UpperRoman => roe_parser::ooxml::docx::format_num(count, "upperRoman"),
-                                roe_model::writer::NumFormat::None => String::new(),
-                            };
-                            let label = format!("{}{}{}", n.prefix, num_str, n.suffix);
+                            let __lbl = list_number_label(doc.styles.list_styles.get(&li.style_name), n, li.level as usize, list_counters.entry(li.list_id.clone()).or_default());
+                            let label = __lbl;
                             (label, n.indent.margin_left, n.indent.text_indent, false)
                         }
                     })
@@ -2188,6 +2164,23 @@ impl ParagraphLayoutEngine {
                 }
             }
 
+            // 修订显示：插入=下划线+作者色，删除=删除线+作者色（与 LOK 默认一致）。
+            // 删除文字仍在 run.text 里，照常占排版宽度。
+            if para.runs.iter().any(|r| r.revision.is_some()) {
+                let rev_authors = doc.revision_authors();
+                for (run_idx, run) in para.runs.iter().enumerate() {
+                    if let Some(rev) = &run.revision {
+                        let c = doc.revision_author_color(&rev_authors, &rev.author);
+                        let rs = &mut run_styles[run_idx];
+                        match rev.kind {
+                            roe_model::writer::RevisionKind::Insert => { rs.underline = true; }
+                            roe_model::writer::RevisionKind::Delete => { rs.strikethrough = true; }
+                        }
+                        rs.color = Some(roe_model::common::Color { r: c[0], g: c[1], b: c[2], a: 255 });
+                    }
+                }
+            }
+
             // Parley 迁移（D3 主循环）：cosmic-text 的 set_rich_text(spans, ...)
             // 靠 Vec<(&str, Attrs)> 顺序隐式表达每个 run 的文字片段，Parley 的
             // ranged_builder 需要先给完整 full_text，再用显式字节 range 指定
@@ -2195,7 +2188,7 @@ impl ParagraphLayoutEngine {
             // 字节偏移，取代原来"每个 span 天然是独立 &str 切片"的隐式写法。
             let default_brush = RunBrush { color: [0, 0, 0, 255], run_idx: None };
             let mut builder = self.registry.layout_context.ranged_builder(
-                &mut self.registry.font_context, &full_text, 1.0, true,
+                &mut self.registry.font_context, &parley_text, 1.0, true,
             );
             builder.push_default(StyleProperty::Brush(default_brush));
             builder.push_default(GenericFamily::SystemUi);
@@ -2290,7 +2283,7 @@ impl ParagraphLayoutEngine {
                 Some(roe_model::style::Alignment::Justify) => Alignment::Justify,
                 None => Alignment::Start,
             };
-            let mut layout: parley::Layout<RunBrush> = builder.build(&full_text);
+            let mut layout: parley::Layout<RunBrush> = builder.build(&parley_text);
 
             // WROOT-093：逐行断行，取代 break_all_lines 一次性整段断行。
             // 参照 vendor/parley/parley_tests/tests/floats.rs 的
@@ -2526,6 +2519,7 @@ impl ParagraphLayoutEngine {
                 // 最大值，供后面跟常规文字的ascent/descent取max。
                 let mut line_formula_ascent: f32 = 0.0;
                 let mut line_formula_descent: f32 = 0.0;
+                let mut label_end_x: f32 = 0.0;
 
                 for item in line.items() {
                     // WROOT-080修复：公式run现在走InlineBox分支（不再产生
@@ -2571,17 +2565,20 @@ impl ParagraphLayoutEngine {
                         // 公式run.text为空字符串，start==end，LineRunSpan的
                         // start/end都用这个偏移即可（下游按is_formula+formula_box
                         // 判断，不依赖end-start的长度）。
-                        let byte_pos = positioned_box.x as usize; // 占位，不用于渲染
-                        let _ = byte_pos;
+                        let (fs_abs, fe_abs) = run_byte_ranges.get(run_idx).copied().unwrap_or((0, 0));
+                        let f_start = fs_abs.max(line_text_range.start).min(line_text_range.end) - line_text_range.start;
+                        let f_end   = fe_abs.max(line_text_range.start).min(line_text_range.end) - line_text_range.start;
+                        let f_width = para.runs.get(run_idx).and_then(|r| r.formula.as_ref()).map(|f| f.width_pt).unwrap_or(0.0);
                         run_spans.push(crate::frame::LineRunSpan {
-                            start: 0,
-                            end:   0,
+                            start: f_start,
+                            end:   f_end,
                             style: rstyle,
                             run_idx: Some(run_idx),
                             formula_box: Some(crate::frame::FormulaBoxPosition {
                                 x: positioned_box.x,
                                 y: positioned_box.y,
                                 baseline: positioned_box.baseline,
+                                width: f_width,
                             }),
                         });
                         continue;
@@ -2589,6 +2586,7 @@ impl ParagraphLayoutEngine {
                     let PositionedLayoutItem::GlyphRun(glyph_run) = item else { continue };
                     let style = glyph_run.style();
                     let Some(run_idx) = style.brush.run_idx else { continue };
+                    if run_idx == 0 { label_end_x = label_end_x.max(glyph_run.offset() + glyph_run.advance()); }
 
                     // WROOT-055-RANGE: 不再用 glyph_run.run().text_range()
                     // （见上方 run_byte_ranges 声明处注释，该值在多 run 合并
@@ -2676,7 +2674,7 @@ impl ParagraphLayoutEngine {
                     .filter(|m| m.byte_offset >= line_text_range.start && m.byte_offset < line_text_range.end)
                     .map(|m| (m.byte_offset - line_text_range.start, m.run_idx, m.tab_seq))
                     .collect();
-                let (tab_adjustments, tab_leaders) = if markers_in_line.is_empty() {
+                let (mut tab_adjustments, tab_leaders) = if markers_in_line.is_empty() {
                     (Vec::new(), Vec::new())
                 } else {
                     eprintln!("[WROOT068-DEBUG] effective_w={:.2} line_text={:?} markers={:?}", effective_w, line_text, markers_in_line);
@@ -2693,6 +2691,28 @@ impl ParagraphLayoutEngine {
                     eprintln!("[WROOT068-DEBUG] result adjustments={:?} leaders={:?}", result.0, result.1);
                     result
                 };
+
+                // 导入列表（self_labeled）首行：标签 run 后补足到悬挂位置。
+                // 文本不动，只在标签之后记一条撑宽量，绘制端按字节位置查表右移。
+                if line_idx == 0 && tab_adjustments.is_empty() {
+                    if let Some((_, _, ti, true)) = &list_bullet {
+                        if para.list_info.is_some() && *ti < 0.0 {
+                            if let Some(r0) = para.runs.first() {
+                                if r0.text.ends_with(' ') && r0.text.contains('\t') == false && r0.text.chars().count() <= 8 {
+                                    let label_w = label_end_x - lm.offset;
+                                    let extra = -*ti - label_w;
+                                    let label_len = r0.text.len();
+                                    if extra > 0.5 && label_len <= line_text.len() {
+                                        tab_adjustments.push(crate::frame::TabAdjustment {
+                                            byte_offset: label_len,
+                                            cumulative_extra: extra,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
 
                 lines.push(LineBox {
                     y_offset:    y,
@@ -2759,11 +2779,36 @@ impl ParagraphLayoutEngine {
                         // 不设置 list_label / list_label_x：label 已随正文一起画出。
                     } else {
                         line.x_offset = *margin_left;
-                        line.text_x_offset = *margin_left + *text_indent + align_off + border_inset;
+                        let roe_hang = *text_indent < 0.0;
+                        line.text_x_offset = if roe_hang {
+                            *margin_left + align_off + border_inset
+                        } else {
+                            *margin_left + *text_indent + align_off + border_inset
+                        };
+                        // 标签比悬挂位置宽时，首行正文顺延到 标签右缘+最小间距，避免压住编号
+                        // （规则对照 LOK porfld.cxx：宽度取 max(悬挂, 标签宽+最小间距)）。
+                        if i == 0 && roe_hang && !label.is_empty() {
+                            let label_w = self.registry.measure_text_width(label, font_size);
+                            let need = *margin_left + *text_indent + label_w + 3.0 + align_off + border_inset;
+                            if need > line.text_x_offset {
+                                line.text_x_offset = need;
+                            }
+                        }
                         if i == 0 {
                             line.list_label = Some(label.clone());
-                            line.list_label_x = *margin_left + *text_indent
-                                - if para.list_info.as_ref().map_or(false, |li| li.style_name.starts_with("ROE_")) { 18.0 } else { 0.0 };
+                            line.list_label_x = *margin_left + *text_indent;
+                            line.list_label_color = para.list_info.as_ref().and_then(|li| {
+                                doc.styles.list_styles.get(&li.style_name)
+                                    .and_then(|ls| ls.label_colors.get(li.level as usize).copied().flatten())
+                            });
+                            {
+                                // 编号字符格式回退：级别没写的，取段落样式（与 Word/OnlyOffice 一致）
+                                let __ps = doc.styles.resolve_paragraph_style(para.style.0.as_str());
+                                if line.list_label_color.is_none() {
+                                    line.list_label_color = __ps.color.map(|c| [c.r, c.g, c.b, c.a]);
+                                }
+                                line.list_label_bold = __ps.bold;
+                            }
                         }
                     }
                 }
@@ -3848,6 +3893,7 @@ pub struct ShapedLine {
     pub list_label_color: Option<[u8;4]>,
     pub list_label_font_scale: Option<f32>,
     pub list_label_superscript: bool,
+    pub list_label_bold: bool,
     /// v317g：单元格行来源，从 LineBox.cell_ref 搬运
     pub cell_ref: Option<(u32, u32, u32, u32)>,
 }
@@ -3960,6 +4006,7 @@ pub fn arena_to_layout_pages(arena: &FrameArena, doc: &WriterDocument) -> Vec<La
                     list_label_color: l.list_label_color,
                     list_label_font_scale: l.list_label_font_scale,
                     list_label_superscript: l.list_label_superscript,
+                    list_label_bold: l.list_label_bold,
                 }).collect(),
                 FrameContent::HorizontalRule { .. } => Vec::new(),
                 FrameContent::TableRow(cells) => cells.iter().flat_map(|c| {
@@ -3992,6 +4039,7 @@ pub fn arena_to_layout_pages(arena: &FrameArena, doc: &WriterDocument) -> Vec<La
                         list_label_color: l.list_label_color,
                         list_label_font_scale: l.list_label_font_scale,
                         list_label_superscript: l.list_label_superscript,
+                    list_label_bold: l.list_label_bold,
                     })
                 }).collect(),
             };
@@ -4344,7 +4392,8 @@ pub fn resolve_run_style(
 
     ResolvedRunStyle {
         font_size,
-        font_family_is_set: false,
+        // 光标/选区测宽用：该 run 字体解析结果是 Carlito 时置位，shape_line 据此推同一字体
+        font_family_is_set: resolve_run_font_family(doc, para, run).as_deref() == Some("Carlito"),
         bold,
         italic,
         underline,
@@ -4402,7 +4451,11 @@ pub fn resolve_run_font_family(
         family = family_ascii.clone();
     }
 
-    family
+    // [数字间隙修复] 文档指定的字体（Arial / Arial Unicode MS / Lato 等）本机没有时，
+    // Parley 会把数字回退到 Noto Serif Armenian 之类的宽字体，导致字距异常、光标选区对不上。
+    // 与表格同一套白名单：不在白名单里的字体名统一换成 Carlito（CJK 字符仍走系统回退）。
+    // 排版（layout.rs）和渲染（tile.rs）都调用本函数，两阶段字体保持一致。
+    family.map(|f| roe_core::row_height_measure::resolve_font_family_for_parley(&f).to_string())
 }
 
 #[cfg(test)]
@@ -4848,5 +4901,293 @@ mod stepb_note_numbering_tests {
         let mut engine = new_engine();
         let result = engine.layout(&doc);
         assert!(!result.arena.frames.is_empty(), "lowerRoman formatting should not break layout");
+    }
+}
+
+#[cfg(test)]
+mod formula_cursor_tests {
+    use super::*;
+    use roe_model::common::StyleRef;
+    use roe_model::writer::{BodyElement, Formula, Paragraph, Run, WriterDocument};
+
+    /// "EF " + 公式(宽30pt) + "GH"
+    fn build_doc() -> WriterDocument {
+        let para = Paragraph {
+            style: StyleRef("Normal".to_string()),
+            runs: vec![
+                Run { text: "EF ".to_string(), ..Default::default() },
+                Run {
+                    formula: Some(Formula {
+                        latex: "x".to_string(),
+                        width_pt: 30.0,
+                        height_pt: 12.0,
+                        depth_pt: 4.0,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                Run { text: "GH".to_string(), ..Default::default() },
+            ],
+            ..Default::default()
+        };
+        WriterDocument {
+            body: vec![BodyElement::Paragraph(para)],
+            page_size: (595.28, 841.89),
+            margin_top: 72.0,
+            margin_bottom: 72.0,
+            margin_left: 72.0,
+            margin_right: 72.0,
+            ..Default::default()
+        }
+    }
+
+    /// 公式在行文字里应占 3 字节（U+FFFC）：EF␠(3) + 公式(3) + GH(2) = 8
+    #[test]
+    fn formula_occupies_three_bytes_in_line_text() {
+        let doc = build_doc();
+        let mut engine = ParagraphLayoutEngine::new(FontRegistry::new_with_system_fonts());
+        let result = engine.layout(&doc);
+        let arena = &result.arena;
+        let page = &arena.pages[arena.page_order[0]];
+        let frame = &arena.frames[page.frames[0]];
+        let line = &frame.text_lines()[0];
+        assert_eq!(line.text.len(), 8, "line.text={:?}", line.text);
+    }
+
+    /// 公式前的光标 x 不应超过公式左边缘，公式后的光标 x 不应小于公式右边缘。
+    #[test]
+    fn formula_cursor_x_before_and_after() {
+        let doc = build_doc();
+        let mut engine = ParagraphLayoutEngine::new(FontRegistry::new_with_system_fonts());
+        let result = engine.layout(&doc);
+        let arena = &result.arena;
+        let page = &arena.pages[arena.page_order[0]];
+        let frame = &arena.frames[page.frames[0]];
+        let line = &frame.text_lines()[0];
+        let fb = line.runs.iter().find_map(|r| r.formula_box.as_ref())
+            .expect("行内应有公式盒子");
+        let fx = fb.x;
+        let x_before = crate::line_shape::char_offset_to_x(
+            &mut engine.registry, &line.text, &line.runs, 12.0, false, false, 3);
+        let x_after = crate::line_shape::char_offset_to_x(
+            &mut engine.registry, &line.text, &line.runs, 12.0, false, false, 6);
+        assert!(x_before <= fx + 1.0, "公式前 x={} 应 <= 公式左边缘 {}", x_before, fx);
+        assert!(x_after >= fx + 30.0 - 1.0, "公式后 x={} 应 >= 公式右边缘 {}", x_after, fx + 30.0);
+    }
+}
+
+
+/// 计算一个编号段的标签文字。计数口径与 docx.rs 的 advance 一致：
+/// counters 存各级"当前号"（0=未出现），取号先加一并清零更深各级；
+/// 跳级时上层未出现的级别按各自起始值补齐。
+/// 有 template 时按 %N 展开（第 N 级用自己的格式），否则 前缀+本级号+后缀。
+fn list_number_label(
+    ls: Option<&roe_model::writer::ListStyle>,
+    n: &roe_model::writer::NumberListLevel,
+    level: usize,
+    counters: &mut Vec<u32>,
+) -> String {
+    use roe_model::writer::{ListLevelStyle, NumFormat};
+    let level = level.min(8);
+    if counters.len() < 9 {
+        counters.resize(9, 0);
+    }
+    let start_of = |k: usize| -> u32 {
+        match ls.and_then(|l| l.levels.get(k)) {
+            Some(ListLevelStyle::Number(x)) => x.start_value.max(1),
+            _ => 1,
+        }
+    };
+    for k in 0..level {
+        if counters[k] == 0 {
+            counters[k] = start_of(k);
+        }
+    }
+    counters[level] = if counters[level] == 0 { n.start_value.max(1) } else { counters[level] + 1 };
+    for k in (level + 1)..9 {
+        counters[k] = 0;
+    }
+    let fmt_num = |f: &NumFormat, v: u32| -> String {
+        match f {
+            NumFormat::Arabic => v.to_string(),
+            NumFormat::LowerAlpha => roe_parser::ooxml::docx::format_num(v, "lowerLetter"),
+            NumFormat::UpperAlpha => roe_parser::ooxml::docx::format_num(v, "upperLetter"),
+            NumFormat::LowerRoman => roe_parser::ooxml::docx::format_num(v, "lowerRoman"),
+            NumFormat::UpperRoman => roe_parser::ooxml::docx::format_num(v, "upperRoman"),
+            NumFormat::None => String::new(),
+        }
+    };
+    match &n.template {
+        None => format!("{}{}{}", n.prefix, fmt_num(&n.format, counters[level]), n.suffix),
+        Some(t) => {
+            if matches!(n.format, NumFormat::None) {
+                return String::new();
+            }
+            let chars: Vec<char> = t.chars().collect();
+            let mut out = String::new();
+            let mut i = 0;
+            while i < chars.len() {
+                if chars[i] == '%' {
+                    if let Some(d) = chars.get(i + 1).and_then(|c| c.to_digit(10)) {
+                        let k = (d as usize).saturating_sub(1).min(8);
+                        let v = if counters[k] == 0 { start_of(k) } else { counters[k] };
+                        let f = match ls.and_then(|l| l.levels.get(k)) {
+                            Some(ListLevelStyle::Number(x)) => x.format.clone(),
+                            _ => NumFormat::Arabic,
+                        };
+                        out.push_str(&fmt_num(&f, v));
+                        i += 2;
+                        continue;
+                    }
+                }
+                out.push(chars[i]);
+                i += 1;
+            }
+            out
+        }
+    }
+}
+
+#[cfg(test)]
+mod multilevel_list_tests {
+    use super::*;
+
+    fn open_sample(sample: &str) -> Vec<u8> {
+        let path = format!("{}/../test_samples/docx/{}", env!("CARGO_MANIFEST_DIR"), sample);
+        std::fs::read(&path).expect("sample should exist")
+    }
+
+    fn labels_of(sample: &str) -> Vec<String> {
+        labels_of_bytes(&open_sample(sample))
+    }
+
+    fn labels_of_bytes(data: &[u8]) -> Vec<String> {
+        let doc = match roe_parser::RoeDocument::open_docx_bytes(data).expect("parse docx") {
+            roe_parser::RoeDocument::Writer(d) => d,
+            _ => panic!("expected Writer"),
+        };
+        labels_of_doc(&doc)
+    }
+
+    fn labels_of_doc(doc: &roe_model::writer::WriterDocument) -> Vec<String> {
+        let mut engine = ParagraphLayoutEngine::new(FontRegistry::new_with_system_fonts());
+        let result = engine.layout(doc);
+        let arena = &result.arena;
+        let mut out = Vec::new();
+        for pid in &arena.page_order {
+            let page = &arena.pages[*pid];
+            for fid in &page.frames {
+                let frame = &arena.frames[*fid];
+                for line in frame.text_lines().iter() {
+                    if let Some(l) = &line.list_label {
+                        if !l.is_empty() {
+                            out.push(l.clone());
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn multilevel_numbering1_labels() {
+        let got = labels_of("sw_ooxmlexport_data__numbering1.docx");
+        assert_eq!(got, ["1.", "1.1.", "1.2.", "2.", "2.1.", "2.2.", "2.2.1."]);
+    }
+
+    #[test]
+    fn multilevel_tdf145215_labels() {
+        let got = labels_of("sw_uitest_data__tdf145215.docx");
+        assert_eq!(got, ["1.", "1.1", "1.2", "1.2.1", "(i)", "(ii)", "1.2.2", "(i)"]);
+    }
+
+    fn roundtrip(sample: &str) -> Vec<String> {
+        let data = open_sample(sample);
+        let doc = match roe_parser::RoeDocument::open_docx_bytes(&data).expect("parse docx") {
+            roe_parser::RoeDocument::Writer(d) => d,
+            _ => panic!("expected Writer"),
+        };
+        let bytes = roe_parser::ooxml::docx_writer::DocxWriter::write(&doc).expect("write docx");
+        labels_of_bytes(&bytes)
+    }
+
+    #[test]
+    fn multilevel_numbering1_roundtrip() {
+        assert_eq!(
+            roundtrip("sw_ooxmlexport_data__numbering1.docx"),
+            ["1.", "1.1.", "1.2.", "2.", "2.1.", "2.2.", "2.2.1."]
+        );
+    }
+
+    #[test]
+    fn multilevel_tdf145215_roundtrip() {
+        assert_eq!(
+            roundtrip("sw_uitest_data__tdf145215.docx"),
+            ["1.", "1.1", "1.2", "1.2.1", "(i)", "(ii)", "1.2.2", "(i)"]
+        );
+    }
+
+
+    #[test]
+    fn wide_label_does_not_overlap_text() {
+        let data = open_sample("sw_ooxmlexport_data__numbering1.docx");
+        let doc = match roe_parser::RoeDocument::open_docx_bytes(&data).expect("parse") {
+            roe_parser::RoeDocument::Writer(d) => d,
+            _ => panic!("expected Writer"),
+        };
+        let mut engine = ParagraphLayoutEngine::new(FontRegistry::new_with_system_fonts());
+        let result = engine.layout(&doc);
+        let arena = &result.arena;
+        let mut checked = 0;
+        for pid in &arena.page_order {
+            for fid in &arena.pages[*pid].frames {
+                for line in arena.frames[*fid].text_lines().iter() {
+                    if let Some(l) = &line.list_label {
+                        if l.len() >= 4 {
+                            let w = engine.registry.measure_text_width(l, 11.0);
+                            assert!(line.text_x_offset + 0.5 >= line.list_label_x + w * 0.8,
+                                "label={l} text_x={} label_x={} w={w}", line.text_x_offset, line.list_label_x);
+                            checked += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(checked >= 3, "应至少检查到 3 个多级标签，实际 {checked}");
+    }
+
+    /// 导入多级编号：标签位置读 numbering.xml 的 w:ind（left-hanging = 0/18/36pt），
+    /// 标签颜色与粗体回退到标题样式（级别自身没写 rPr 时）。
+    #[test]
+    fn imported_multilevel_label_indent_and_style_fallback() {
+        let data = open_sample("sw_ooxmlexport_data__numbering1.docx");
+        let doc = match roe_parser::RoeDocument::open_docx_bytes(&data).expect("parse") {
+            roe_parser::RoeDocument::Writer(d) => d,
+            _ => panic!("expected Writer"),
+        };
+        let mut engine = ParagraphLayoutEngine::new(FontRegistry::new_with_system_fonts());
+        let result = engine.layout(&doc);
+        let arena = &result.arena;
+        let mut seen = std::collections::HashMap::new();
+        for pid in &arena.page_order {
+            for fid in &arena.pages[*pid].frames {
+                for line in arena.frames[*fid].text_lines().iter() {
+                    if let Some(l) = &line.list_label {
+                        let depth = l.trim_end_matches('.').matches('.').count();
+                        seen.entry(depth).or_insert((line.list_label_x, line.list_label_color, line.list_label_bold));
+                    }
+                }
+            }
+        }
+        let (x0, c0, b0) = seen[&0];
+        let (x1, c1, _) = seen[&1];
+        let (x2, _, _) = seen[&2];
+        assert!((x0 - 0.0).abs() < 0.5, "x0={x0}");
+        assert!((x1 - 18.0).abs() < 0.5, "x1={x1}");
+        assert!((x2 - 36.0).abs() < 0.5, "x2={x2}");
+        assert_eq!(c0, Some([0x36, 0x5F, 0x91, 255]));
+        assert!(b0, "一级标题编号应加粗");
+        assert_eq!(c1, Some([0x4F, 0x81, 0xBD, 255]));
     }
 }

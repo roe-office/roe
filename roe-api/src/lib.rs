@@ -49,6 +49,7 @@ pub use impress_slide_ops::{roe_impress_insert_slide, roe_impress_delete_slide, 
 pub use impress_text_edit::{roe_impress_insert_textbox, roe_impress_text_insert, roe_impress_text_delete, roe_impress_text_split, roe_impress_text_caret, roe_impress_text_hit, roe_impress_text_is_empty, roe_impress_text_move, roe_impress_text_copy, roe_impress_text_paste, roe_impress_text_extent};
 mod tile;
 mod comments;
+mod revisions;
 mod char_format;
 pub mod sort_paragraphs;
 pub mod page_setup;
@@ -64,7 +65,7 @@ pub use error::{roe_last_error_message, RoeErrorCode};
 pub use events::roe_poll_event;
 pub use hit_test::roe_hit_test;
 pub use table_cell_cursor::{roe_hit_test_ex, roe_query_layout_rect_ex, roe_query_cell_selection_rects, roe_query_cell_range_rects, roe_cell_nav_line};
-pub use table_cell_edit::{roe_cell_replace_range, roe_cell_delete_char, roe_cell_split_paragraph, roe_cell_tab, roe_cell_merge_paragraph, roe_cell_nav, roe_cell_fmt_char, roe_cell_fmt_para, roe_cell_fmt_get, roe_cell_fmt_font};
+pub use table_cell_edit::{roe_cell_replace_range, roe_cell_get_text, roe_cell_delete_char, roe_cell_split_paragraph, roe_cell_tab, roe_cell_merge_paragraph, roe_cell_nav, roe_cell_fmt_char, roe_cell_fmt_para, roe_cell_fmt_get, roe_cell_fmt_font, roe_cell_clear_range, roe_cell_range_tsv};
 pub use formula_edit::{roe_formula_get, roe_formula_set, roe_formula_insert, roe_formula_hit_test, roe_formula_preview_rgba};
 pub use layout_query::roe_query_layout_rect;
 pub use calc_geometry::{roe_calc_hit_test, roe_calc_query_layout_rect, roe_get_column_width, roe_get_row_height, roe_set_column_width, roe_set_row_height, roe_get_frozen_panes, roe_get_visible_range, roe_get_row_offset, roe_get_col_offset, roe_get_row_at_offset, roe_get_col_at_offset, roe_get_used_range, roe_get_sheet_total_height, roe_get_sheet_total_width, roe_get_sheet_count, roe_get_sheet_name, roe_get_row_count, roe_get_col_count, roe_add_sheet, roe_remove_sheet, roe_rename_sheet};
@@ -72,7 +73,9 @@ pub use script::{roe_execute_script, roe_free_string, roe_get_formula_function_l
 pub use chart::{roe_render_chart_to_png, roe_render_stat_chart_to_rgba, roe_free_bytes};
 pub use chart_query::{roe_get_chart_rect, roe_get_chart_config, roe_resize_chart, roe_move_chart, roe_set_chart_rect, roe_set_chart_style, roe_delete_chart, roe_list_charts, roe_calc_insert_stat_chart, roe_calc_list_objects, roe_calc_get_object, roe_calc_set_object_rect, roe_calc_delete_object, roe_calc_insert_image, roe_calc_insert_shape, roe_calc_insert_textbox, roe_calc_set_object_text, roe_calc_set_object_fill, roe_calc_set_object_stroke};
 pub use snapshot::{roe_begin_edit, roe_commit_edit, roe_discard_edit, roe_undo, roe_redo};
-pub use pivot::{roe_pivot_sheet, roe_get_pivot_unique_values, roe_sheet_preview, roe_sheet_is_pivot, roe_get_pivot_buttons, roe_pivot_set_filter, roe_pivot_set_sort, roe_get_pivot_config, roe_pivot_set_config};
+pub use pivot::{roe_pivot_sheet, roe_get_pivot_unique_values, roe_sheet_preview, roe_sheet_is_pivot, roe_get_pivot_buttons, roe_pivot_set_filter, roe_pivot_set_sort, roe_pivot_set_subtotals, roe_pivot_set_subtotals_top, roe_pivot_set_layout, roe_pivot_set_grand_totals, roe_get_pivot_config, roe_pivot_set_config};
+pub mod export_image;
+pub mod script_export;
 pub use tile::{roe_get_render_page_size, roe_render_page, roe_render_sheet_viewport, roe_render_writer_viewport, roe_get_writer_document_size, roe_set_writer_options, roe_get_impress_document_size, roe_render_impress_viewport};
 pub use cursor_inline::roe_cursor_move_inline;
 pub use selection_rects::roe_query_selection_rects;
@@ -81,6 +84,7 @@ pub use cursor::{RoeLocation, CursorInlineCommand};
 pub use cursor_move_line::CursorLineDirection;
 pub use cursor_para_info::roe_get_paragraph_info;
 pub use text_edit::{roe_insert_char, roe_delete_char, roe_insert_text, roe_split_paragraph, roe_merge_paragraph, roe_replace_range};
+pub use revisions::{roe_resolve_revision, roe_resolve_all_revisions, resolve_revision_at_core, resolve_all_revisions_core, roe_list_revisions, list_revisions_core, RevisionInfo, roe_resolve_revision_range, resolve_revision_range_core, roe_set_track_changes};
 pub use comments::{roe_get_comment_threads, roe_take_comment_hits, roe_insert_comment, insert_comment_core, roe_delete_comment, delete_comment_core, roe_set_comment_done, roe_edit_comment, roe_reply_comment, reply_comment_core, roe_insert_footnote, insert_note_core};
 pub use char_format::{
     roe_set_range_char_format_bold, roe_get_range_char_format_bold,
@@ -101,7 +105,7 @@ pub use char_format::{
     roe_set_paragraph_list, roe_set_paragraph_style, roe_change_list_level, roe_set_paragraph_spacing,
 };
 pub use find_replace::{roe_replace_text, roe_replace_text_ex, roe_find_text};
-pub use writer_clipboard::{roe_writer_copy, roe_writer_delete_range, roe_writer_paste, roe_writer_clip_has, roe_writer_painter_pick, roe_writer_painter_apply, roe_writer_change_case, roe_writer_insert_page_break};
+pub use writer_clipboard::{roe_writer_copy, roe_writer_delete_range, roe_writer_paste, roe_writer_clip_has, roe_writer_clip_text, roe_writer_set_clip_text, roe_writer_painter_pick, roe_writer_painter_apply, roe_writer_change_case, roe_writer_insert_page_break};
 pub use impress_geometry::{roe_impress_hit_test, roe_impress_query_shape_rect, roe_impress_set_shape_rect, roe_impress_set_shape_rotation, roe_impress_move_shape, roe_impress_resize_shape, roe_impress_shape_move_forward, roe_impress_shape_move_backward, roe_impress_shape_bring_to_front, roe_impress_shape_send_to_back, roe_impress_set_line_endpoints, roe_impress_insert_shape, roe_impress_delete_shape, roe_impress_shape_preview_path, roe_impress_insert_image, roe_image_dimensions, roe_impress_insert_table};
 pub use auto_fit::roe_auto_fit_columns;
 pub use range_json::{roe_get_range_json, roe_set_range_json};
@@ -114,6 +118,8 @@ pub use comments::{roe_delete_note, roe_writer_insert_column_break, roe_writer_s
 pub use comments::roe_writer_insert_image;
 pub use comments::roe_writer_insert_chart;
 pub use comments::{roe_writer_get_chart_json, roe_writer_set_chart_json};
+pub use comments::{roe_writer_get_chart_config, roe_writer_set_chart_style};
+pub use comments::{roe_writer_get_stat_chart_json, roe_writer_set_stat_chart_data};
 pub use comments::{roe_writer_hit_object, roe_writer_resize_object, roe_writer_delete_object};
 pub use comments::roe_writer_insert_shape;
 
@@ -124,3 +130,8 @@ pub use comments::{roe_writer_set_object_rotation, roe_writer_object_rotation};
 pub use comments::roe_writer_insert_table;
 pub use impress_text_edit::roe_impress_text_sel_rects;
 pub use impress_text_edit::{roe_impress_cell_at, roe_impress_cell_hit, roe_impress_cell_caret, roe_impress_cell_insert, roe_impress_cell_delete, roe_impress_is_table, roe_impress_cell_move, roe_impress_table_fit, roe_impress_table_settle};
+
+/// 占位符提示文案语言开关（true=英文，false=中文，默认中文）。
+pub fn set_placeholder_lang_en(en: bool) {
+    roe_impress::placeholder_hints::set_lang_en(en);
+}
