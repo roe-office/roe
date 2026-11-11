@@ -1,0 +1,434 @@
+env:
+  # We aim to always test with the latest stable Rust toolchain, however we pin to a specific
+  # version like 1.70. Note that we only specify MAJOR.MINOR and not PATCH so that bugfixes still
+  # come automatically. If the version specified here is no longer the latest stable version,
+  # then please feel free to submit a PR that adjusts it along with the potential clippy fixes.
+  RUST_STABLE_VER: "1.97.1" # In quotes because otherwise (e.g.) 1.70 would be interpreted as 1.7
+  # The purpose of checking with the minimum supported Rust toolchain is to detect its staleness.
+  # If the compilation fails, then the version specified here needs to be bumped up to reality.
+  # Be sure to also update the rust-version property in the workspace Cargo.toml file,
+  # plus all the README.md files of the affected packages.
+  RUST_MIN_VER: "1.88"
+  # List of packages that will be checked with the minimum supported Rust version.
+  # This should be limited to packages that are intended for publishing.
+  RUST_MIN_VER_PKGS: "-p parley -p parley_data -p parley_engine -p parlance -p fontique -p attributed_text"
+  # List of features that depend on the standard library and will be excluded from no_std checks.
+  FEATURES_DEPENDING_ON_STD: "std,default,png,system,vello_hybrid"
+  # List of packages that can not target Wasm.
+  NO_WASM_PKGS: "--exclude xtask --exclude parley_bench --exclude parley_data_gen"
+  # List of packages that can not target Android.
+  NO_ANDROID_PKGS: "--exclude xtask --exclude parley_bench --exclude parley_data_gen"
+
+
+# Rationale
+#
+# We don't run clippy with --all-targets because then even --lib and --bins are compiled with
+# dev dependencies enabled, which does not match how they would be compiled by users.
+# A dev dependency might enable a feature that we need for a regular dependency,
+# and checking with --all-targets would not find our feature requirements lacking.
+# This problem still applies to cargo resolver version 2.
+# Thus we split all the targets into two steps, one with --lib --bins
+# and another with --tests --benches --examples.
+# Also, we can't give --lib --bins explicitly because then cargo will error on binary-only packages.
+# Luckily the default behavior of cargo with no explicit targets is the same but without the error.
+#
+# We use cargo-hack for a similar reason. Cargo's --workspace will do feature unification across
+# the whole workspace. While cargo-hack will instead check each workspace package separately.
+#
+# Using cargo-hack also allows us to more easily test the feature matrix of our packages.
+# We use --each-feature & --optional-deps which will run a separate check for every feature.
+#
+# We use cargo-nextest, which has a faster concurrency model for running tests.
+# However cargo-nextest does not support running doc tests, so we also have a cargo test --doc step.
+# For more information see https://github.com/nextest-rs/nextest/issues/16
+#
+# The MSRV jobs run only cargo check because different clippy versions can disagree on goals and
+# running tests introduces dev dependencies which may require a higher MSRV than the bare package.
+#
+# For no_std checks we target x86_64-unknown-none, because this target doesn't support std
+# and as such will error out if our dependency tree accidentally tries to use std.
+# https://doc.rust-lang.org/stable/rustc/platform-support/x86_64-unknown-none.html
+#
+# We don't save caches in the merge-group cases, because those caches will never be re-used (apart
+# from the very rare cases where there are multiple PRs in the merge queue).
+# This is because GitHub doesn't share caches between merge queues and the main branch.
+
+name: CI
+
+on:
+  pull_request:
+  merge_group:
+  # We run on push, even though the commit is the same as when we ran in merge_group.
+  # This allows the cache to be primed.
+  # See https://github.com/orgs/community/discussions/66430
+  push:
+    branches:
+      - main
+
+jobs:
+  fmt:
+    name: formatting
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install stable toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_STABLE_VER }}
+          components: rustfmt
+
+      - name: cargo fmt
+        run: cargo fmt --all --check
+
+      - name: Install Taplo
+        uses: uncenter/setup-taplo@09968a8ae38d66ddd3d23802c44bf6122d7aa991 # v1
+        with:
+          version: "0.9.3"
+
+      - name: Run taplo fmt
+        run: taplo fmt --check --diff
+
+      - name: Install ripgrep+cargo-rdme
+        uses: taiki-e/install-action@v2
+        with:
+          tool: ripgrep@15.1.0,cargo-rdme@1.4.8
+
+      - name: check copyright headers
+        run: bash .github/copyright.sh
+
+      - name: Run cargo rdme (attributed_text)
+        run: cargo rdme --check --heading-base-level=0 --workspace-project=attributed_text
+
+      - name: Run cargo rdme (parley_engine)
+        run: cargo rdme --check --heading-base-level=0 --workspace-project=parley_engine
+
+      - name: Run cargo rdme (parlance)
+        run: cargo rdme --check --heading-base-level=0 --workspace-project=parlance
+
+  clippy-stable:
+    name: cargo clippy
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install stable toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_STABLE_VER }}
+          targets: x86_64-unknown-none,thumbv8m.main-none-eabihf,powerpc-unknown-linux-gnu
+          components: clippy
+
+      - name: Install fontconfig-dev
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install libfontconfig-dev
+
+      - name: install cargo-hack
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-hack
+
+      - name: restore cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.event_name != 'merge_group' }}
+
+      - name: cargo clippy (no_std)
+        run: cargo hack clippy ${{ env.RUST_MIN_VER_PKGS }} --locked --optional-deps --each-feature --ignore-unknown-features --features libm --exclude-features ${{ env.FEATURES_DEPENDING_ON_STD }} --target x86_64-unknown-none -- -D warnings
+
+      - name: cargo clippy (no_std 32-bit)
+        run: cargo hack clippy ${{ env.RUST_MIN_VER_PKGS }} --locked --optional-deps --each-feature --ignore-unknown-features --features libm --exclude-features ${{ env.FEATURES_DEPENDING_ON_STD }} --target thumbv8m.main-none-eabihf -- -D warnings
+
+      # We check the std code paths on a 32-bit target without 64-bit atomics
+      # (powerpc-unknown-linux-gnu) to catch regressions like our atomics-based
+      # version counters assuming a 64-bit-wide integer. We omit --optional-deps
+      # and exclude the system feature because the system font backends pull in
+      # C dependencies (e.g. fontconfig) that can't be cross-compiled here.
+      - name: cargo clippy (32-bit with std)
+        run: cargo hack clippy ${{ env.RUST_MIN_VER_PKGS }} --locked --each-feature --ignore-unknown-features --features std --exclude-features default,system,png,vello_hybrid --target powerpc-unknown-linux-gnu -- -D warnings
+
+      - name: cargo clippy
+        run: cargo hack clippy --workspace --locked --optional-deps --each-feature --ignore-unknown-features --features std -- -D warnings
+
+      - name: cargo clippy (auxiliary)
+        run: cargo hack clippy --workspace --locked --optional-deps --each-feature --ignore-unknown-features --features std --tests --benches --examples -- -D warnings
+
+  clippy-stable-wasm:
+    name: cargo clippy (wasm32)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install stable toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_STABLE_VER }}
+          targets: wasm32-unknown-unknown
+          components: clippy
+
+      - name: install cargo-hack
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-hack
+
+      - name: restore cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.event_name != 'merge_group' }}
+
+      - name: cargo clippy
+        run: cargo hack clippy --workspace ${{ env.NO_WASM_PKGS }} --locked --target wasm32-unknown-unknown --optional-deps --each-feature --ignore-unknown-features --features std -- -D warnings
+
+      - name: cargo clippy (auxiliary)
+        run: cargo hack clippy --workspace ${{ env.NO_WASM_PKGS }} --locked --target wasm32-unknown-unknown --optional-deps --each-feature --ignore-unknown-features --features std --tests --benches --examples -- -D warnings
+
+  clippy-stable-android:
+    name: cargo clippy (android)
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target: [armv7-linux-androideabi, aarch64-linux-android, x86_64-linux-android]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install stable toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_STABLE_VER }}
+          targets: ${{ matrix.target }}
+          components: clippy
+
+      - name: install cargo-hack
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-hack
+
+      - name: restore cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.event_name != 'merge_group' }}
+
+      - name: cargo clippy
+        run: cargo hack clippy --workspace ${{ env.NO_ANDROID_PKGS }} --locked --target ${{ matrix.target }} --optional-deps --each-feature --ignore-unknown-features --features std -- -D warnings
+
+      - name: cargo clippy (auxiliary)
+        run: cargo hack clippy --workspace ${{ env.NO_ANDROID_PKGS }} --locked --target ${{ matrix.target }} --optional-deps --each-feature --ignore-unknown-features --features std --tests --benches --examples -- -D warnings
+
+  test-stable:
+    name: cargo test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install stable toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_STABLE_VER }}
+
+      - name: install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+
+      - name: restore cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.event_name != 'merge_group' }}
+
+      - name: cargo nextest
+        run: cargo nextest run --workspace --locked --all-features --no-fail-fast
+
+      - name: cargo test --doc
+        run: cargo test --doc --workspace --locked --all-features --no-fail-fast
+
+  test-stable-wasm:
+    name: cargo test (wasm32)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install stable toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_STABLE_VER }}
+          targets: wasm32-unknown-unknown
+
+      - name: restore cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.event_name != 'merge_group' }}
+
+      # TODO: Find a way to make tests work. Until then the tests are merely compiled.
+      - name: cargo test compile
+        run: cargo test --workspace ${{ env.NO_WASM_PKGS }} --locked --target wasm32-unknown-unknown --all-features --no-run
+
+  check-msrv:
+    name: cargo check (msrv)
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install msrv toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_MIN_VER }}
+          targets: x86_64-unknown-none,thumbv8m.main-none-eabihf,powerpc-unknown-linux-gnu
+
+      - name: Install fontconfig-dev
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install libfontconfig-dev
+
+      - name: install cargo-hack
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-hack
+
+      - name: restore cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.event_name != 'merge_group' }}
+
+      - name: cargo check (no_std)
+        run: cargo hack check ${{ env.RUST_MIN_VER_PKGS }} --locked --optional-deps --each-feature --ignore-unknown-features --features libm --exclude-features ${{ env.FEATURES_DEPENDING_ON_STD }} --target x86_64-unknown-none
+
+      - name: cargo check (no_std 32-bit)
+        run: cargo hack check ${{ env.RUST_MIN_VER_PKGS }} --locked --optional-deps --each-feature --ignore-unknown-features --features libm --exclude-features ${{ env.FEATURES_DEPENDING_ON_STD }} --target thumbv8m.main-none-eabihf
+
+      # We check the std code paths on a 32-bit target without 64-bit atomics
+      # (powerpc-unknown-linux-gnu) to catch regressions like our atomics-based
+      # version counters assuming a 64-bit-wide integer. We omit --optional-deps
+      # and exclude the system feature because the system font backends pull in
+      # C dependencies (e.g. fontconfig) that can't be cross-compiled here.
+      - name: cargo check (32-bit with std)
+        run: cargo hack check ${{ env.RUST_MIN_VER_PKGS }} --locked --each-feature --ignore-unknown-features --features std --exclude-features default,system,png,vello_hybrid --target powerpc-unknown-linux-gnu
+
+      - name: cargo check
+        run: cargo hack check ${{ env.RUST_MIN_VER_PKGS }} --locked --optional-deps --each-feature --ignore-unknown-features --features std
+
+  check-msrv-wasm:
+    name: cargo check (msrv) (wasm32)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install msrv toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_MIN_VER }}
+          targets: wasm32-unknown-unknown
+
+      - name: install cargo-hack
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-hack
+
+      - name: restore cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.event_name != 'merge_group' }}
+
+      - name: cargo check
+        run: cargo hack check ${{ env.RUST_MIN_VER_PKGS }} ${{ env.NO_WASM_PKGS }} --locked --target wasm32-unknown-unknown --optional-deps --each-feature --ignore-unknown-features --features std
+
+  check-msrv-android:
+    name: cargo check (msrv) (android)
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target: [armv7-linux-androideabi, aarch64-linux-android, x86_64-linux-android]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install msrv toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_MIN_VER }}
+          targets: ${{ matrix.target }}
+
+      - name: install cargo-hack
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-hack
+
+      - name: restore cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.event_name != 'merge_group' }}
+
+      - name: cargo check
+        run: cargo hack check ${{ env.RUST_MIN_VER_PKGS }} ${{ env.NO_ANDROID_PKGS }} --locked --target ${{ matrix.target }} --optional-deps --each-feature --ignore-unknown-features --features std
+
+  doc:
+    name: cargo doc
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install nightly toolchain
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: restore cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.event_name != 'merge_group' }}
+
+      # We test documentation using nightly to match docs.rs.
+      - name: cargo doc
+        run: cargo doc --workspace --locked --all-features --no-deps --document-private-items
+        env:
+          RUSTDOCFLAGS: '--cfg docsrs -D warnings'
+
+  unicode-data:
+    name: unicode data (regen check)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install stable toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_STABLE_VER }}
+          components: rustfmt
+
+      - name: restore cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.event_name != 'merge_group' }}
+
+      - name: regenerate unicode data
+        # Compression level 5 was chosen because:
+        # - Level 5 produced the greatest performance gain
+        # - Levels 5 through 9 produced the same output
+        # - Level 10 regressed performance but only reduced binary size by 128 bytes
+        run: cargo run --locked -p parley_data_gen -- ./parley_data/src/generated --compression=5
+
+      - name: format generated code
+        run: cargo fmt -p parley_data
+
+      - name: check for differences
+        run: git diff --exit-code
+
+  # If this fails, consider changing your text or adding something to .typos.toml.
+  typos:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: check typos
+        uses: crate-ci/typos@v1.48.0

@@ -14,7 +14,6 @@ _archive/
 
 # LOK用例库+精选测试样本，体积大，属于外部测试数据资产，不纳入版本控制
 test_samples/
-vendor/
 
 # 各团队的会话进度交接文档，纯人工协作产物，不纳入版本控制
 ROE_Progress_v*.md
