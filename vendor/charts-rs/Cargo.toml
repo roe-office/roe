@@ -1,0 +1,69 @@
+[package]
+name = "charts-rs"
+version = "2.3.0"
+authors = ["Tree Xie <tree.xie@outlook.com>"]
+edition = "2024"
+categories = ["multimedia::images"]
+keywords = ["charts", "svg", "plot", "visualization", "graph"]
+description = "A charts library for rust"
+license = "Apache-2.0"
+homepage = "https://github.com/vicanso/charts-rs"
+repository = "https://github.com/vicanso/charts-rs"
+exclude = [
+    "asset/*",
+    "tests/*",
+    "examples/*",
+    "Cargo.lock",
+    # Of use in the repository only.
+    ".github/*",
+    "CLAUDE.md",
+    "Makefile",
+    "cliff.toml",
+    # Pages of pictures, which are in `asset` and not in the package.
+    "theme.md",
+    "docs/gallery.md",
+]
+readme = "./README.md"
+rust-version = "1.88"
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+arc-swap = "1.9.2"
+image = { version = "0.25.10", default-features = false, optional = true }
+resvg = { version = "0.48.1", default-features = false, features = [
+    "text",
+    "system-fonts",
+], optional = true }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+ttf-parser = { version = "0.25.1", default-features = false, features = [
+    "std",
+    "variable-fonts",
+] }
+
+[features]
+# Internal plumbing: the shared raster pipeline (resvg + image). Enabled
+# automatically by the per-format features below; not meant to be used alone.
+raster = ["dep:resvg", "dep:image"]
+# Per-format raster export. Pick only what you need — AVIF in particular
+# pulls in the heavyweight rav1e encoder.
+png = ["raster", "image/png"]
+jpeg = ["raster", "image/jpeg"]
+webp = ["raster", "image/webp"]
+avif = ["raster", "image/avif"]
+# Backwards-compatible umbrella enabling every raster format.
+image-encoder = ["png", "jpeg", "webp", "avif"]
+
+[dev-dependencies]
+criterion = "0.8.2"
+pretty_assertions = "1.4.1"
+
+[[bench]]
+name = "bench"
+harness = false
+
+[package.metadata.docs.rs]
+# Whether to pass `--all-features` to Cargo (default: false)
+all-features = true
+# Lets docs.rs mark the raster export functions with the feature they need.
+rustdoc-args = ["--cfg", "docsrs"]

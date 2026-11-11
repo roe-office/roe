@@ -1,0 +1,181 @@
+<svg width="600" height="400" viewBox="0 0 600 400" xmlns="http://www.w3.org/2000/svg">
+<rect x="0" y="0" width="600" height="400" fill="#FFFFFF"/>
+<text font-size="18" x="196.5" y="5" dy="15" font-weight="bold" dominant-baseline="middle" font-family="Roboto" fill="#464646">
+Stacked Area Chart
+</text>
+<text font-size="14" x="240" y="35" dy="10" dominant-baseline="middle" font-family="Roboto" fill="#464646">
+Hello World
+</text>
+<g>
+<line stroke-width="2" x1="91.5" y1="65" x2="116.5" y2="65" stroke="#5470C6"/>
+<circle cx="104" cy="65" r="5.5" stroke-width="2" stroke="#5470C6" fill="#FFFFFF"/>
+<text font-size="14" x="119.5" y="69" font-family="Roboto" fill="#464646">
+Email
+</text>
+</g>
+<g>
+<line stroke-width="2" x1="160.5" y1="65" x2="185.5" y2="65" stroke="#91CC75"/>
+<circle cx="173" cy="65" r="5.5" stroke-width="2" stroke="#91CC75" fill="#FFFFFF"/>
+<text font-size="14" x="188.5" y="69" font-family="Roboto" fill="#464646">
+Union Ads
+</text>
+</g>
+<g>
+<line stroke-width="2" x1="260.5" y1="65" x2="285.5" y2="65" stroke="#FAC858"/>
+<circle cx="273" cy="65" r="5.5" stroke-width="2" stroke="#FAC858" fill="#FFFFFF"/>
+<text font-size="14" x="288.5" y="69" font-family="Roboto" fill="#464646">
+Direct
+</text>
+</g>
+<g>
+<line stroke-width="2" x1="333.5" y1="65" x2="358.5" y2="65" stroke="#EE6666"/>
+<circle cx="346" cy="65" r="5.5" stroke-width="2" stroke="#EE6666" fill="#FFFFFF"/>
+<text font-size="14" x="361.5" y="69" font-family="Roboto" fill="#464646">
+Search Engine
+</text>
+</g>
+<g stroke="#E0E6F2" stroke-width="1">
+<line x1="38" y1="87" x2="550" y2="87"/><line x1="38" y1="133.3" x2="550" y2="133.3"/><line x1="38" y1="179.7" x2="550" y2="179.7"/><line x1="38" y1="226" x2="550" y2="226"/><line x1="38" y1="272.3" x2="550" y2="272.3"/><line x1="38" y1="318.7" x2="550" y2="318.7"/>
+</g>
+<g>
+
+<text font-size="14" x="2" y="92" font-family="Roboto" fill="#6E7079">
+1.4k
+</text>
+<text font-size="14" x="2" y="138.3" font-family="Roboto" fill="#6E7079">
+1.1k
+</text>
+<text font-size="14" x="6" y="184.7" font-family="Roboto" fill="#6E7079">
+920
+</text>
+<text font-size="14" x="6" y="231" font-family="Roboto" fill="#6E7079">
+690
+</text>
+<text font-size="14" x="6" y="277.3" font-family="Roboto" fill="#6E7079">
+460
+</text>
+<text font-size="14" x="6" y="323.7" font-family="Roboto" fill="#6E7079">
+230
+</text>
+<text font-size="14" x="22" y="370" font-family="Roboto" fill="#6E7079">
+0
+</text>
+</g>
+<g>
+<g stroke="#6E7079" stroke-width="1">
+<line x1="38" y1="365" x2="550" y2="365"/>
+<line x1="38" y1="365" x2="38" y2="370"/>
+<line x1="111.1" y1="365" x2="111.1" y2="370"/>
+<line x1="184.3" y1="365" x2="184.3" y2="370"/>
+<line x1="257.4" y1="365" x2="257.4" y2="370"/>
+<line x1="330.6" y1="365" x2="330.6" y2="370"/>
+<line x1="403.7" y1="365" x2="403.7" y2="370"/>
+<line x1="476.9" y1="365" x2="476.9" y2="370"/>
+<line x1="550" y1="365" x2="550" y2="370"/>
+</g>
+<text font-size="14" x="60.6" y="384" font-family="Roboto" fill="#6E7079">
+Mon
+</text>
+<text font-size="14" x="135.7" y="384" font-family="Roboto" fill="#6E7079">
+Tue
+</text>
+<text font-size="14" x="206.9" y="384" font-family="Roboto" fill="#6E7079">
+Wed
+</text>
+<text font-size="14" x="282" y="384" font-family="Roboto" fill="#6E7079">
+Thu
+</text>
+<text font-size="14" x="359.1" y="384" font-family="Roboto" fill="#6E7079">
+Fri
+</text>
+<text font-size="14" x="429.3" y="384" font-family="Roboto" fill="#6E7079">
+Sat
+</text>
+<text font-size="14" x="501.4" y="384" font-family="Roboto" fill="#6E7079">
+Sun
+</text>
+</g>
+<g>
+<path d="M 74.6 340.8 L 147.7 338.4 L 220.9 344.7 L 294 338 L 367.1 346.9 L 440.3 318.7 L 513.4 322.7" stroke-width="2" fill="none" stroke="#5470C6" stroke-dasharray="4,2"/>
+<g stroke-width="2" stroke="#5470C6" fill="#FFFFFF">
+<circle cx="74.6" cy="340.8" r="2"/>
+<circle cx="147.7" cy="338.4" r="2"/>
+<circle cx="220.9" cy="344.7" r="2"/>
+<circle cx="294" cy="338" r="2"/>
+<circle cx="367.1" cy="346.9" r="2"/>
+<circle cx="440.3" cy="318.7" r="2"/>
+<circle cx="513.4" cy="322.7" r="2"/>
+</g>
+</g>
+<g>
+<path d="M 74.6 320.7 L 147.7 328.3 L 220.9 326.5 L 294 317.9 L 367.1 306.6 L 440.3 298.5 L 513.4 302.6" stroke-width="2" fill="none" stroke="#91CC75"/>
+<g stroke-width="2" stroke="#91CC75" fill="#FFFFFF">
+<circle cx="74.6" cy="320.7" r="2"/>
+<circle cx="147.7" cy="328.3" r="2"/>
+<circle cx="220.9" cy="326.5" r="2"/>
+<circle cx="294" cy="317.9" r="2"/>
+<circle cx="367.1" cy="306.6" r="2"/>
+<circle cx="440.3" cy="298.5" r="2"/>
+<circle cx="513.4" cy="302.6" r="2"/>
+</g>
+</g>
+<g>
+<path d="M 74.6 300.5 L 147.7 298.1 L 220.9 304.4 L 294 297.7 L 367.1 286.4 L 440.3 298.5 L 513.4 300.5" stroke-width="2" fill="none" stroke="#FAC858"/>
+<g stroke-width="2" stroke="#FAC858" fill="#FFFFFF">
+<circle cx="74.6" cy="300.5" r="2"/>
+<circle cx="147.7" cy="298.1" r="2"/>
+<circle cx="220.9" cy="304.4" r="2"/>
+<circle cx="294" cy="297.7" r="2"/>
+<circle cx="367.1" cy="286.4" r="2"/>
+<circle cx="440.3" cy="298.5" r="2"/>
+<circle cx="513.4" cy="300.5" r="2"/>
+</g>
+</g>
+<path d="M 356.8,267.2 A 16,16 0,0,1 351.1,254.9 A 16,16 0,0,1 383.2,254.9 A 16,16 0,0,1 377.4,267.2 L 367.1,278.9 Z" fill="#FAC858"/>
+<text font-size="14" x="367.1" y="254.9" dominant-baseline="central" text-anchor="middle" font-family="Roboto" fill="#464646">
+390
+</text>
+<path d="M 211.2,285.9 A 15,15 0,0,1 205.9,274.4 A 15,15 0,0,1 235.9,274.4 A 15,15 0,0,1 230.5,285.9 L 220.9,296.9 Z" fill="#FAC858"/>
+<text font-size="14" x="220.9" y="274.4" dominant-baseline="central" text-anchor="middle" font-family="Roboto" fill="#464646">
+301
+</text>
+<g>
+<path d="M 74.6 199.8 L 147.7 177.2 L 220.9 183.5 L 294 176.8 L 367.1 105.1 L 440.3 97.1 L 513.4 99.1" stroke-width="2" fill="none" stroke="#EE6666"/>
+<g stroke-width="2" stroke="#EE6666" fill="#FFFFFF">
+<circle cx="74.6" cy="199.8" r="2"/>
+<circle cx="147.7" cy="177.2" r="2"/>
+<circle cx="220.9" cy="183.5" r="2"/>
+<circle cx="294" cy="176.8" r="2"/>
+<circle cx="367.1" cy="105.1" r="2"/>
+<circle cx="440.3" cy="97.1" r="2"/>
+<circle cx="513.4" cy="99.1" r="2"/>
+</g>
+</g>
+<text font-size="14" x="74.6" y="199.8" dx="-12" dy="-8" font-family="Roboto" fill="#464646">
+820
+</text>
+<text font-size="14" x="147.7" y="177.2" dx="-12" dy="-8" font-family="Roboto" fill="#464646">
+932
+</text>
+<text font-size="14" x="220.9" y="183.5" dx="-10.5" dy="-8" font-family="Roboto" fill="#464646">
+901
+</text>
+<text font-size="14" x="294" y="176.8" dx="-12" dy="-8" font-family="Roboto" fill="#464646">
+934
+</text>
+<text font-size="14" x="367.1" y="105.1" dx="-16" dy="-8" font-family="Roboto" fill="#464646">
+1290
+</text>
+<text font-size="14" x="440.3" y="97.1" dx="-16" dy="-8" font-family="Roboto" fill="#464646">
+1330
+</text>
+<text font-size="14" x="513.4" y="99.1" dx="-16" dy="-8" font-family="Roboto" fill="#464646">
+1320
+</text>
+<circle cx="41" cy="148.4" r="3.5" stroke-width="1" stroke="#EE6666" fill="#EE6666"/>
+<line stroke-width="1" x1="46" y1="148.4" x2="540" y2="148.4" stroke="#EE6666" stroke-dasharray="4,2"/>
+<path d="M 540 148.4 L 535 143.4 L 550 148.4 L 535 153.4 Z" stroke-width="1" fill="#EE6666" stroke="#EE6666"/>
+<text font-size="14" x="536" y="148.4" dy="-6" text-anchor="end" font-family="Roboto" fill="#464646">
+1075.3
+</text>
+</svg>

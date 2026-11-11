@@ -1,0 +1,452 @@
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#![forbid(unsafe_code)]
+#![warn(missing_docs)]
+#![cfg_attr(docsrs, feature(doc_cfg))]
+
+//! Charts supports twenty-nine chart types: bar, horizontal bar, line, lines, pie,
+//! radar, scatter, candlestick, table, heatmap, funnel, waterfall, multi
+//! chart, calendar, gauge, bullet, treemap, box plot, sunburst, sankey, tree,
+//! graph, parallel, theme river, histogram, polar bar, chord, gantt and map.
+//!
+//! It supports ten built-in themes and is very easy to use.
+//! Each attribute can be customized, it can be saved as svg, png, jpeg,
+//! webp or avif.
+//! The chart can be new from json, which sets default value if the field is undefined.
+//!
+//! # New a bar chart from json, the other charts also support the function.
+//! ```rust
+//! use charts_rs::{BarChart};
+//! let bar_chart = BarChart::from_json(
+//!     r###"{
+//!         "width": 630,
+//!         "height": 410,
+//!         "margin": {
+//!             "left": 10,
+//!             "top": 5,
+//!             "right": 10
+//!         },
+//!         "title_text": "Bar Chart",
+//!         "title_font_color": "#345",
+//!         "title_align": "right",
+//!         "sub_title_text": "demo",
+//!         "legend_align": "left",
+//!         "series_list": [
+//!             {
+//!                 "name": "Email",
+//!                 "label_show": true,
+//!                 "data": [120.0, 132.0, 101.0, 134.0, 90.0, 230.0, 210.0]
+//!             },
+//!             {
+//!                 "name": "Union Ads",
+//!                 "data": [220.0, 182.0, 191.0, 234.0, 290.0, 330.0, 310.0]
+//!             }
+//!         ],
+//!         "x_axis_data": [
+//!             "Mon",
+//!             "Tue",
+//!             "Wed",
+//!             "Thu",
+//!             "Fri",
+//!             "Sat",
+//!             "Sun"
+//!         ]
+//!     }"###,
+//! ).unwrap();
+//! println!("{}", bar_chart.svg().unwrap());
+//! ```
+//!
+//! # New bar chart with theme
+//!
+//! There are ten built-in themes: light, dark, ant, grafana, vintage,
+//! walden, westeros, chalk, shine and shadcn.
+//! The light is the default theme.
+//! ```rust
+//! use charts_rs::{BarChart, Series, THEME_GRAFANA};
+//! let bar_chart = BarChart::new_with_theme(
+//!     vec![
+//!         ("Email", vec![120.0, 132.0, 101.0, 134.0, 90.0, 230.0, 210.0]).into(),
+//!     ],
+//!     vec![
+//!         "Mon".to_string(),
+//!         "Tue".to_string(),
+//!         "Wed".to_string(),
+//!         "Thu".to_string(),
+//!         "Fri".to_string(),
+//!         "Sat".to_string(),
+//!         "Sun".to_string(),
+//!     ],
+//!     THEME_GRAFANA,
+//! );
+//! println!("{}", bar_chart.svg().unwrap());
+//!```
+//!
+//!
+//! # Add more font
+//! Fonts can be registered at any time; new fonts take effect for
+//! subsequent renders.
+//! ```rust
+//! use charts_rs::{add_fonts, BarChart};
+//! let data = include_bytes!("./Roboto.ttf") as &[u8];
+//! add_fonts(&[data]).unwrap();
+//! let bar_chart = BarChart::from_json(
+//!     r###"{
+//!         "width": 630,
+//!         "height": 410,
+//!         "font_family": "test",
+//!         "margin": {
+//!             "left": 10,
+//!             "top": 5,
+//!             "right": 10
+//!         },
+//!         "title_text": "Bar Chart",
+//!         "title_font_color": "#345",
+//!         "title_align": "right",
+//!         "sub_title_text": "demo",
+//!         "legend_align": "left",
+//!         "series_list": [
+//!             {
+//!                 "name": "Email",
+//!                 "label_show": true,
+//!                 "data": [120.0, 132.0, 101.0, 134.0, 90.0, 230.0, 210.0]
+//!             },
+//!             {
+//!                 "name": "Union Ads",
+//!                 "data": [220.0, 182.0, 191.0, 234.0, 290.0, 330.0, 310.0]
+//!             }
+//!         ],
+//!         "x_axis_data": [
+//!             "Mon",
+//!             "Tue",
+//!             "Wed",
+//!             "Thu",
+//!             "Fri",
+//!             "Sat",
+//!             "Sun"
+//!         ]
+//!     }"###,
+//! ).unwrap();
+//! println!("{}", bar_chart.svg().unwrap());
+//! ```
+//!
+//! # Basic bar chart
+//! ```rust
+//! use charts_rs::{BarChart, Series, Box};
+//! let mut bar_chart = BarChart::new(
+//!     vec![
+//!         Series::new(
+//!             "Email".to_string(),
+//!             vec![120.0, 132.0, 101.0, 134.0, 90.0, 230.0, 210.0],
+//!         ),
+//!         Series::new(
+//!             "Union Ads".to_string(),
+//!             vec![220.0, 182.0, 191.0, 234.0, 290.0, 330.0, 310.0],
+//!         ),
+//!         Series::new(
+//!             "Direct".to_string(),
+//!             vec![320.0, 332.0, 301.0, 334.0, 390.0, 330.0, 320.0],
+//!         ),
+//!         Series::new(
+//!             "Search Engine".to_string(),
+//!             vec![820.0, 932.0, 901.0, 934.0, 1290.0, 1330.0, 1320.0],
+//!         )
+//!     ],
+//!     vec![
+//!         "Mon".to_string(),
+//!         "Tue".to_string(),
+//!         "Wed".to_string(),
+//!         "Thu".to_string(),
+//!         "Fri".to_string(),
+//!         "Sat".to_string(),
+//!         "Sun".to_string(),
+//!     ],
+//! );
+//! bar_chart.y_axis_configs[0].width = Some(55.0);
+//! bar_chart.title.text = "Bar Chart".to_string();
+//! bar_chart.legend.margin = Some(Box {
+//!     top: 35.0,
+//!     bottom: 10.0,
+//!     ..Default::default()
+//! });
+//! println!("{}", bar_chart.svg().unwrap());
+//!```
+//!
+//! # Bar line mixin chart
+//! ```rust
+//! use charts_rs::{BarChart, Series, Box, SeriesCategory};
+//! let mut bar_chart = BarChart::new(
+//!     vec![
+//!         Series::new(
+//!             "Email".to_string(),
+//!             vec![120.0, 132.0, 101.0, 134.0, 90.0, 230.0, 210.0],
+//!         ),
+//!         Series::new(
+//!             "Union Ads".to_string(),
+//!             vec![220.0, 182.0, 191.0, 234.0, 290.0, 330.0, 310.0],
+//!         ),
+//!         Series::new(
+//!             "Direct".to_string(),
+//!             vec![320.0, 332.0, 301.0, 334.0, 390.0, 330.0, 320.0],
+//!         ),
+//!         Series::new(
+//!             "Search Engine".to_string(),
+//!             vec![820.0, 932.0, 901.0, 934.0, 1290.0, 1330.0, 1320.0],
+//!         )
+//!     ],
+//!     vec![
+//!         "Mon".to_string(),
+//!         "Tue".to_string(),
+//!         "Wed".to_string(),
+//!         "Thu".to_string(),
+//!         "Fri".to_string(),
+//!         "Sat".to_string(),
+//!         "Sun".to_string(),
+//!     ],
+//! );
+//! bar_chart.series_list[0].category = Some(SeriesCategory::Line);
+//! bar_chart.y_axis_configs[0].width = Some(55.0);
+//! bar_chart.title.text = "Bar Line Chart".to_string();
+//! bar_chart.legend.margin = Some(Box {
+//!     top: 35.0,
+//!     bottom: 10.0,
+//!     ..Default::default()
+//! });
+//! println!("{}", bar_chart.svg().unwrap());
+//! ```
+//!
+//!
+//! # Basic horizontal bar
+//! ```rust
+//! use charts_rs::{HorizontalBarChart, Series, Align};
+//! let mut horizontal_bar_chart = HorizontalBarChart::new(
+//!     vec![
+//!         Series::new(
+//!             "2011".to_string(),
+//!             vec![18203.0, 23489.0, 29034.0, 104970.0, 131744.0, 630230.0],
+//!         ),
+//!         Series::new(
+//!             "2012".to_string(),
+//!             vec![19325.0, 23438.0, 31000.0, 121594.0, 134141.0, 681807.0],
+//!         ),
+//!     ],
+//!     vec![
+//!         "Brazil".to_string(),
+//!         "Indonesia".to_string(),
+//!         "USA".to_string(),
+//!         "India".to_string(),
+//!         "China".to_string(),
+//!         "World".to_string(),
+//!     ],
+//! );
+//! horizontal_bar_chart.title.text = "World Population".to_string();
+//! horizontal_bar_chart.margin.right = 15.0;
+//! horizontal_bar_chart.series_list[0].label_show = true;
+//! horizontal_bar_chart.title.align = Align::Left;
+//! println!("{}", horizontal_bar_chart.svg().unwrap());
+//! ```
+//!
+//! # Basic line chart
+//! ```rust
+//! use charts_rs::{LineChart, Box};
+//! let mut line_chart = LineChart::new(
+//!     vec![
+//!         ("Email", vec![120.0, 132.0, 101.0, 134.0, 90.0, 230.0, 210.0]).into(),
+//!         ("Union Ads", vec![220.0, 182.0, 191.0, 234.0, 290.0, 330.0, 310.0]).into(),
+//!         ("Direct", vec![320.0, 332.0, 301.0, 334.0, 390.0, 330.0, 320.0]).into(),
+//!         ("Search Engine", vec![820.0, 932.0, 901.0, 934.0, 1290.0, 1330.0, 1320.0]).into(),
+//!     ],
+//!     vec![
+//!         "Mon".to_string(),
+//!         "Tue".to_string(),
+//!         "Wed".to_string(),
+//!         "Thu".to_string(),
+//!         "Fri".to_string(),
+//!         "Sat".to_string(),
+//!         "Sun".to_string(),
+//!     ],
+//! );
+//! line_chart.title.text = "Stacked Area Chart".to_string();
+//! line_chart.sub_title.text = "Hello World".to_string();
+//! line_chart.legend.margin = Some(Box {
+//!     top: 50.0,
+//!     bottom: 10.0,
+//!     ..Default::default()
+//! });
+//! line_chart.series_list[3].label_show = true;
+//! println!("{}", line_chart.svg().unwrap());
+//! ```
+//!
+//! # Basic pie chart
+//! ```rust
+//! use charts_rs::{PieChart};
+//! let mut pie_chart = PieChart::new(vec![
+//!     ("rose 1", vec![40.0]).into(),
+//!     ("rose 2", vec![38.0]).into(),
+//!     ("rose 3", vec![32.0]).into(),
+//!     ("rose 4", vec![30.0]).into(),
+//!     ("rose 5", vec![28.0]).into(),
+//!     ("rose 6", vec![26.0]).into(),
+//!     ("rose 7", vec![22.0]).into(),
+//!     ("rose 8", vec![18.0]).into(),
+//! ]);
+//! pie_chart.title.text = "Nightingale Chart".to_string();
+//! pie_chart.sub_title.text = "Fake Data".to_string();
+//! println!("{}", pie_chart.svg().unwrap());
+//! ```
+//!
+//! # Basic radar chart
+//! ```rust
+//! use charts_rs::{RadarChart};
+//! let radar_chart = RadarChart::new(
+//!     vec![
+//!         ("Allocated Budget", vec![4200.0, 3000.0, 20000.0, 35000.0, 50000.0, 18000.0, 9000.0]).into(),
+//!         ("Actual Spending", vec![5000.0, 14000.0, 28000.0, 26000.0, 42000.0, 21000.0, 7000.0]).into(),
+//!     ],
+//!     vec![
+//!         ("Sales", 6500.0).into(),
+//!         ("Administration", 16000.0).into(),
+//!         ("Information Technology", 30000.0).into(),
+//!         ("Customer Support", 38000.0).into(),
+//!         ("Development", 52000.0).into(),
+//!         ("Marketing", 25000.0).into(),
+//!         ("Online", 10000.0).into(),
+//!     ],
+//! );
+//! println!("{}", radar_chart.svg().unwrap());
+//! ```
+//!
+//! # Basic table
+//! ```rust
+//! use charts_rs::{TableChart};
+//! let mut table_chart  = TableChart::new(vec![
+//!     vec![
+//!         "Name".to_string(),
+//!         "Price".to_string(),
+//!         "Change".to_string(),
+//!     ],
+//!     vec![
+//!         "Datadog Inc".to_string(),
+//!         "97.32".to_string(),
+//!         "-7.49%".to_string(),
+//!     ],
+//!     vec![
+//!         "Hashicorp Inc".to_string(),
+//!         "28.66".to_string(),
+//!         "-9.25%".to_string(),
+//!     ],
+//!     vec![
+//!         "Gitlab Inc".to_string(),
+//!         "51.63".to_string(),
+//!         "+4.32%".to_string(),
+//!     ],
+//! ]);
+//! table_chart.title.text = "NASDAQ".to_string();
+//! println!("{}", table_chart.svg().unwrap());
+//! ```
+//!
+//! # Basic funnel chart
+//! ```rust
+//! use charts_rs::FunnelChart;
+//! let funnel_chart = FunnelChart::new(vec![
+//!     ("Impression", vec![100.0]).into(),
+//!     ("Click", vec![80.0]).into(),
+//!     ("Order", vec![30.0]).into(),
+//! ]);
+//! println!("{}", funnel_chart.svg().unwrap());
+//! ```
+//!
+//! # Basic treemap chart
+//! ```rust
+//! use charts_rs::TreemapChart;
+//! let treemap_chart = TreemapChart::new(vec![
+//!     ("A", vec![60.0]).into(),
+//!     ("B", vec![30.0]).into(),
+//!     ("C", vec![10.0]).into(),
+//! ]);
+//! println!("{}", treemap_chart.svg().unwrap());
+//! ```
+//!
+//! # Basic sunburst chart
+//! ```rust
+//! use charts_rs::{SunburstChart, SunburstData};
+//! let sunburst_chart = SunburstChart::new(vec![SunburstData {
+//!     name: "Root".to_string(),
+//!     children: vec![
+//!         SunburstData { name: "A".to_string(), value: 3.0, ..Default::default() },
+//!         SunburstData { name: "B".to_string(), value: 2.0, ..Default::default() },
+//!     ],
+//!     ..Default::default()
+//! }]);
+//! println!("{}", sunburst_chart.svg().unwrap());
+//! ```
+//!
+//! # Basic sankey chart
+//! ```rust
+//! use charts_rs::SankeyChart;
+//! // Nodes are derived from the link endpoints when left empty.
+//! let sankey_chart = SankeyChart::new(
+//!     vec![],
+//!     vec![
+//!         ("a", "b", 8.0).into(),
+//!         ("a", "c", 4.0).into(),
+//!         ("b", "d", 8.0).into(),
+//!     ],
+//! );
+//! println!("{}", sankey_chart.svg().unwrap());
+//! ```
+//!
+//! # Basic tree chart
+//! ```rust
+//! use charts_rs::{TreeChart, TreeData};
+//! let tree_chart = TreeChart::new(vec![TreeData {
+//!     name: "Root".to_string(),
+//!     children: vec![
+//!         TreeData { name: "A".to_string(), ..Default::default() },
+//!         TreeData { name: "B".to_string(), ..Default::default() },
+//!     ],
+//!     ..Default::default()
+//! }]);
+//! println!("{}", tree_chart.svg().unwrap());
+//! ```
+//!
+//! # Compatibility
+//!
+//! Guarantees that hold across all 2.x releases:
+//!
+//! - Missing data points are `None` in `Series::data` (`Vec<Option<f32>>`)
+//!   and are skipped instead of drawn as zero. Flat `Vec<f32>` input and
+//!   JSON keep accepting the legacy [`NIL_VALUE`] sentinel (= `f32::MIN`),
+//!   which maps to a missing point; JSON `null` does too.
+//! - Chart structs and the option structs they are made of (`TitleConfig`,
+//!   `XAxisConfig`, …) keep their public fields, and new optional fields may
+//!   be added in minor releases. Construct them via `new(…)`, `from_json`,
+//!   or functional update syntax (`..Default::default()`); exhaustive struct
+//!   literals are not covered by the compatibility guarantee.
+//! - [`Error`] is `#[non_exhaustive]`; keep a wildcard arm when matching.
+
+mod charts;
+pub use charts::*;
+
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// Returns the crate version.
+pub fn version() -> &'static str {
+    VERSION
+}
+
+// Compiles the Rust snippets of the README and of the guide as doctests
+// (with the raster feature they use), so the examples cannot drift from the
+// API.
+#[cfg(all(doctest, feature = "png"))]
+#[doc = include_str!("../README.md")]
+#[doc = include_str!("../docs/guide.md")]
+pub struct ReadmeDoctests;

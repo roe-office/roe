@@ -7,7 +7,6 @@
 
 # 外部参考/vendor代码，不属于本workspace，各自带独立.git，不纳入版本控制
 RaTeX/
-charts-rs/
 
 # 手动.bak快照归档，git接管后不再需要，不纳入版本控制
 _archive/

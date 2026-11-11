@@ -1,0 +1,706 @@
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use super::base::ChartBase;
+use super::canvas;
+use super::color::*;
+use super::common::*;
+use super::component::*;
+use super::font::measure_max_text_width_family;
+use super::params::*;
+use super::theme::{get_default_theme_name, get_theme};
+use super::util::*;
+use crate::charts::measure_text_width_family;
+
+/// One heatmap cell: a flat grid `index` plus its value.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct HeatmapData {
+    /// Flat index of the cell in the grid.
+    pub index: usize,
+    /// Value of the cell.
+    pub value: f32,
+}
+
+impl From<(usize, f32)> for HeatmapData {
+    fn from(value: (usize, f32)) -> Self {
+        HeatmapData {
+            index: value.0,
+            value: value.1,
+        }
+    }
+}
+
+/// How a cell of a heatmap shows its value.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum HeatmapSymbol {
+    /// The whole cell, in the color of the value.
+    #[default]
+    Rect,
+    /// A circle in the cell, as large as the value (and in its color): a
+    /// punch card.
+    Circle,
+}
+
+/// The heatmap cells plus the value range and its color mapping.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct HeatmapSeries {
+    /// The heatmap cells.
+    pub data: Vec<HeatmapData>,
+    /// Lower bound of the value range.
+    pub min: f32,
+    /// Upper bound of the value range.
+    pub max: f32,
+    /// Color mapped to the lower bound.
+    pub min_color: Color,
+    /// Color mapped to the upper bound.
+    pub max_color: Color,
+    /// Label font color on low-value cells.
+    pub min_font_color: Color,
+    /// Label font color on high-value cells.
+    pub max_font_color: Color,
+    /// The colors of the scale, from the smallest value to the largest.
+    /// Two or more take the place of `min_color` and `max_color`: the scale
+    /// goes through all of them.
+    pub colors: Vec<Color>,
+    /// Number of classes of the same width the values are sorted into, each
+    /// in one color, instead of a continuous scale. 0 (the default) and 1
+    /// keep it continuous.
+    pub steps: usize,
+    /// The values where one class ends and the next begins; takes the place
+    /// of `steps`. A value below the first one is in the first class.
+    pub thresholds: Vec<f32>,
+    /// Fills the cells, or draws a circle as large as the value in each.
+    pub symbol: HeatmapSymbol,
+}
+
+impl HeatmapSeries {
+    /// True when the scale is more than a gradient from `min_color` to
+    /// `max_color`: several colors, or classes.
+    fn is_custom_scale(&self) -> bool {
+        self.colors.len() >= 2 || self.steps >= 2 || !self.thresholds.is_empty()
+    }
+    /// The color of `value` on a scale of several colors, or of classes.
+    fn scale_color(&self, value: f32) -> Color {
+        let position = scale_position(value, (self.min, self.max), self.steps, &self.thresholds);
+        if self.colors.len() >= 2 {
+            gradient_color(&self.colors, position)
+        } else {
+            gradient_color(&[self.min_color, self.max_color], position)
+        }
+    }
+    fn get_color(&self, value: f32) -> Color {
+        if self.is_custom_scale() {
+            return self.scale_color(value);
+        }
+        if value < self.min {
+            return self.min_color;
+        }
+        if value > self.max {
+            return self.max_color;
+        }
+        let percent = (value - self.min) / (self.max - self.min);
+        let get_value = |max: u8, min: u8| {
+            let offset = max.abs_diff(min);
+            let offset = (offset as f32 * percent) as u8;
+            if max > min {
+                min + offset
+            } else {
+                min - offset
+            }
+        };
+        Color {
+            r: get_value(self.max_color.r, self.min_color.r),
+            g: get_value(self.max_color.g, self.min_color.g),
+            b: get_value(self.max_color.b, self.min_color.b),
+            a: get_value(self.max_color.a, self.min_color.a),
+        }
+    }
+}
+
+/// A heatmap over an x/y category grid, coloring cells by value.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct HeatmapChart {
+    /// The shared chart options (size, series, title/legend, axes); exposed
+    /// directly on the chart through `Deref`, e.g. `chart.title.text`.
+    pub base: ChartBase,
+    // no use, but for derive chart
+    /// The heatmap cell data and color mapping.
+    pub heatmap_series: HeatmapSeries,
+
+    // title
+
+    // sub title
+
+    // legend
+
+    // x axis
+
+    // y axis
+    /// Labels of the y axis.
+    pub y_axis_data: Vec<String>,
+    y_axis_configs: Vec<YAxisConfig>,
+    // grid
+
+    // series
+}
+
+impl std::ops::Deref for HeatmapChart {
+    type Target = ChartBase;
+    fn deref(&self) -> &ChartBase {
+        &self.base
+    }
+}
+impl std::ops::DerefMut for HeatmapChart {
+    fn deref_mut(&mut self) -> &mut ChartBase {
+        &mut self.base
+    }
+}
+
+impl HeatmapChart {
+    fn fill_default(&mut self) {
+        if self.y_axis_configs[0].stroke_color.is_zero() {
+            self.y_axis_configs[0].stroke_color = self.x_axis.stroke_color;
+        }
+        self.y_axis_configs[0].name_align = Some(Align::Center);
+        self.y_axis_configs[0].split_number += 1;
+        if self.heatmap_series.max_color.is_zero() {
+            self.heatmap_series.max_color = (191, 68, 76).into();
+        }
+        if self.heatmap_series.min_color.is_zero() {
+            self.heatmap_series.min_color = (240, 217, 156).into();
+        }
+        if self.heatmap_series.min_font_color.is_zero() {
+            self.heatmap_series.min_font_color = (70, 70, 70).into();
+        }
+        if self.heatmap_series.max_font_color.is_zero() {
+            self.heatmap_series.max_font_color = (238, 238, 238).into();
+        }
+        if self.heatmap_series.max == 0.0 {
+            let mut max = 0.0;
+            for item in self.heatmap_series.data.iter() {
+                if item.value > max {
+                    max = item.value
+                }
+            }
+            self.heatmap_series.max = max;
+        }
+    }
+    /// Creates a heatmap chart from json.
+    pub fn from_json(data: &str) -> canvas::Result<HeatmapChart> {
+        let mut h = HeatmapChart {
+            ..Default::default()
+        };
+        let value =
+            h.base
+                .fill_option(data, &mut h.y_axis_configs, super::schema::HEATMAP_FIELDS)?;
+        if let Some(y_axis_data) = get_string_slice_from_value(&value, "y_axis_data") {
+            h.y_axis_data = y_axis_data;
+        }
+        if let Some(value) = value.get("series") {
+            if let Some(min) = get_f32_from_value(value, "min") {
+                h.heatmap_series.min = min;
+            }
+            if let Some(max) = get_f32_from_value(value, "max") {
+                h.heatmap_series.max = max;
+            }
+            if let Some(min_color) = get_color_from_value(value, "min_color") {
+                h.heatmap_series.min_color = min_color;
+            }
+            if let Some(max_color) = get_color_from_value(value, "max_color") {
+                h.heatmap_series.max_color = max_color;
+            }
+            if let Some(min_font_color) = get_color_from_value(value, "min_font_color") {
+                h.heatmap_series.min_font_color = min_font_color;
+            }
+            if let Some(max_font_color) = get_color_from_value(value, "max_font_color") {
+                h.heatmap_series.max_font_color = max_font_color;
+            }
+            if let Some(colors) = get_color_slice_from_value(value, "colors") {
+                h.heatmap_series.colors = colors;
+            }
+            if let Some(steps) = get_usize_from_value(value, "steps") {
+                h.heatmap_series.steps = steps;
+            }
+            if let Some(thresholds) = get_f32_slice_from_value(value, "thresholds") {
+                h.heatmap_series.thresholds = thresholds;
+            }
+            if let Some(symbol) = get_string_from_value(value, "symbol") {
+                h.heatmap_series.symbol = if symbol.eq_ignore_ascii_case("circle") {
+                    HeatmapSymbol::Circle
+                } else {
+                    HeatmapSymbol::Rect
+                };
+            }
+            if let Some(data) = value.get("data") {
+                let mut values = vec![];
+                if let Some(arr) = data.as_array() {
+                    for item in arr.iter() {
+                        if let Some(arr) = item.as_array() {
+                            if arr.len() != 2 {
+                                continue;
+                            }
+                            values.push(HeatmapData {
+                                index: arr[0].as_i64().unwrap_or_default() as usize,
+                                value: arr[1].as_f64().unwrap_or_default() as f32,
+                            });
+                        }
+                    }
+                }
+                h.heatmap_series.data = values;
+            }
+        }
+        h.fill_default();
+        Ok(h)
+    }
+    /// Creates a heatmap chart with default theme.
+    pub fn new(
+        series_data: Vec<(usize, f32)>,
+        x_axis_data: Vec<String>,
+        y_axis_data: Vec<String>,
+    ) -> HeatmapChart {
+        HeatmapChart::new_with_theme(
+            series_data,
+            x_axis_data,
+            y_axis_data,
+            &get_default_theme_name(),
+        )
+    }
+    /// Creates a heatmap chart with custom theme.
+    pub fn new_with_theme(
+        series_data: Vec<(usize, f32)>,
+        x_axis_data: Vec<String>,
+        y_axis_data: Vec<String>,
+        theme: &str,
+    ) -> HeatmapChart {
+        let mut h = HeatmapChart {
+            y_axis_data,
+            ..Default::default()
+        };
+        h.x_axis.data = x_axis_data;
+        let mut max = 0.0_f32;
+        let mut data = vec![];
+        for item in series_data.iter() {
+            if item.1 > max {
+                max = item.1;
+            }
+            data.push((*item).into());
+        }
+        h.heatmap_series.data = data;
+        let theme = get_theme(theme);
+        h.base.fill_theme(theme, &mut h.y_axis_configs);
+        h.fill_default();
+        h
+    }
+    /// Converts heatmap chart to svg.
+    pub fn svg(&self) -> canvas::Result<String> {
+        let mut c = self.new_canvas();
+
+        if self.x_axis.data.is_empty() || self.y_axis_data.is_empty() {
+            return Err(canvas::Error::Params {
+                message: "x axis or y axis can not be empty".to_string(),
+            });
+        }
+
+        let mut x_axis_height = self.x_axis.height;
+        if self.x_axis.hidden {
+            x_axis_height = 0.0;
+        }
+        let axis_top = self.render_header(&mut c);
+        let titles =
+            self.reserve_axis_titles(&mut c, &self.y_axis_configs, &self.x_axis.title, false);
+        let axis_height = c.height() - x_axis_height - axis_top;
+
+        // minus the height of top text area
+        if axis_top > 0.0 {
+            c = c.child(Box {
+                top: axis_top,
+                ..Default::default()
+            });
+        }
+        let mut y_axis_width = 0.0;
+        if !self.y_axis_hidden {
+            let max_text_width_box = measure_max_text_width_family(
+                &self.font_family,
+                self.y_axis_configs[0].font.size,
+                self.y_axis_data.iter().map(|item| item.as_str()).collect(),
+            )?;
+            y_axis_width = max_text_width_box.width() + self.margin.left;
+            // y axis
+            let mut y_axis_data = self.y_axis_data.clone();
+            y_axis_data.reverse();
+            self.render_y_axis(
+                c.child_left_top(Box::default()),
+                &self.y_axis_configs,
+                y_axis_data,
+                axis_height,
+                y_axis_width,
+                0,
+            );
+        }
+        let axis_width = c.width() - y_axis_width;
+        self.render_axis_titles(
+            &titles,
+            &self.y_axis_configs,
+            &self.x_axis.title,
+            y_axis_width,
+            axis_top,
+            axis_width,
+            axis_height,
+        );
+        // x axis
+        if !self.x_axis.hidden {
+            self.render_x_axis(
+                c.child(Box {
+                    top: c.height() - x_axis_height,
+                    left: y_axis_width,
+                    ..Default::default()
+                }),
+                self.x_axis.data.clone(),
+                axis_width,
+            );
+        }
+        let mut data = vec![None; self.x_axis.data.len() * self.y_axis_data.len()];
+        for item in self.heatmap_series.data.iter() {
+            if item.index < data.len() {
+                data[item.index] = Some(item.value);
+            }
+        }
+
+        let x_unit = (axis_width - 1.0) / self.x_axis.data.len() as f32;
+        let y_unit = (axis_height - 1.0) / self.y_axis_data.len() as f32;
+        let mut c1 = c.child(Box {
+            left: y_axis_width + 1.0,
+            ..Default::default()
+        });
+        let y_axis_count = self.y_axis_data.len();
+        let circles = self.heatmap_series.symbol == HeatmapSymbol::Circle;
+        for i in 0..y_axis_count {
+            // A punch card: the circles of a row lie on a line.
+            if circles {
+                let y = y_unit * (y_axis_count - i - 1) as f32 + y_unit / 2.0;
+                c1.line(Line {
+                    color: Some(self.grid.stroke_color),
+                    stroke_width: self.grid.stroke_width,
+                    stroke_dash_array: self.grid.stroke_dash_array.clone(),
+                    left: 0.0,
+                    top: y,
+                    right: x_unit * self.x_axis.data.len() as f32,
+                    bottom: y,
+                });
+            }
+            for j in 0..self.x_axis.data.len() {
+                let index = i * self.x_axis.data.len() + j;
+                let x = x_unit * j as f32;
+                // position of y axis starts from bottom
+                let y = y_unit * (y_axis_count - i - 1) as f32;
+                let mut text = "".to_string();
+                let mut font_color = self.heatmap_series.min_font_color;
+                let color = if let Some(value) = data[index] {
+                    let percent = (value - self.heatmap_series.min)
+                        / (self.heatmap_series.max - self.heatmap_series.min);
+                    // The light font on the high values of a plain scale; on
+                    // a scale of one's own, wherever the cell is dark.
+                    let dark_cell = if self.heatmap_series.is_custom_scale() {
+                        !self.heatmap_series.get_color(value).is_light()
+                    } else {
+                        percent >= 0.8
+                    };
+                    if dark_cell {
+                        font_color = self.heatmap_series.max_font_color;
+                    }
+
+                    text = format_series_label(
+                        &self.series.label.formatter,
+                        value,
+                        &self.y_axis_data[i],
+                        &self.x_axis.data[j],
+                    );
+                    self.heatmap_series.get_color(value)
+                } else {
+                    let mut color_index = j;
+                    if i % 2 != 0 {
+                        color_index += 1;
+                    }
+                    let mut color = self.background_color;
+                    let offset = 20;
+                    if color.is_light() {
+                        color.r -= offset;
+                        color.g -= offset;
+                        color.b -= offset;
+                    } else {
+                        color.r += offset;
+                        color.g += offset;
+                        color.b += offset;
+                    }
+                    if color_index % 2 != 0 {
+                        color = color.with_alpha(100);
+                    }
+                    color
+                };
+                // Cell identity for callers that make the rendered SVG
+                // interactive. `index` is the same flat index the series data
+                // is keyed by; only cells that have data carry a value.
+                let mut dataset = vec![
+                    ("index".to_string(), index.to_string()),
+                    ("x".to_string(), self.x_axis.data[j].clone()),
+                    ("y".to_string(), self.y_axis_data[i].clone()),
+                ];
+                if let Some(value) = data[index] {
+                    dataset.push(("value".to_string(), format_float(value)));
+                }
+                let tooltip_text = match (self.tooltip.show, data[index]) {
+                    (true, Some(value)) => Some(format!(
+                        "{}, {}: {}",
+                        self.x_axis.data[j],
+                        self.y_axis_data[i],
+                        format_float(value)
+                    )),
+                    _ => None,
+                };
+                if circles {
+                    // The area of the circle tells the value; a cell
+                    // without one stays empty.
+                    let Some(value) = data[index] else {
+                        continue;
+                    };
+                    let range = self.heatmap_series.max - self.heatmap_series.min;
+                    let share = if range > 0.0 {
+                        ((value - self.heatmap_series.min) / range).clamp(0.0, 1.0)
+                    } else {
+                        1.0
+                    };
+                    let radius = (x_unit.min(y_unit) * 0.45 * share.sqrt()).max(1.5);
+                    let (cx, cy) = (x + x_unit / 2.0, y + y_unit / 2.0);
+                    c1.circle(Circle {
+                        stroke_color: None,
+                        fill: Some(color),
+                        stroke_width: 0.0,
+                        stroke_dash_array: None,
+                        cx,
+                        cy,
+                        r: radius,
+                        title: tooltip_text.clone(),
+                        class: tooltip_text.as_ref().map(|_| "ct-trigger".to_string()),
+                        dataset,
+                    });
+                    if let Some(tip) = tooltip_text {
+                        c1.text_unmeasured(Text {
+                            text: tip,
+                            class: Some("ct-tip".to_string()),
+                            font_weight: self.tooltip.font.weight.clone(),
+                            font_family: Some(self.font_family.clone()),
+                            font_color: Some(self.tooltip_font_color(self.series.label.font.color)),
+                            font_size: Some(self.tooltip_font_size(self.series.label.font.size)),
+                            x: Some(cx),
+                            y: Some(cy - radius),
+                            dy: Some(-4.0),
+                            text_anchor: Some("middle".to_string()),
+                            ..Default::default()
+                        });
+                    }
+                    continue;
+                }
+                c1.rect(Rect {
+                    color: Some(color),
+                    fill: Some(color.into()),
+                    left: x,
+                    top: y,
+                    width: x_unit,
+                    height: y_unit,
+                    title: tooltip_text.clone(),
+                    class: tooltip_text.as_ref().map(|_| "ct-trigger".to_string()),
+                    dataset,
+                    ..Default::default()
+                });
+                if let Some(tip) = tooltip_text {
+                    c1.text_unmeasured(Text {
+                        text: tip,
+                        class: Some("ct-tip".to_string()),
+                        font_weight: self.tooltip.font.weight.clone(),
+                        font_family: Some(self.font_family.clone()),
+                        font_color: Some(self.tooltip_font_color(self.series.label.font.color)),
+                        font_size: Some(self.tooltip_font_size(self.series.label.font.size)),
+                        x: Some(x + x_unit / 2.0),
+                        y: Some(y),
+                        dy: Some(-4.0),
+                        text_anchor: Some("middle".to_string()),
+                        ..Default::default()
+                    });
+                }
+                if !text.is_empty() {
+                    let mut x1 = x + x_unit / 2.0;
+                    let y1 = y + y_unit / 2.0;
+                    if let Ok(b) = measure_text_width_family(
+                        &self.font_family,
+                        self.series.label.font.size,
+                        &text,
+                    ) {
+                        x1 -= b.width() / 2.0;
+                    }
+                    c1.text_unmeasured(Text {
+                        text,
+                        font_family: Some(self.font_family.clone()),
+                        font_color: Some(font_color),
+                        font_size: Some(self.series.label.font.size),
+                        font_weight: self.series.label.font.weight.clone(),
+                        dominant_baseline: Some("central".to_string()),
+                        x: Some(x1),
+                        y: Some(y1),
+                        ..Default::default()
+                    });
+                }
+            }
+        }
+
+        if self.tooltip.show {
+            c.svg_with_style(TOOLTIP_STYLE)
+        } else {
+            c.svg()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::THEME_DARK;
+
+    use super::HeatmapChart;
+
+    #[test]
+    fn heatmap_chart_basic() {
+        let x_axis_data = vec![
+            "12a", "1a", "2a", "3a", "4a", "5a", "6a", "7a", "8a", "9a", "10a", "11a", "12p", "1p",
+            "2p", "3p", "4p", "5p", "6p", "7p", "8p", "9p", "10p", "11p",
+        ]
+        .iter()
+        .map(|item| item.to_string())
+        .collect();
+        let y_axis_data = [
+            "Saturday",
+            "Friday",
+            "Thursday",
+            "Wednesday",
+            "Tuesday",
+            "Monday",
+            "Sunday",
+        ]
+        .iter()
+        .map(|item| item.to_string())
+        .collect();
+        let mut heatmap_chart = HeatmapChart::new(
+            vec![
+                (0, 9.0),
+                (1, 3.0),
+                (7, 3.0),
+                (12, 3.0),
+                (24, 12.0),
+                (28, 10.0),
+                (31, 8.0),
+                (50, 4.0),
+                (63, 2.0),
+            ],
+            x_axis_data,
+            y_axis_data,
+        );
+        heatmap_chart.width = 800.0;
+        heatmap_chart.heatmap_series.max = 10.0;
+
+        assert_snapshot!("heatmap_chart/basic.svg", heatmap_chart.svg().unwrap());
+    }
+
+    #[test]
+    fn heatmap_chart_dark() {
+        let x_axis_data = vec![
+            "12a", "1a", "2a", "3a", "4a", "5a", "6a", "7a", "8a", "9a", "10a", "11a", "12p", "1p",
+            "2p", "3p", "4p", "5p", "6p", "7p", "8p", "9p", "10p", "11p",
+        ]
+        .iter()
+        .map(|item| item.to_string())
+        .collect();
+        let y_axis_data = [
+            "Saturday",
+            "Friday",
+            "Thursday",
+            "Wednesday",
+            "Tuesday",
+            "Monday",
+            "Sunday",
+        ]
+        .iter()
+        .map(|item| item.to_string())
+        .collect();
+        let mut heatmap_chart = HeatmapChart::new_with_theme(
+            vec![
+                (0, 9.0),
+                (1, 3.0),
+                (7, 3.0),
+                (12, 3.0),
+                (24, 12.0),
+                (28, 10.0),
+                (31, 8.0),
+                (50, 4.0),
+                (63, 2.0),
+            ],
+            x_axis_data,
+            y_axis_data,
+            THEME_DARK,
+        );
+        heatmap_chart.width = 800.0;
+        heatmap_chart.heatmap_series.max = 10.0;
+
+        assert_snapshot!("heatmap_chart/basic_dark.svg", heatmap_chart.svg().unwrap());
+    }
+
+    #[test]
+    fn heatmap_chart_no_axis() {
+        let x_axis_data = vec![
+            "12a", "1a", "2a", "3a", "4a", "5a", "6a", "7a", "8a", "9a", "10a", "11a", "12p", "1p",
+            "2p", "3p", "4p", "5p", "6p", "7p", "8p", "9p", "10p", "11p",
+        ]
+        .iter()
+        .map(|item| item.to_string())
+        .collect();
+        let y_axis_data = [
+            "Saturday",
+            "Friday",
+            "Thursday",
+            "Wednesday",
+            "Tuesday",
+            "Monday",
+            "Sunday",
+        ]
+        .iter()
+        .map(|item| item.to_string())
+        .collect();
+        let mut heatmap_chart = HeatmapChart::new(
+            vec![
+                (0, 9.0),
+                (1, 3.0),
+                (7, 3.0),
+                (12, 3.0),
+                (24, 12.0),
+                (28, 10.0),
+                (31, 8.0),
+                (50, 4.0),
+                (63, 2.0),
+            ],
+            x_axis_data,
+            y_axis_data,
+        );
+        heatmap_chart.width = 800.0;
+        heatmap_chart.heatmap_series.max = 10.0;
+        heatmap_chart.x_axis.hidden = true;
+        heatmap_chart.y_axis_hidden = true;
+
+        assert_snapshot!("heatmap_chart/no_axis.svg", heatmap_chart.svg().unwrap());
+    }
+}

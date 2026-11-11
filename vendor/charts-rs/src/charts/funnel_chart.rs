@@ -1,0 +1,440 @@
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use super::base::ChartBase;
+use super::canvas;
+use super::color::*;
+use super::common::*;
+use super::component::*;
+use super::params::*;
+use super::theme::{get_default_theme_name, get_theme};
+use super::util::*;
+use crate::charts::measure_text_width_family;
+
+/// A funnel chart for stage conversion data.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct FunnelChart {
+    /// The shared chart options (size, series, title/legend, axes); exposed
+    /// directly on the chart through `Deref`, e.g. `chart.title.text`.
+    pub base: ChartBase,
+
+    y_axis_configs: Vec<YAxisConfig>,
+
+    /// Label position: `"inside"`, `"left"`, or `"right"` (default).
+    pub series_label_position: Option<String>,
+
+    // ── Funnel-specific fields ────────────────────────────────────────────────
+    /// Vertical gap between trapezoids in pixels (default: 2).
+    pub funnel_gap: f32,
+
+    /// Horizontal alignment of all trapezoids (default: `Center`).
+    pub funnel_align: Align,
+
+    /// If `true`, smallest value at top; if `false` (default), largest at top.
+    pub sort_ascending: bool,
+
+    /// Minimum trapezoid width for the narrowest end, in pixels (default: 20).
+    pub min_width: f32,
+
+    /// ROE-PATCH: if `true`, every stage is a rectangle (bottom width = top width). Default `false`.
+    pub funnel_rect: bool,
+
+    /// ROE-PATCH: if `true`, keep the series order instead of sorting by value. Default `false`.
+    pub funnel_keep_order: bool,
+
+    /// ROE-PATCH: stage outline (color, width). `None` keeps upstream behavior.
+    pub funnel_stroke: Option<(crate::Color, f32)>,
+}
+
+impl std::ops::Deref for FunnelChart {
+    type Target = ChartBase;
+    fn deref(&self) -> &ChartBase {
+        &self.base
+    }
+}
+impl std::ops::DerefMut for FunnelChart {
+    fn deref_mut(&mut self) -> &mut ChartBase {
+        &mut self.base
+    }
+}
+
+impl FunnelChart {
+    fn fill_default(&mut self) {
+        if self.funnel_gap <= 0.0 {
+            self.funnel_gap = 2.0;
+        }
+        if self.min_width <= 0.0 {
+            self.min_width = 20.0;
+        }
+        // default label position
+        if self.series_label_position.is_none() {
+            self.series_label_position = Some("right".to_string());
+        }
+    }
+
+    /// Creates a funnel chart with default theme.
+    pub fn new(series_list: Vec<Series>) -> FunnelChart {
+        FunnelChart::new_with_theme(series_list, &get_default_theme_name())
+    }
+
+    /// Creates a funnel chart with a custom theme.
+    pub fn new_with_theme(series_list: Vec<Series>, theme: &str) -> FunnelChart {
+        let mut c = FunnelChart {
+            ..Default::default()
+        };
+        c.series_list = series_list;
+        c.base.fill_theme(get_theme(theme), &mut c.y_axis_configs);
+        c.fill_default();
+        c
+    }
+
+    /// Creates a funnel chart from a JSON string.
+    pub fn from_json(json: &str) -> canvas::Result<FunnelChart> {
+        let mut c = FunnelChart {
+            ..Default::default()
+        };
+        let value =
+            c.base
+                .fill_option(json, &mut c.y_axis_configs, super::schema::FUNNEL_FIELDS)?;
+        if let Some(v) = get_f32_from_value(&value, "funnel_gap") {
+            c.funnel_gap = v;
+        }
+        if let Some(v) = get_f32_from_value(&value, "min_width") {
+            c.min_width = v;
+        }
+        if let Some(b) = get_bool_from_value(&value, "sort_ascending") {
+            c.sort_ascending = b;
+        }
+        if let Some(s) = get_string_from_value(&value, "series_label_position") {
+            c.series_label_position = Some(s);
+        }
+        if let Some(a) = get_align_from_value(&value, "funnel_align") {
+            c.funnel_align = a;
+        }
+        c.fill_default();
+        Ok(c)
+    }
+
+    /// Renders the funnel chart to an SVG string.
+    pub fn svg(&self) -> canvas::Result<String> {
+        if self.series_list.is_empty() {
+            return Err(canvas::Error::Params {
+                message: "series_list is empty".to_string(),
+            });
+        }
+
+        let mut c = self.new_canvas();
+        let axis_top = self.render_header(&mut c);
+
+        if axis_top > 0.0 {
+            c = c.child(Box {
+                top: axis_top,
+                ..Default::default()
+            });
+        }
+
+        let funnel_width = c.width();
+        let funnel_height = c.height();
+
+        // ── Collect & sort series ─────────────────────────────────────────────
+        // Tuple: (color_index, value, name).
+        let mut stages: Vec<(usize, f32, String)> = self
+            .series_list
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                let val: f32 = s.iter_values().sum();
+                (s.index.unwrap_or(i), val, s.name.clone())
+            })
+            .collect();
+
+        if self.funnel_keep_order {
+        } else if self.sort_ascending {
+            stages.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        } else {
+            stages.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        }
+
+        let max_val = stages
+            .iter()
+            .map(|(_, v, _)| *v)
+            .fold(f32::NEG_INFINITY, f32::max);
+        if max_val <= 0.0 {
+            return c.svg();
+        }
+        let total: f32 = stages.iter().map(|(_, v, _)| *v).sum();
+
+        let n = stages.len();
+        let gap = self.funnel_gap;
+        let stage_h = (funnel_height - (n as f32 - 1.0) * gap) / n as f32;
+
+        let label_pos = self.series_label_position.as_deref().unwrap_or("right");
+        let label_font_size = self.series.label.font.size;
+        let label_color = self.series.label.font.color;
+        let mut formatter = self.series.label.formatter.clone();
+        if formatter.is_empty() {
+            formatter = "{a}: {c}".to_string();
+        }
+        let anim_class = self.animation.as_ref().map(|_| "funnel-anim".to_string());
+
+        for (stage_idx, (color_idx, val, name)) in stages.iter().enumerate() {
+            let top_w = (val / max_val) * funnel_width;
+            // bottom width = next stage's width (or min_width for last stage)
+            let bot_w = if self.funnel_rect {
+                top_w
+            } else if stage_idx + 1 < n {
+                let next_val = stages[stage_idx + 1].1;
+                ((next_val / max_val) * funnel_width).max(self.min_width)
+            } else {
+                self.min_width
+            };
+
+            let y_top = stage_idx as f32 * (stage_h + gap);
+            let y_bot = y_top + stage_h;
+
+            // horizontal offset per alignment
+            let (x_left_top, x_left_bot) = match self.funnel_align {
+                Align::Left => (0.0, 0.0),
+                Align::Right => (funnel_width - top_w, funnel_width - bot_w),
+                _ => ((funnel_width - top_w) / 2.0, (funnel_width - bot_w) / 2.0),
+            };
+            let x_right_top = x_left_top + top_w;
+            let x_right_bot = x_left_bot + bot_w;
+
+            let color = get_color(&self.series.colors, *color_idx);
+            let percentage = if total > 0.0 { val / total } else { 0.0 };
+
+            let tooltip_text = self.tooltip.show.then(|| {
+                LabelOption {
+                    series_name: name.clone(),
+                    value: *val,
+                    percentage,
+                    formatter: "{a}: {c} ({d})".to_string(),
+                    ..Default::default()
+                }
+                .format()
+            });
+            let mut class = anim_class.clone();
+            if tooltip_text.is_some() {
+                class = Some(match class {
+                    Some(c) => format!("{c} ct-trigger"),
+                    None => "ct-trigger".to_string(),
+                });
+            }
+            c.polygon(Polygon {
+                color: Some(self.funnel_stroke.map(|s| s.0).unwrap_or(color)),
+                style: self.funnel_stroke.map(|s| format!("stroke-width:{}", s.1)),
+                fill: Some(color),
+                points: vec![
+                    (x_left_top, y_top).into(),
+                    (x_right_top, y_top).into(),
+                    (x_right_bot, y_bot).into(),
+                    (x_left_bot, y_bot).into(),
+                ],
+                class,
+                title: tooltip_text.clone(),
+                dataset: vec![
+                    ("series".to_string(), name.clone()),
+                    ("value".to_string(), format_float(*val)),
+                    ("percentage".to_string(), format_float(percentage * 100.0)),
+                ],
+                ..Default::default()
+            });
+
+            let mid_y = (y_top + y_bot) / 2.0;
+            // Hidden hover label right after the shape (adjacent-sibling reveal).
+            if let Some(text) = tooltip_text {
+                c.text(Text {
+                    text,
+                    class: Some("ct-tip".to_string()),
+                    font_weight: self.tooltip.font.weight.clone(),
+                    font_family: Some(self.font_family.clone()),
+                    font_color: Some(self.tooltip_font_color(label_color)),
+                    font_size: Some(self.tooltip_font_size(label_font_size)),
+                    x: Some((x_left_top + x_right_top) / 2.0),
+                    y: Some(mid_y),
+                    text_anchor: Some("middle".to_string()),
+                    dominant_baseline: Some("central".to_string()),
+                    ..Default::default()
+                });
+            }
+
+            let label_option = LabelOption {
+                series_name: name.clone(),
+                value: *val,
+                percentage,
+                formatter: formatter.clone(),
+                ..Default::default()
+            };
+            let label_text = label_option.format();
+
+            match label_pos {
+                "inside" => {
+                    // Center text inside the trapezoid
+                    let mid_x = (x_left_top + x_right_top) / 2.0;
+                    let mut text_x = mid_x;
+                    if let Ok(b) =
+                        measure_text_width_family(&self.font_family, label_font_size, &label_text)
+                    {
+                        text_x -= b.width() / 2.0;
+                    }
+                    c.text(Text {
+                        text: label_text,
+                        font_family: Some(self.font_family.clone()),
+                        font_color: Some(label_color),
+                        font_size: Some(label_font_size),
+                        font_weight: self.series.label.font.weight.clone(),
+                        dominant_baseline: Some("central".to_string()),
+                        x: Some(text_x),
+                        y: Some(mid_y),
+                        class: anim_class.clone(),
+                        ..Default::default()
+                    });
+                }
+                "left" => {
+                    let x_edge = x_left_top.min(x_left_bot) - 5.0;
+                    let mut text_x = x_edge;
+                    if let Ok(b) =
+                        measure_text_width_family(&self.font_family, label_font_size, &label_text)
+                    {
+                        text_x -= b.width();
+                    }
+                    c.text(Text {
+                        text: label_text,
+                        font_family: Some(self.font_family.clone()),
+                        font_color: Some(label_color),
+                        font_size: Some(label_font_size),
+                        font_weight: self.series.label.font.weight.clone(),
+                        dominant_baseline: Some("central".to_string()),
+                        x: Some(text_x.max(0.0)),
+                        y: Some(mid_y),
+                        class: anim_class.clone(),
+                        ..Default::default()
+                    });
+                }
+                _ => {
+                    // "right" (default): to the right of the widest edge, pulled
+                    // back so the text ends inside the canvas. The widest stage
+                    // is as wide as the funnel, so the unclamped position always
+                    // falls outside it.
+                    let x_edge = x_right_top.max(x_right_bot) + 5.0;
+                    let mut text_x = x_edge;
+                    if let Ok(b) =
+                        measure_text_width_family(&self.font_family, label_font_size, &label_text)
+                    {
+                        text_x = text_x.min(funnel_width - b.width());
+                    }
+                    c.text(Text {
+                        text: label_text,
+                        font_family: Some(self.font_family.clone()),
+                        font_color: Some(label_color),
+                        font_size: Some(label_font_size),
+                        font_weight: self.series.label.font.weight.clone(),
+                        dominant_baseline: Some("central".to_string()),
+                        x: Some(text_x.max(0.0)),
+                        y: Some(mid_y),
+                        class: anim_class.clone(),
+                        ..Default::default()
+                    });
+                }
+            }
+        }
+
+        let mut css = String::new();
+        if let Some(ref anim) = self.animation {
+            css.push_str(&format!(
+                "@keyframes funnel-fade{{from{{opacity:0}}to{{opacity:1}}}} \
+                 .funnel-anim{{animation:funnel-fade {}ms {} both}} ",
+                anim.duration,
+                anim.safe_easing()
+            ));
+        }
+        if self.tooltip.show {
+            css.push_str(TOOLTIP_STYLE);
+        }
+        if css.is_empty() {
+            c.svg()
+        } else {
+            c.svg_with_style(&css)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FunnelChart;
+    use crate::Series;
+
+    fn make_series() -> Vec<Series> {
+        vec![
+            ("Impression", vec![60000.0]).into(),
+            ("Click", vec![40000.0]).into(),
+            ("Inquiry", vec![20000.0]).into(),
+            ("Order", vec![8000.0]).into(),
+            ("Re-order", vec![2000.0]).into(),
+        ]
+    }
+
+    #[test]
+    fn funnel_chart_basic() {
+        let chart = FunnelChart::new(make_series());
+        assert_snapshot!("funnel_chart/basic.svg", chart.svg().unwrap());
+    }
+
+    #[test]
+    fn funnel_chart_inside_label() {
+        let mut chart = FunnelChart::new(make_series());
+        chart.title.text = "Conversion Funnel".to_string();
+        chart.series_label_position = Some("inside".to_string());
+        assert_snapshot!("funnel_chart/inside_label.svg", chart.svg().unwrap());
+    }
+
+    #[test]
+    fn funnel_chart_basic_json() {
+        let chart = FunnelChart::from_json(
+            r##"{
+                "title_text": "Funnel Chart",
+                "series_label_position": "inside",
+                "funnel_gap": 4,
+                "series_list": [
+                    {"name": "Impression", "data": [60000]},
+                    {"name": "Click",      "data": [40000]},
+                    {"name": "Inquiry",    "data": [20000]},
+                    {"name": "Order",      "data": [8000]},
+                    {"name": "Re-order",   "data": [2000]}
+                ]
+            }"##,
+        )
+        .unwrap();
+        assert_snapshot!("funnel_chart/basic_json.svg", chart.svg().unwrap());
+    }
+
+    #[test]
+    fn funnel_chart_animation() {
+        let mut chart = FunnelChart::new(make_series());
+        chart.animation = Some(super::AnimationConfig {
+            duration: 800,
+            easing: "ease-in".to_string(),
+            delay: 0,
+        });
+        let svg = chart.svg().unwrap();
+        assert!(
+            svg.contains("funnel-fade"),
+            "missing @keyframes funnel-fade"
+        );
+        assert!(
+            svg.contains(r#"class="funnel-anim""#),
+            "missing class on trapezoid"
+        );
+        assert!(svg.contains("800ms ease-in"), "missing duration/easing");
+    }
+}

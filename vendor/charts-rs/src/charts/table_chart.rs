@@ -1,0 +1,1064 @@
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use super::Canvas;
+use super::base::{ChartBase, reserved_margin};
+use super::canvas;
+use super::color::*;
+use super::common::*;
+use super::component::*;
+use super::font::text_wrap_fit;
+use super::params::*;
+use super::theme::{Theme, get_default_theme_name, get_theme};
+use super::util::*;
+use crate::charts::measure_text_width_family;
+use std::sync::Arc;
+
+/// What the sparklines of a table are drawn as.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum SparklineType {
+    /// A line through the values, with a dot on the last of them.
+    #[default]
+    Line,
+    /// A bar for each value, from 0.
+    Bar,
+}
+
+/// A small chart in a cell of a table, in place of its text: the trend of
+/// its values, as wide as the cell and as high as a line of its text, with
+/// no axes. Its values run from the lowest point of the cell to the highest
+/// (from 0, for bars).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TableSparkline {
+    /// The cell, as `[row, column]`; the header is row 0.
+    pub indexes: Vec<usize>,
+    /// The values, from the first to the last. `NIL_VALUE`, or a value that
+    /// is not a number, leaves a gap in the line and has no bar.
+    pub values: Vec<f32>,
+}
+
+/// A style override for a single table cell, addressed by `indexes`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TableCellStyle {
+    /// Font color override.
+    pub font_color: Option<Color>,
+    /// Font weight override.
+    pub font_weight: Option<String>,
+    /// Background color override.
+    pub background_color: Option<Color>,
+    /// The cell address as `[row, column]`.
+    pub indexes: Vec<usize>,
+}
+
+/// The header row of a table.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TableHeaderConfig {
+    /// Padding of the row.
+    pub row_padding: Box,
+    /// Minimum height of the row.
+    pub row_height: f32,
+    /// Font of the cells.
+    pub font: FontConfig,
+    /// Background color of the row.
+    pub background_color: Color,
+}
+
+/// The body rows of a table.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TableBodyConfig {
+    /// Padding of the rows.
+    pub row_padding: Box,
+    /// Minimum height of the rows.
+    pub row_height: f32,
+    /// Font of the cells.
+    pub font: FontConfig,
+    /// Background colors of the rows, cycled per row.
+    pub background_colors: Vec<Color>,
+}
+
+/// A table rendered as SVG, with optional per-cell style overrides.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TableChart {
+    /// The shared chart options (size, title/sub-title, font); exposed
+    /// directly on the chart through `Deref`, e.g. `chart.title.text`.
+    pub base: ChartBase,
+
+    /// The table content as rows of cells; the first row is the header.
+    pub data: Vec<Vec<String>>,
+    /// Column widths: values below 1.0 are fractions of the table width,
+    /// larger values are absolute; unspecified columns split the rest equally.
+    pub spans: Vec<f32>,
+    /// Text alignment per column.
+    pub text_aligns: Vec<Align>,
+    /// Color of the row separator lines.
+    pub border_color: Color,
+    /// Stroke width of the row separator lines and of the outer border;
+    /// `None` is 1.
+    pub border_width: Option<f32>,
+    /// Draws the outer border.
+    pub outlined: bool,
+
+    /// The header row.
+    pub header: TableHeaderConfig,
+    /// The body rows.
+    pub body: TableBodyConfig,
+
+    /// Per-cell style overrides.
+    pub cell_styles: Vec<TableCellStyle>,
+    /// Small charts in cells, in place of their text. From JSON, a cell of
+    /// `data` that is an array of numbers is one.
+    pub sparklines: Vec<TableSparkline>,
+    /// What the sparklines are drawn as: a line (the default) or bars.
+    pub sparkline_type: SparklineType,
+    /// Color of the sparklines; without one, the first color of the palette.
+    pub sparkline_color: Option<Color>,
+}
+
+impl std::ops::Deref for TableChart {
+    type Target = ChartBase;
+    fn deref(&self) -> &ChartBase {
+        &self.base
+    }
+}
+impl std::ops::DerefMut for TableChart {
+    fn deref_mut(&mut self) -> &mut ChartBase {
+        &mut self.base
+    }
+}
+
+impl TableChart {
+    fn fill_option(&mut self, data: &str) -> canvas::Result<serde_json::Value> {
+        let data: serde_json::Value = serde_json::from_str(data)?;
+        super::schema::validate(&data, &[super::schema::TABLE_FIELDS])?;
+        let theme = get_string_from_value(&data, "theme").unwrap_or_default();
+        super::base::check_theme_name(&theme)?;
+        if let Some(compact) = get_bool_from_value(&data, "compact") {
+            self.compact = compact;
+        }
+        self.fill_theme(get_theme(&theme));
+
+        if let Some(width) = get_f32_from_value(&data, "width") {
+            self.width = width;
+        }
+        if let Some(height) = get_f32_from_value(&data, "height") {
+            self.height = height;
+        }
+        if let Some(x) = get_f32_from_value(&data, "x") {
+            self.x = x;
+        }
+        if let Some(y) = get_f32_from_value(&data, "y") {
+            self.y = y;
+        }
+        if let Some(font_family) = get_string_from_value(&data, "font_family") {
+            self.font_family = font_family;
+        }
+        if let Some(background_color) = get_color_from_value(&data, "background_color") {
+            self.background_color = background_color;
+        }
+        if let Some(title_text) = get_string_from_value(&data, "title_text") {
+            self.title.text = title_text;
+        }
+        if let Some(title_font_size) = get_f32_from_value(&data, "title_font_size") {
+            self.title.font.size = title_font_size;
+        }
+        if let Some(title_font_color) = get_color_from_value(&data, "title_font_color") {
+            self.title.font.color = title_font_color;
+        }
+        if let Some(title_font_weight) = get_string_from_value(&data, "title_font_weight") {
+            self.title.font.weight = Some(title_font_weight);
+        }
+        if let Some(title_margin) = get_margin_from_value(&data, "title_margin") {
+            self.title.margin = Some(title_margin);
+        }
+        if let Some(title_align) = get_align_from_value(&data, "title_align") {
+            self.title.align = title_align;
+        }
+        if let Some(title_height) = get_f32_from_value(&data, "title_height") {
+            self.title.height = title_height;
+        }
+
+        if let Some(sub_title_text) = get_string_from_value(&data, "sub_title_text") {
+            self.sub_title.text = sub_title_text;
+        }
+        if let Some(sub_title_font_size) = get_f32_from_value(&data, "sub_title_font_size") {
+            self.sub_title.font.size = sub_title_font_size;
+        }
+        if let Some(sub_title_font_color) = get_color_from_value(&data, "sub_title_font_color") {
+            self.sub_title.font.color = sub_title_font_color;
+        }
+        if let Some(sub_title_font_weight) = get_string_from_value(&data, "sub_title_font_weight") {
+            self.sub_title.font.weight = Some(sub_title_font_weight);
+        }
+        if let Some(sub_title_margin) = get_margin_from_value(&data, "sub_title_margin") {
+            self.sub_title.margin = Some(sub_title_margin);
+        }
+        if let Some(sub_title_align) = get_align_from_value(&data, "sub_title_align") {
+            self.sub_title.align = sub_title_align;
+        }
+        if let Some(sub_title_height) = get_f32_from_value(&data, "sub_title_height") {
+            self.sub_title.height = sub_title_height;
+        }
+        if let Some(data) = data.get("cell_styles")
+            && let Some(arr) = data.as_array()
+        {
+            let mut cell_styles = vec![];
+            for item in arr.iter() {
+                let mut style = TableCellStyle {
+                    ..Default::default()
+                };
+                if let Some(font_color) = get_color_from_value(item, "font_color") {
+                    style.font_color = Some(font_color);
+                }
+                if let Some(background_color) = get_color_from_value(item, "background_color") {
+                    style.background_color = Some(background_color);
+                }
+                if let Some(font_weight) = get_string_from_value(item, "font_weight") {
+                    style.font_weight = Some(font_weight);
+                }
+                if let Some(indexes) = get_usize_slice_from_value(item, "indexes") {
+                    style.indexes = indexes;
+                }
+                cell_styles.push(style);
+            }
+            self.cell_styles = cell_styles;
+        }
+
+        if let Some(data) = data.get("data")
+            && let Some(arr) = data.as_array()
+        {
+            let mut data_list = vec![];
+            let mut sparklines = vec![];
+            for (row, items) in arr.iter().enumerate() {
+                let mut list = vec![];
+                if let Some(sub_arr) = items.as_array() {
+                    for (column, item) in sub_arr.iter().enumerate() {
+                        // A cell keeps its place whatever it holds: a number
+                        // is written as it is, `null` is an empty cell, and
+                        // an array of numbers is a sparkline.
+                        let text = match item {
+                            serde_json::Value::String(text) => text.clone(),
+                            serde_json::Value::Number(number) => number.to_string(),
+                            serde_json::Value::Bool(value) => value.to_string(),
+                            serde_json::Value::Array(values) => {
+                                sparklines.push(TableSparkline {
+                                    indexes: vec![row, column],
+                                    values: values
+                                        .iter()
+                                        .map(|value| {
+                                            value.as_f64().map_or(NIL_VALUE, |value| value as f32)
+                                        })
+                                        .collect(),
+                                });
+                                String::new()
+                            }
+                            _ => String::new(),
+                        };
+                        list.push(text);
+                    }
+                }
+                data_list.push(list);
+            }
+            self.data = data_list;
+            self.sparklines = sparklines;
+        }
+        if let Some(value) = get_string_from_value(&data, "sparkline_type") {
+            self.sparkline_type = if value.eq_ignore_ascii_case("bar") {
+                SparklineType::Bar
+            } else {
+                SparklineType::Line
+            };
+        }
+        if let Some(color) = get_color_from_value(&data, "sparkline_color") {
+            self.sparkline_color = Some(color);
+        }
+        if let Some(spans) = get_f32_slice_from_value(&data, "spans") {
+            self.spans = spans;
+        }
+        if let Some(text_aligns) = get_align_slice_from_value(&data, "text_aligns") {
+            self.text_aligns = text_aligns;
+        }
+        if let Some(header_row_padding) = get_margin_from_value(&data, "header_row_padding") {
+            self.header.row_padding = header_row_padding;
+        }
+        if let Some(header_row_height) = get_f32_from_value(&data, "header_row_height") {
+            self.header.row_height = header_row_height;
+        }
+        if let Some(header_font_size) = get_f32_from_value(&data, "header_font_size") {
+            self.header.font.size = header_font_size;
+        }
+        if let Some(header_font_weight) = get_string_from_value(&data, "header_font_weight") {
+            self.header.font.weight = Some(header_font_weight);
+        }
+        if let Some(header_font_color) = get_color_from_value(&data, "header_font_color") {
+            self.header.font.color = header_font_color;
+        }
+        if let Some(header_background_color) =
+            get_color_from_value(&data, "header_background_color")
+        {
+            self.header.background_color = header_background_color;
+        }
+        if let Some(body_row_padding) = get_margin_from_value(&data, "body_row_padding") {
+            self.body.row_padding = body_row_padding;
+        }
+        if let Some(body_row_height) = get_f32_from_value(&data, "body_row_height") {
+            self.body.row_height = body_row_height;
+        }
+        if let Some(body_font_size) = get_f32_from_value(&data, "body_font_size") {
+            self.body.font.size = body_font_size;
+        }
+        if let Some(body_font_color) = get_color_from_value(&data, "body_font_color") {
+            self.body.font.color = body_font_color;
+        }
+        if let Some(body_font_weight) = get_string_from_value(&data, "body_font_weight") {
+            self.body.font.weight = Some(body_font_weight);
+        }
+        if let Some(body_background_colors) =
+            get_color_slice_from_value(&data, "body_background_colors")
+        {
+            self.body.background_colors = body_background_colors;
+        }
+        if let Some(border_color) = get_color_from_value(&data, "border_color") {
+            self.border_color = border_color;
+        }
+        if let Some(border_width) = get_f32_from_value(&data, "border_width") {
+            self.border_width = Some(border_width);
+        }
+        if let Some(texts) = get_texts_from_value(&data, "texts") {
+            self.texts = texts;
+        }
+        if let Some(outlined) = get_bool_from_value(&data, "outlined") {
+            self.outlined = outlined;
+        }
+        Ok(data)
+    }
+    /// Creates a table chart from json.
+    pub fn from_json(data: &str) -> canvas::Result<TableChart> {
+        let mut t = TableChart::new_with_theme(vec![], "");
+        t.fill_option(data)?;
+        Ok(t)
+    }
+    /// Creates a table chart with custom theme.
+    pub fn new_with_theme(data: Vec<Vec<String>>, theme: &str) -> TableChart {
+        let mut table = TableChart {
+            data,
+            header: TableHeaderConfig {
+                row_padding: (10.0, 8.0).into(),
+                row_height: 30.0,
+                ..Default::default()
+            },
+            body: TableBodyConfig {
+                row_padding: (10.0, 5.0).into(),
+                row_height: 30.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        table.fill_theme(get_theme(theme));
+        table
+    }
+    fn fill_theme(&mut self, t: Arc<Theme>) {
+        self.font_family.clone_from(&t.font_family);
+        self.width = t.width;
+        self.background_color = t.background_color;
+
+        // The title and the sub-title of the theme, whatever it holds of
+        // them; a table leaves its title half as much room again.
+        self.title = TitleConfig {
+            height: t.title.height * 1.5,
+            ..t.title.clone()
+        };
+        self.sub_title = t.sub_title.clone();
+        self.texts = t.texts.clone();
+        // The palette, for the sparklines.
+        self.series.colors.clone_from(&t.series.colors);
+
+        self.header.font.size = t.sub_title.font.size;
+        self.header.font.color = t.sub_title.font.color;
+        self.header.background_color = t.table_header_color;
+
+        self.body.font.size = t.sub_title.font.size;
+        self.body.font.color = t.sub_title.font.color;
+        self.body.background_colors.clone_from(&t.table_body_colors);
+        self.border_color = t.table_border_color;
+    }
+    /// Creates a table chart with default theme.
+    pub fn new(data: Vec<Vec<String>>) -> TableChart {
+        TableChart::new_with_theme(data, &get_default_theme_name())
+    }
+    fn render_title(&self, c: Canvas) -> f32 {
+        let mut title_height = 0.0;
+
+        if !self.title.text.is_empty() {
+            let title_margin = self.title.margin.unwrap_or_default();
+            let mut x = 0.0;
+            if let Ok(title_box) =
+                measure_text_width_family(&self.font_family, self.title.font.size, &self.title.text)
+            {
+                x = match self.title.align {
+                    Align::Center => (c.width() - title_box.width()) / 2.0,
+                    Align::Right => c.width() - title_box.width(),
+                    _ => 0.0,
+                }
+            }
+            let title_margin_bottom = title_margin.bottom;
+            let b = c.child(title_margin).text(Text {
+                text: self.title.text.clone(),
+                font_family: Some(self.font_family.clone()),
+                font_size: Some(self.title.font.size),
+                font_weight: self.title.font.weight.clone(),
+                font_color: Some(self.title.font.color),
+                line_height: Some(self.title.height),
+                x: Some(x),
+                ..Default::default()
+            });
+            title_height = b.height() + title_margin_bottom;
+        }
+        if !self.sub_title.text.is_empty() {
+            let mut sub_title_margin = self.sub_title.margin.unwrap_or_default();
+            let mut x = 0.0;
+            if let Ok(sub_title_box) = measure_text_width_family(
+                &self.font_family,
+                self.sub_title.font.size,
+                &self.sub_title.text,
+            ) {
+                x = match self.sub_title.align {
+                    Align::Center => (c.width() - sub_title_box.width()) / 2.0,
+                    Align::Right => c.width() - sub_title_box.width(),
+                    _ => 0.0,
+                }
+            }
+            let sub_title_margin_bottom = sub_title_margin.bottom;
+            sub_title_margin.top += self.title.height;
+            let b = c.child(sub_title_margin).text(Text {
+                text: self.sub_title.text.clone(),
+                font_family: Some(self.font_family.clone()),
+                font_size: Some(self.sub_title.font.size),
+                font_color: Some(self.sub_title.font.color),
+                font_weight: self.sub_title.font.weight.clone(),
+                line_height: Some(self.sub_title.height),
+                x: Some(x),
+                ..Default::default()
+            });
+            // Down to the bottom of the sub-title from the top of the
+            // table, which is below the room its texts reserve.
+            title_height = b.outer_height() - c.margin.top + sub_title_margin_bottom;
+        }
+        title_height
+    }
+    /// Draws a sparkline in `area` of `c`.
+    fn render_sparkline(&self, c: &mut Canvas, sparkline: &TableSparkline, area: Box) {
+        let (width, height) = (area.right - area.left, area.bottom - area.top);
+        let present = |value: &f32| value.is_finite() && *value != NIL_VALUE;
+        let (lowest, highest) = sparkline
+            .values
+            .iter()
+            .filter(|value| present(value))
+            .fold((f32::MAX, f32::MIN), |(a, b), v| (a.min(*v), b.max(*v)));
+        if width <= 0.0 || height <= 0.0 || lowest > highest {
+            return;
+        }
+        let color = self
+            .sparkline_color
+            .unwrap_or_else(|| get_color(&self.series.colors, 0));
+        let count = sparkline.values.len();
+        match self.sparkline_type {
+            SparklineType::Line => {
+                // From the lowest point of the area to the highest; a line
+                // of values that are all the same through the middle.
+                let x_of = |index: usize| {
+                    if count > 1 {
+                        area.left + width * index as f32 / (count - 1) as f32
+                    } else {
+                        area.left + width / 2.0
+                    }
+                };
+                let y_of = |value: f32| {
+                    if highest > lowest {
+                        area.bottom - (value - lowest) / (highest - lowest) * height
+                    } else {
+                        area.top + height / 2.0
+                    }
+                };
+                let mut pieces: Vec<Vec<Point>> = vec![vec![]];
+                for (index, value) in sparkline.values.iter().enumerate() {
+                    if present(value) {
+                        pieces
+                            .last_mut()
+                            .unwrap()
+                            .push((x_of(index), y_of(*value)).into());
+                    } else if !pieces.last().unwrap().is_empty() {
+                        pieces.push(vec![]);
+                    }
+                }
+                for points in pieces.iter().filter(|points| points.len() > 1) {
+                    c.polyline(Polyline {
+                        color: Some(color),
+                        stroke_width: 1.5,
+                        points: points.clone(),
+                    });
+                }
+                // A dot on the last value, and on a value that stands alone
+                // (the last one may be both).
+                let last = pieces
+                    .iter()
+                    .rev()
+                    .find(|points| !points.is_empty())
+                    .filter(|points| points.len() > 1)
+                    .and_then(|points| points.last());
+                for point in pieces
+                    .iter()
+                    .filter(|points| points.len() == 1)
+                    .flatten()
+                    .chain(last)
+                {
+                    c.circle(Circle {
+                        fill: Some(color),
+                        cx: point.x,
+                        cy: point.y,
+                        r: 2.0,
+                        ..Default::default()
+                    });
+                }
+            }
+            SparklineType::Bar => {
+                // From 0, up for a value above it and down for one below.
+                let (lowest, highest) = (lowest.min(0.0), highest.max(0.0));
+                let span = if highest > lowest {
+                    highest - lowest
+                } else {
+                    1.0
+                };
+                let y_of = |value: f32| area.bottom - (value - lowest) / span * height;
+                let slot = width / count as f32;
+                let bar = (slot * 0.7).max(1.0).min(slot);
+                for (index, value) in sparkline.values.iter().enumerate() {
+                    if !present(value) {
+                        continue;
+                    }
+                    let (zero, y) = (y_of(0.0), y_of(*value));
+                    c.rect(Rect {
+                        fill: Some(color.into()),
+                        left: area.left + slot * index as f32 + (slot - bar) / 2.0,
+                        top: zero.min(y),
+                        width: bar,
+                        height: (zero - y).abs().max(0.5),
+                        ..Default::default()
+                    });
+                }
+            }
+        }
+    }
+    /// Converts table chart to svg. The table sizes itself to its content;
+    /// the rendered height is the `height` attribute of the returned svg.
+    pub fn svg(&self) -> canvas::Result<String> {
+        Ok(self.render()?.0)
+    }
+
+    /// Renders the svg and returns it with the computed (auto-sized) height.
+    pub(crate) fn render(&self) -> canvas::Result<(String, f32)> {
+        if self.data.is_empty() {
+            return Err(canvas::Error::Params {
+                message: "data is empty".to_string(),
+            });
+        }
+        let column_count = self.data[0].len();
+        if column_count == 0 {
+            return Err(canvas::Error::Params {
+                message: "table header column is empty".to_string(),
+            });
+        }
+        for item in self.data.iter() {
+            if item.len() != column_count {
+                return Err(canvas::Error::Params {
+                    message: "data len is invalid".to_string(),
+                });
+            }
+        }
+
+        let mut c = self.new_canvas();
+        // A table has no margin of its own: the room its texts reserve is
+        // all there is around it.
+        let reserved = reserved_margin(&self.texts, &self.font_family);
+        c.margin = reserved;
+
+        if !self.title.text.is_empty() {
+            let mut title_height = self.title.height;
+            if let Some(value) = self.title.margin {
+                title_height += value.top + value.bottom;
+            }
+            if !self.sub_title.text.is_empty() {
+                title_height += self.sub_title.height;
+            }
+            c.rect(Rect {
+                fill: Some(self.background_color.into()),
+                left: 0.0,
+                top: 0.0,
+                width: c.width(),
+                height: title_height,
+                ..Default::default()
+            });
+        }
+
+        let title_height = self.render_title(c.child(Box::default()));
+
+        c = c.child(Box {
+            top: title_height,
+            ..Default::default()
+        });
+        let width = c.width();
+        let mut spans = vec![];
+        let mut rest_width = width;
+        let mut rest_count = 0.0_f32;
+        for index in 0..column_count {
+            if let Some(value) = self.spans.get(index) {
+                let mut v = value.to_owned();
+                if v < 1.0 {
+                    v *= width;
+                }
+                // 如果值少于1.0的则认为平分剩余宽度
+                if v > 1.0 {
+                    rest_width -= v;
+                    spans.push(v);
+                    continue;
+                }
+            }
+            rest_count += 1.0;
+            spans.push(0.0);
+        }
+        // reassign the width of the table to 0 and divide the remaining width equally
+        if rest_count > 0.0 {
+            let unit_width = rest_width / rest_count;
+            for item in spans.iter_mut() {
+                if *item == 0.0 {
+                    *item = unit_width;
+                }
+            }
+        }
+
+        let find_cell_style = |row: usize, column: usize| -> Option<&TableCellStyle> {
+            for cell_style in self.cell_styles.iter() {
+                if cell_style.indexes.len() != 2 {
+                    continue;
+                }
+                if cell_style.indexes[0] != row || cell_style.indexes[1] != column {
+                    continue;
+                }
+                return Some(cell_style);
+            }
+            None
+        };
+
+        let mut table_content_list = vec![];
+        for (i, items) in self.data.iter().enumerate() {
+            let mut font_size = self.body.font.size;
+            let mut padding = self.body.row_padding.left + self.body.row_padding.right;
+            let is_header = i == 0;
+            if is_header {
+                font_size = self.header.font.size;
+                padding = self.header.row_padding.left + self.header.row_padding.right;
+            }
+
+            let mut row_content_list = vec![];
+            for (j, item) in items.iter().enumerate() {
+                // spans[j] can not be nil
+                // minus the padding value
+                let span_width = spans[j] - padding;
+                if let Ok(result) = text_wrap_fit(&self.font_family, font_size, item, span_width) {
+                    row_content_list.push(result);
+                } else {
+                    row_content_list.push(vec![item.clone()]);
+                }
+            }
+            table_content_list.push(row_content_list);
+        }
+        let mut top = 0.0;
+        let body_background_color_count = self.body.background_colors.len();
+
+        for (i, items) in table_content_list.iter().enumerate() {
+            let mut left = 0.0;
+            let mut right = 0.0;
+            let mut line_height = self.body.row_height;
+            let mut padding = self.body.row_padding.top + self.body.row_padding.bottom;
+            let mut font_size = self.body.font.size;
+            let mut font_color = self.body.font.color;
+
+            let is_header = i == 0;
+            let mut font_weight = self.body.font.weight.clone();
+            let bg_color = if is_header {
+                line_height = self.header.row_height;
+                padding = self.header.row_padding.top + self.header.row_padding.bottom;
+                font_size = self.header.font.size;
+                font_color = self.header.font.color;
+                font_weight.clone_from(&self.header.font.weight);
+                self.header.background_color
+            } else if body_background_color_count == 0 {
+                // An empty palette (`"body_background_colors": []`) means no
+                // row striping rather than a division by zero.
+                Color::transparent()
+            } else {
+                self.body.background_colors[(i - 1) % body_background_color_count]
+            };
+
+            let row_padding = if is_header {
+                self.header.row_padding
+            } else {
+                self.body.row_padding
+            };
+            let mut count = 0;
+            for content_list in items.iter() {
+                if count < content_list.len() {
+                    count = content_list.len();
+                }
+            }
+            let row_height = line_height * count as f32 + padding;
+
+            c.rect(Rect {
+                fill: Some(bg_color.into()),
+                top,
+                width: c.width(),
+                height: row_height,
+                ..Default::default()
+            });
+            if !self.border_color.is_transparent() {
+                c.line(Line {
+                    color: Some(self.border_color),
+                    stroke_width: self.border_width.unwrap_or(1.0),
+                    top,
+                    right: c.width(),
+                    bottom: top,
+                    ..Default::default()
+                });
+            }
+            for (j, content_list) in items.iter().enumerate() {
+                // spans[j] can not be nil
+                let span_width = spans[j];
+
+                let mut cell_font_color = font_color;
+                let mut cell_font_weight = font_weight.clone();
+
+                // get the table cell's background color
+                if let Some(cell_style) = find_cell_style(i, j) {
+                    if let Some(value) = cell_style.font_color {
+                        cell_font_color = value;
+                    }
+                    if let Some(ref value) = cell_style.font_weight {
+                        cell_font_weight = Some(value.clone());
+                    }
+                    if let Some(value) = cell_style.background_color {
+                        c.rect(Rect {
+                            fill: Some(value.into()),
+                            left,
+                            top: top + 1.0,
+                            width: span_width,
+                            height: row_height - 1.0,
+                            ..Default::default()
+                        });
+                    }
+                }
+
+                // A sparkline is in the first line of its cell, in place of
+                // the text: a little inside it, as the text is.
+                let sparkline = self
+                    .sparklines
+                    .iter()
+                    .find(|s| s.indexes.len() == 2 && s.indexes[0] == i && s.indexes[1] == j);
+                if let Some(sparkline) = sparkline {
+                    let top = top + row_padding.top;
+                    self.render_sparkline(
+                        &mut c,
+                        sparkline,
+                        Box {
+                            left: left + row_padding.left,
+                            top: top + line_height * 0.15,
+                            right: left + span_width - row_padding.right,
+                            bottom: top + line_height * 0.85,
+                        },
+                    );
+                }
+                for (index, item) in content_list.iter().enumerate() {
+                    if sparkline.is_some() {
+                        break;
+                    }
+                    let mut dx = None;
+                    if let Ok(measurement) =
+                        measure_text_width_family(&self.font_family, font_size, item)
+                    {
+                        let mut align = Align::Left;
+                        if let Some(value) = self.text_aligns.get(j) {
+                            value.clone_into(&mut align);
+                        }
+                        let text_width = measurement.width();
+                        let text_max_width = span_width - row_padding.left - row_padding.right;
+                        dx = match align {
+                            Align::Center => Some((text_max_width - text_width) / 2.0),
+                            Align::Right => Some(text_max_width - text_width),
+                            Align::Left => None,
+                        };
+                    }
+                    c.child(row_padding).text(Text {
+                        text: item.to_string(),
+                        font_weight: cell_font_weight.clone(),
+                        font_family: Some(self.font_family.clone()),
+                        font_size: Some(font_size),
+                        font_color: Some(cell_font_color),
+                        line_height: Some(line_height),
+                        dx,
+                        x: Some(left),
+                        y: Some(top + line_height * index as f32),
+                        ..Default::default()
+                    });
+                }
+
+                right += span_width;
+                left = right
+            }
+            top += row_height;
+        }
+        if self.outlined {
+            c.rect(Rect {
+                color: Some(self.border_color),
+                // The default of SVG is the default here: nothing is written.
+                stroke_width: self.border_width.filter(|width| *width != 1.0),
+                fill: Some(Color::transparent().into()),
+                left: 0.0,
+                top: 0.0,
+                width: c.width(),
+                height: top,
+                ..Default::default()
+            });
+        }
+        c.height = c.margin.top + top + reserved.bottom;
+        let height = c.height;
+        // The reserved room is in the background of the table, below
+        // everything else: the rows have only filled what is theirs.
+        if reserved != Box::default() {
+            c.components.borrow_mut().insert(
+                0,
+                Component::Rect(Rect {
+                    fill: Some(self.background_color.into()),
+                    left: 0.0,
+                    top: 0.0,
+                    width: self.width,
+                    height,
+                    ..Default::default()
+                }),
+            );
+        }
+
+        Ok((c.svg()?, height))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TableCellStyle, TableChart};
+    use crate::{Align, THEME_ANT, THEME_DARK, THEME_GRAFANA};
+
+    #[test]
+    fn table_basic() {
+        let mut table_chart = TableChart::new(vec![
+            vec![
+                "Name".to_string(),
+                "Price".to_string(),
+                "Change".to_string(),
+            ],
+            vec![
+                "Datadog Inc".to_string(),
+                "97.32".to_string(),
+                "-7.49%".to_string(),
+            ],
+            vec![
+                "Hashicorp Inc".to_string(),
+                "28.66".to_string(),
+                "-9.25%".to_string(),
+            ],
+            vec![
+                "Gitlab Inc".to_string(),
+                "51.63".to_string(),
+                "+4.32%".to_string(),
+            ],
+        ]);
+        table_chart.title.text = "NASDAQ".to_string();
+        table_chart.cell_styles = vec![TableCellStyle {
+            indexes: vec![1, 2],
+            font_weight: Some("bold".to_string()),
+            background_color: Some("#3bb357".into()),
+            font_color: Some(("#fff").into()),
+        }];
+        table_chart.outlined = true;
+        assert_snapshot!("table_chart/basic.svg", table_chart.svg().unwrap());
+    }
+
+    #[test]
+    fn table_multi_lines() {
+        let mut table_chart = TableChart::new(vec![
+            vec![
+                "Name".to_string(),
+                "Price".to_string(),
+                "ChangeChangeChangeChangeChangeChange".to_string(),
+            ],
+            vec![
+                "Datadog Inc".to_string(),
+                "97.32".to_string(),
+                "-7.49%".to_string(),
+            ],
+            vec![
+                "Hashicorp Inc".to_string(),
+                "28.66".to_string(),
+                "Hashicorp Inc Hashicorp Inc -9.25%".to_string(),
+            ],
+            vec![
+                "Gitlab Inc".to_string(),
+                "51.63".to_string(),
+                "+4.32%".to_string(),
+            ],
+        ]);
+        table_chart.title.text = "NASDAQ".to_string();
+        table_chart.text_aligns = vec![Align::Left, Align::Center];
+        table_chart.cell_styles = vec![
+            TableCellStyle {
+                indexes: vec![1, 2],
+                font_weight: Some("bold".to_string()),
+                background_color: Some("#3bb357".into()),
+                font_color: Some(("#fff").into()),
+            },
+            TableCellStyle {
+                indexes: vec![2, 1],
+                background_color: Some("#3bb357".into()),
+                font_color: Some(("#fff").into()),
+                ..Default::default()
+            },
+        ];
+        assert_snapshot!("table_chart/multi_lines.svg", table_chart.svg().unwrap());
+    }
+
+    #[test]
+    fn table_basic_dark() {
+        let mut table_chart = TableChart::new_with_theme(
+            vec![
+                vec![
+                    "Name".to_string(),
+                    "Price".to_string(),
+                    "Change".to_string(),
+                ],
+                vec![
+                    "Datadog Inc".to_string(),
+                    "97.32".to_string(),
+                    "-7.49%".to_string(),
+                ],
+                vec![
+                    "Hashicorp Inc".to_string(),
+                    "28.66".to_string(),
+                    "-9.25%".to_string(),
+                ],
+                vec![
+                    "Gitlab Inc".to_string(),
+                    "51.63".to_string(),
+                    "+4.32%".to_string(),
+                ],
+            ],
+            THEME_DARK,
+        );
+        table_chart.title.text = "NASDAQ".to_string();
+        table_chart.text_aligns = vec![Align::Left, Align::Center, Align::Right];
+        assert_snapshot!("table_chart/basic_dark.svg", table_chart.svg().unwrap());
+    }
+
+    #[test]
+    fn table_basic_ant() {
+        let mut table_chart = TableChart::new_with_theme(
+            vec![
+                vec![
+                    "Name".to_string(),
+                    "Price".to_string(),
+                    "Change".to_string(),
+                ],
+                vec![
+                    "Datadog Inc".to_string(),
+                    "97.32".to_string(),
+                    "-7.49%".to_string(),
+                ],
+                vec![
+                    "Hashicorp Inc".to_string(),
+                    "28.66".to_string(),
+                    "-9.25%".to_string(),
+                ],
+                vec![
+                    "Gitlab Inc".to_string(),
+                    "51.63".to_string(),
+                    "+4.32%".to_string(),
+                ],
+            ],
+            THEME_ANT,
+        );
+        table_chart.title.text = "NASDAQ".to_string();
+        table_chart.text_aligns = vec![Align::Left, Align::Center, Align::Right];
+        assert_snapshot!("table_chart/basic_ant.svg", table_chart.svg().unwrap());
+    }
+
+    #[test]
+    fn table_basic_grafana() {
+        let mut table_chart = TableChart::new_with_theme(
+            vec![
+                vec![
+                    "Name".to_string(),
+                    "Price".to_string(),
+                    "Change".to_string(),
+                ],
+                vec![
+                    "Datadog Inc".to_string(),
+                    "97.32".to_string(),
+                    "-7.49%".to_string(),
+                ],
+                vec![
+                    "Hashicorp Inc".to_string(),
+                    "28.66".to_string(),
+                    "-9.25%".to_string(),
+                ],
+                vec![
+                    "Gitlab Inc".to_string(),
+                    "51.63".to_string(),
+                    "+4.32%".to_string(),
+                ],
+            ],
+            THEME_GRAFANA,
+        );
+        table_chart.title.text = "NASDAQ".to_string();
+        table_chart.sub_title.text = "stock".to_string();
+        table_chart.spans = vec![0.5, 0.3, 0.2];
+        let green = "#2d7c2b".into();
+        let red = "#a93b01".into();
+        table_chart.cell_styles = vec![
+            TableCellStyle {
+                indexes: vec![1, 2],
+                font_weight: Some("bold".to_string()),
+                background_color: Some(green),
+                ..Default::default()
+            },
+            TableCellStyle {
+                indexes: vec![2, 2],
+                font_weight: Some("bold".to_string()),
+                background_color: Some(green),
+                ..Default::default()
+            },
+            TableCellStyle {
+                indexes: vec![3, 2],
+                font_weight: Some("bold".to_string()),
+                background_color: Some(red),
+                ..Default::default()
+            },
+        ];
+        table_chart.spans = vec![150.0, 0.4];
+        table_chart.text_aligns = vec![Align::Left, Align::Center, Align::Center];
+        assert_snapshot!("table_chart/basic_grafana.svg", table_chart.svg().unwrap());
+    }
+}

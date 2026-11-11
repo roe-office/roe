@@ -1,0 +1,135 @@
+<svg width="600" height="400" viewBox="0 0 600 400" xmlns="http://www.w3.org/2000/svg">
+<rect x="0" y="0" width="600" height="400" fill="#FFFFFF"/>
+<text font-size="18" x="260.5" y="5" dy="15" font-weight="bold" dominant-baseline="middle" font-family="Roboto" fill="#464646">
+Bar Chart
+</text>
+<g>
+<rect x="128.5" y="45" width="25" height="10" stroke="#5470C6" fill="#5470C6"/>
+<text font-size="14" x="156.5" y="54" font-family="Roboto" fill="#464646">
+Evaporation
+</text>
+</g>
+<g>
+<rect x="237.5" y="45" width="25" height="10" stroke="#91CC75" fill="#91CC75"/>
+<text font-size="14" x="265.5" y="54" font-family="Roboto" fill="#464646">
+Precipitation
+</text>
+</g>
+<g>
+<rect x="353.5" y="45" width="25" height="10" stroke="#FAC858" fill="#FAC858"/>
+<text font-size="14" x="381.5" y="54" font-family="Roboto" fill="#464646">
+Temperature
+</text>
+</g>
+<g stroke="#E0E6F2" stroke-width="1">
+<line x1="60" y1="72" x2="540" y2="72"/><line x1="60" y1="120.8" x2="540" y2="120.8"/><line x1="60" y1="169.7" x2="540" y2="169.7"/><line x1="60" y1="218.5" x2="540" y2="218.5"/><line x1="60" y1="267.3" x2="540" y2="267.3"/><line x1="60" y1="316.2" x2="540" y2="316.2"/>
+</g>
+<g>
+
+<text font-size="14" x="8" y="77" font-family="Roboto" fill="#6E7079">
+180 ml
+</text>
+<text font-size="14" x="8" y="125.8" font-family="Roboto" fill="#6E7079">
+150 ml
+</text>
+<text font-size="14" x="8" y="174.7" font-family="Roboto" fill="#6E7079">
+120 ml
+</text>
+<text font-size="14" x="16" y="223.5" font-family="Roboto" fill="#6E7079">
+90 ml
+</text>
+<text font-size="14" x="16" y="272.3" font-family="Roboto" fill="#6E7079">
+60 ml
+</text>
+<text font-size="14" x="16" y="321.2" font-family="Roboto" fill="#6E7079">
+30 ml
+</text>
+<text font-size="14" x="24" y="370" font-family="Roboto" fill="#6E7079">
+0 ml
+</text>
+</g>
+<g>
+
+<text font-size="14" x="548" y="79" font-family="Roboto" fill="#6E7079">
+24 °C
+</text>
+<text font-size="14" x="548" y="127.8" font-family="Roboto" fill="#6E7079">
+20 °C
+</text>
+<text font-size="14" x="548" y="176.7" font-family="Roboto" fill="#6E7079">
+16 °C
+</text>
+<text font-size="14" x="548" y="225.5" font-family="Roboto" fill="#6E7079">
+12 °C
+</text>
+<text font-size="14" x="548" y="274.3" font-family="Roboto" fill="#6E7079">
+8 °C
+</text>
+<text font-size="14" x="548" y="323.2" font-family="Roboto" fill="#6E7079">
+4 °C
+</text>
+<text font-size="14" x="548" y="372" font-family="Roboto" fill="#6E7079">
+0 °C
+</text>
+</g>
+<g>
+<g stroke="#6E7079" stroke-width="1">
+<line x1="60" y1="365" x2="540" y2="365"/>
+<line x1="60" y1="365" x2="60" y2="370"/>
+<line x1="128.6" y1="365" x2="128.6" y2="370"/>
+<line x1="197.1" y1="365" x2="197.1" y2="370"/>
+<line x1="265.7" y1="365" x2="265.7" y2="370"/>
+<line x1="334.3" y1="365" x2="334.3" y2="370"/>
+<line x1="402.9" y1="365" x2="402.9" y2="370"/>
+<line x1="471.4" y1="365" x2="471.4" y2="370"/>
+<line x1="540" y1="365" x2="540" y2="370"/>
+</g>
+<text font-size="14" x="80.3" y="384" font-family="Roboto" fill="#6E7079">
+Mon
+</text>
+<text font-size="14" x="150.9" y="384" font-family="Roboto" fill="#6E7079">
+Tue
+</text>
+<text font-size="14" x="217.4" y="384" font-family="Roboto" fill="#6E7079">
+Wed
+</text>
+<text font-size="14" x="288" y="384" font-family="Roboto" fill="#6E7079">
+Thu
+</text>
+<text font-size="14" x="360.6" y="384" font-family="Roboto" fill="#6E7079">
+Fri
+</text>
+<text font-size="14" x="426.1" y="384" font-family="Roboto" fill="#6E7079">
+Sat
+</text>
+<text font-size="14" x="493.7" y="384" font-family="Roboto" fill="#6E7079">
+Sun
+</text>
+</g>
+<rect x="65" y="361.7" width="27.8" height="3.3" fill="#5470C6" data-series="Evaporation" data-category="Mon" data-value="2"/>
+<rect x="133.6" y="357" width="27.8" height="8" fill="#5470C6" data-series="Evaporation" data-category="Tue" data-value="4.9"/>
+<rect x="202.1" y="353.6" width="27.8" height="11.4" fill="#5470C6" data-series="Evaporation" data-category="Wed" data-value="7"/>
+<rect x="270.7" y="327.2" width="27.8" height="37.8" fill="#5470C6" data-series="Evaporation" data-category="Thu" data-value="23.2"/>
+<rect x="339.3" y="323.3" width="27.8" height="41.7" fill="#5470C6" data-series="Evaporation" data-category="Fri" data-value="25.6"/>
+<rect x="407.9" y="240.1" width="27.8" height="124.9" fill="#5470C6" data-series="Evaporation" data-category="Sat" data-value="76.7"/>
+<rect x="476.4" y="144.3" width="27.8" height="220.7" fill="#5470C6" data-series="Evaporation" data-category="Sun" data-value="135.6"/>
+<rect x="95.8" y="360.8" width="27.8" height="4.2" fill="#91CC75" data-series="Precipitation" data-category="Mon" data-value="2.6"/>
+<rect x="164.4" y="355.4" width="27.8" height="9.6" fill="#91CC75" data-series="Precipitation" data-category="Tue" data-value="5.9"/>
+<rect x="232.9" y="350.4" width="27.8" height="14.6" fill="#91CC75" data-series="Precipitation" data-category="Wed" data-value="9"/>
+<rect x="301.5" y="322" width="27.8" height="43" fill="#91CC75" data-series="Precipitation" data-category="Thu" data-value="26.4"/>
+<rect x="370.1" y="318.3" width="27.8" height="46.7" fill="#91CC75" data-series="Precipitation" data-category="Fri" data-value="28.7"/>
+<rect x="438.6" y="249.9" width="27.8" height="115.1" fill="#91CC75" data-series="Precipitation" data-category="Sat" data-value="70.7"/>
+<rect x="507.2" y="79.2" width="27.8" height="285.8" fill="#91CC75" data-series="Precipitation" data-category="Sun" data-value="175.6"/>
+<g>
+<path d="M 94.3 340.6 L 162.9 338.1 L 231.4 324.7 L 300 310.1 L 368.6 288.1 L 437.1 240.5 L 505.7 117.2" stroke-width="2" fill="none" stroke="#FAC858"/>
+<g stroke-width="2" stroke="#FAC858" fill="#FFFFFF">
+<circle cx="94.3" cy="340.6" r="2"/>
+<circle cx="162.9" cy="338.1" r="2"/>
+<circle cx="231.4" cy="324.7" r="2"/>
+<circle cx="300" cy="310.1" r="2"/>
+<circle cx="368.6" cy="288.1" r="2"/>
+<circle cx="437.1" cy="240.5" r="2"/>
+<circle cx="505.7" cy="117.2" r="2"/>
+</g>
+</g>
+</svg>

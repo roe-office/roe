@@ -1,0 +1,89 @@
+<svg width="600" height="400" viewBox="0 0 600 400" xmlns="http://www.w3.org/2000/svg">
+<rect x="0" y="0" width="600" height="400" fill="#FFFFFF"/>
+<text font-size="18" x="10" y="10" dy="15" font-weight="bold" dominant-baseline="middle" font-family="Roboto" fill="#464646">
+World Population
+</text>
+<g>
+<line stroke-width="2" x1="232.5" y1="20" x2="257.5" y2="20" stroke="#5470C6"/>
+<circle cx="245" cy="20" r="5.5" stroke-width="2" stroke="#5470C6" fill="#FFFFFF"/>
+<text font-size="14" x="260.5" y="24" font-family="Roboto" fill="#464646">
+2011
+</text>
+</g>
+<g>
+<line stroke-width="2" x1="294.5" y1="20" x2="319.5" y2="20" stroke="#91CC75"/>
+<circle cx="307" cy="20" r="5.5" stroke-width="2" stroke="#91CC75" fill="#FFFFFF"/>
+<text font-size="14" x="322.5" y="24" font-family="Roboto" fill="#464646">
+2012
+</text>
+</g>
+<g>
+<g stroke="#6E7079" stroke-width="1">
+<line x1="78" y1="50" x2="78" y2="360"/>
+<line x1="78" y1="50" x2="73" y2="50"/>
+<line x1="78" y1="101.7" x2="73" y2="101.7"/>
+<line x1="78" y1="153.3" x2="73" y2="153.3"/>
+<line x1="78" y1="205" x2="73" y2="205"/>
+<line x1="78" y1="256.7" x2="73" y2="256.7"/>
+<line x1="78" y1="308.3" x2="73" y2="308.3"/>
+<line x1="78" y1="360" x2="73" y2="360"/>
+</g>
+<text font-size="14" x="36" y="80.8" font-family="Roboto" fill="#6E7079">
+World
+</text>
+<text font-size="14" x="36" y="132.5" font-family="Roboto" fill="#6E7079">
+China
+</text>
+<text font-size="14" x="42" y="184.2" font-family="Roboto" fill="#6E7079">
+India
+</text>
+<text font-size="14" x="45" y="235.8" font-family="Roboto" fill="#6E7079">
+USA
+</text>
+<text font-size="14" x="10" y="287.5" font-family="Roboto" fill="#6E7079">
+Indonesia
+</text>
+<text font-size="14" x="37" y="339.2" font-family="Roboto" fill="#6E7079">
+Brazil
+</text>
+</g>
+<g>
+
+<text font-size="14" x="74" y="382" font-family="Roboto" fill="#6E7079">
+0
+</text>
+<text font-size="14" x="145.7" y="382" font-family="Roboto" fill="#6E7079">
+136k
+</text>
+<text font-size="14" x="229.3" y="382" font-family="Roboto" fill="#6E7079">
+272k
+</text>
+<text font-size="14" x="313" y="382" font-family="Roboto" fill="#6E7079">
+408k
+</text>
+<text font-size="14" x="396.7" y="382" font-family="Roboto" fill="#6E7079">
+544k
+</text>
+<text font-size="14" x="480.3" y="382" font-family="Roboto" fill="#6E7079">
+680k
+</text>
+<text font-size="14" x="564" y="382" font-family="Roboto" fill="#6E7079">
+816k
+</text>
+</g>
+<g stroke="#E0E6F2" stroke-width="1">
+<line x1="161.7" y1="50" x2="161.7" y2="360"/><line x1="245.3" y1="50" x2="245.3" y2="360"/><line x1="329" y1="50" x2="329" y2="360"/><line x1="412.7" y1="50" x2="412.7" y2="360"/><line x1="496.3" y1="50" x2="496.3" y2="360"/><line x1="580" y1="50" x2="580" y2="360"/>
+</g>
+<rect x="78" y="313.3" width="11.2" height="19.3" fill="#5470C6" data-series="2011" data-category="Brazil" data-value="18203"/>
+<rect x="78" y="261.7" width="14.5" height="19.3" fill="#5470C6" data-series="2011" data-category="Indonesia" data-value="23489"/>
+<rect x="78" y="210" width="17.9" height="19.3" fill="#5470C6" data-series="2011" data-category="USA" data-value="29034"/>
+<rect x="78" y="158.3" width="64.6" height="19.3" fill="#5470C6" data-series="2011" data-category="India" data-value="104970"/>
+<rect x="78" y="106.7" width="81" height="19.3" fill="#5470C6" data-series="2011" data-category="China" data-value="131744"/>
+<rect x="78" y="55" width="387.7" height="19.3" fill="#5470C6" data-series="2011" data-category="World" data-value="630230"/>
+<rect x="78" y="335.7" width="11.9" height="19.3" fill="#91CC75" data-series="2012" data-category="Brazil" data-value="19325"/>
+<rect x="78" y="284" width="14.4" height="19.3" fill="#91CC75" data-series="2012" data-category="Indonesia" data-value="23438"/>
+<rect x="78" y="232.3" width="19.1" height="19.3" fill="#91CC75" data-series="2012" data-category="USA" data-value="31000"/>
+<rect x="78" y="180.7" width="74.8" height="19.3" fill="#91CC75" data-series="2012" data-category="India" data-value="121594"/>
+<rect x="78" y="129" width="82.5" height="19.3" fill="#91CC75" data-series="2012" data-category="China" data-value="134141"/>
+<rect x="78" y="77.3" width="419.4" height="19.3" fill="#91CC75" data-series="2012" data-category="World" data-value="681807"/>
+</svg>

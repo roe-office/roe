@@ -1,0 +1,677 @@
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use super::common::{FontConfig, LineStep, MarkArea, SeriesBand, TextConfig};
+use super::{Align, Box, Color, LegendCategory, Series, SeriesCategory, Theme, YAxisConfig};
+use crate::{
+    AxisScale, MarkLine, MarkLineCategory, MarkPoint, MarkPointCategory, NIL_VALUE, Position,
+    Symbol,
+};
+use std::sync::Arc;
+
+/// Gets bool value from serde json.
+pub(crate) fn get_bool_from_value(value: &serde_json::Value, key: &str) -> Option<bool> {
+    if let Some(value) = value.get(key)
+        && let Some(b) = value.as_bool()
+    {
+        return Some(b);
+    }
+    None
+}
+
+/// Gets usize value from serde json.
+pub(crate) fn get_usize_from_value(value: &serde_json::Value, key: &str) -> Option<usize> {
+    if let Some(value) = value.get(key)
+        && let Some(u) = value.as_u64()
+    {
+        return Some(u as usize);
+    }
+    None
+}
+
+/// Gets usize slice value from serde json.
+pub(crate) fn get_usize_slice_from_value(
+    value: &serde_json::Value,
+    key: &str,
+) -> Option<Vec<usize>> {
+    if let Some(arr) = value.get(key)
+        && let Some(values) = arr.as_array()
+    {
+        return Some(
+            values
+                .iter()
+                .map(|item| {
+                    if let Some(v) = item.as_u64() {
+                        v as usize
+                    } else {
+                        0
+                    }
+                })
+                .collect(),
+        );
+    }
+    None
+}
+
+/// Gets float32 value from serde json.
+pub(crate) fn get_f32_from_value(value: &serde_json::Value, key: &str) -> Option<f32> {
+    if let Some(value) = value.get(key) {
+        if value.is_null() {
+            return None;
+        }
+        if let Some(v) = value.as_f64() {
+            return Some(v as f32);
+        }
+    }
+    None
+}
+
+/// Gets float32 slice value from serde json, the value can be null.
+pub(crate) fn get_f32_slice_from_value_support_nil(
+    value: &serde_json::Value,
+    key: &str,
+) -> Option<Vec<Option<f32>>> {
+    if let Some(arr) = value.get(key)
+        && let Some(values) = arr.as_array()
+    {
+        return Some(
+            values
+                .iter()
+                .map(|item| {
+                    if item.is_null() {
+                        return None;
+                    }
+                    // The legacy sentinel is also treated as a missing point so
+                    // that callers passing `NIL_VALUE` numerically keep working.
+                    match item.as_f64() {
+                        Some(v) if v as f32 != NIL_VALUE => Some(v as f32),
+                        Some(_) => None,
+                        None => Some(0.0),
+                    }
+                })
+                .collect(),
+        );
+    }
+    None
+}
+
+/// Gets float32 slice value from serde json, the value will set as 0.0 if not float32.
+pub(crate) fn get_f32_slice_from_value(value: &serde_json::Value, key: &str) -> Option<Vec<f32>> {
+    if let Some(arr) = value.get(key)
+        && let Some(values) = arr.as_array()
+    {
+        return Some(
+            values
+                .iter()
+                .map(|item| {
+                    if let Some(v) = item.as_f64() {
+                        v as f32
+                    } else {
+                        0.0
+                    }
+                })
+                .collect(),
+        );
+    }
+    None
+}
+
+fn convert_to_align(value: &serde_json::Value) -> Option<Align> {
+    if value.is_null() {
+        return None;
+    }
+    if let Some(value) = value.as_str() {
+        let value = match value.to_lowercase().as_str() {
+            "left" => Align::Left,
+            "right" => Align::Right,
+            _ => Align::Center,
+        };
+        return Some(value);
+    }
+    None
+}
+
+/// Gets align slice value from serde json.
+pub(crate) fn get_align_slice_from_value(
+    value: &serde_json::Value,
+    key: &str,
+) -> Option<Vec<Align>> {
+    if let Some(arr) = value.get(key) {
+        let mut align_list = vec![];
+        if let Some(values) = arr.as_array() {
+            for item in values.iter() {
+                if let Some(align) = convert_to_align(item) {
+                    align_list.push(align);
+                }
+            }
+        }
+        return Some(align_list);
+    }
+    None
+}
+
+/// Gets align value from serde json.
+pub(crate) fn get_align_from_value(value: &serde_json::Value, key: &str) -> Option<Align> {
+    if let Some(value) = value.get(key) {
+        return convert_to_align(value);
+    }
+    None
+}
+
+/// Gets legend category value from serde json.
+pub(crate) fn get_legend_category_from_value(
+    value: &serde_json::Value,
+    key: &str,
+) -> Option<LegendCategory> {
+    if let Some(value) = value.get(key) {
+        if value.is_null() {
+            return None;
+        }
+        if let Some(value) = value.as_str() {
+            let value = match value.to_lowercase().as_str() {
+                "rect" => LegendCategory::Rect,
+                "round_rect" => LegendCategory::RoundRect,
+                "circle" => LegendCategory::Circle,
+                "square" => LegendCategory::Square,
+                _ => LegendCategory::Normal,
+            };
+            return Some(value);
+        }
+    }
+    None
+}
+
+/// Gets margin box value from serde json.
+pub(crate) fn get_margin_from_value(value: &serde_json::Value, key: &str) -> Option<Box> {
+    if let Some(data) = value.get(key) {
+        if data.is_null() {
+            return None;
+        }
+        return Some(get_box_from_value(data));
+    }
+    None
+}
+
+fn get_box_from_value(value: &serde_json::Value) -> Box {
+    // A bare number applies to all four sides, like `Box::from(f32)`.
+    if let Some(v) = value.as_f64() {
+        return (v as f32).into();
+    }
+    Box {
+        left: get_f32_from_value(value, "left").unwrap_or_default(),
+        top: get_f32_from_value(value, "top").unwrap_or_default(),
+        right: get_f32_from_value(value, "right").unwrap_or_default(),
+        bottom: get_f32_from_value(value, "bottom").unwrap_or_default(),
+    }
+}
+
+/// Gets string slice value from serde json.
+/// One x value: a number, or a date / date-time string (unix seconds).
+/// The flag tells whether it was a time string.
+pub(crate) fn get_x_value(value: &serde_json::Value) -> Option<(f64, bool)> {
+    if let Some(v) = value.as_f64() {
+        return Some((v, false));
+    }
+    value
+        .as_str()
+        .and_then(super::x_axis::parse_time)
+        .map(|v| (v, true))
+}
+
+/// Gets the x values of a continuous axis: numbers, or date / date-time
+/// strings (converted to unix seconds). `null` is a missing value. The flag
+/// tells whether any value was a time string.
+pub(crate) fn get_x_values_from_value(
+    value: &serde_json::Value,
+    key: &str,
+) -> Option<(Vec<f64>, bool)> {
+    let values = value.get(key)?.as_array()?;
+    let mut has_time = false;
+    let xs = values
+        .iter()
+        .map(|item| match get_x_value(item) {
+            Some((v, is_time)) => {
+                has_time |= is_time;
+                v
+            }
+            None => f64::NAN,
+        })
+        .collect();
+    Some((xs, has_time))
+}
+
+pub(crate) fn get_string_slice_from_value(
+    value: &serde_json::Value,
+    key: &str,
+) -> Option<Vec<String>> {
+    if let Some(arr) = value.get(key)
+        && let Some(values) = arr.as_array()
+    {
+        return Some(
+            values
+                .iter()
+                .map(|item| item.as_str().unwrap_or_default().to_string())
+                .collect(),
+        );
+    }
+    None
+}
+
+/// Gets y axis config value from serde json.
+pub(crate) fn get_y_axis_config_from_value(t: Arc<Theme>, item: &serde_json::Value) -> YAxisConfig {
+    let mut y_config = t.y_axis.clone();
+    if let Some(axis_font_size) = get_f32_from_value(item, "axis_font_size") {
+        y_config.font.size = axis_font_size;
+    }
+    if let Some(axis_font_color) = get_color_from_value(item, "axis_font_color") {
+        y_config.font.color = axis_font_color;
+    }
+    if let Some(axis_font_weight) = get_string_from_value(item, "axis_font_weight") {
+        y_config.font.weight = Some(axis_font_weight);
+    }
+    if let Some(axis_stroke_color) = get_color_from_value(item, "axis_stroke_color") {
+        y_config.stroke_color = axis_stroke_color;
+    }
+    if let Some(axis_stroke_width) = get_f32_from_value(item, "axis_stroke_width") {
+        y_config.stroke_width = Some(axis_stroke_width);
+    }
+    if let Some(axis_width) = get_f32_from_value(item, "axis_width") {
+        y_config.width = Some(axis_width);
+    }
+    if let Some(axis_split_number) = get_usize_from_value(item, "axis_split_number") {
+        y_config.split_number = axis_split_number;
+    }
+    if let Some(axis_name_gap) = get_f32_from_value(item, "axis_name_gap") {
+        y_config.name_gap = axis_name_gap;
+    }
+    if let Some(axis_formatter) = get_string_from_value(item, "axis_formatter") {
+        y_config.formatter = Some(axis_formatter);
+    }
+    if let Some(axis_margin) = get_margin_from_value(item, "axis_margin") {
+        y_config.margin = Some(axis_margin);
+    }
+    if let Some(axis_min) = get_f32_from_value(item, "axis_min") {
+        y_config.min = Some(axis_min);
+    }
+    if let Some(axis_max) = get_f32_from_value(item, "axis_max") {
+        y_config.max = Some(axis_max);
+    }
+    if let Some(scale) = get_axis_scale_from_value(item, "axis_scale") {
+        y_config.scale = scale;
+    }
+    if let Some(axis_inverse) = get_bool_from_value(item, "axis_inverse") {
+        y_config.inverse = axis_inverse;
+    }
+    if let Some(axis_title) = get_string_from_value(item, "axis_title") {
+        y_config.title = Some(axis_title);
+    }
+    y_config
+}
+
+/// Gets axis scale value from serde json.
+/// Accepts a string `"log"` / `"log10"` / `"log2"` / `"linear"`,
+/// or an object `{"type": "log", "base": 10}`.
+pub(crate) fn get_axis_scale_from_value(value: &serde_json::Value, key: &str) -> Option<AxisScale> {
+    let v = value.get(key)?;
+    if v.is_null() {
+        return None;
+    }
+    if let Some(s) = v.as_str() {
+        return Some(match s.to_lowercase().as_str() {
+            "log" | "log10" => AxisScale::Log(10.0),
+            "log2" => AxisScale::Log(2.0),
+            _ => AxisScale::Linear,
+        });
+    }
+    // {"type": "log", "base": 2.0}
+    if v.is_object()
+        && v.get("type")
+            .and_then(|t| t.as_str())
+            .map(|t| t.to_lowercase())
+            == Some("log".into())
+    {
+        let base = v.get("base").and_then(|b| b.as_f64()).unwrap_or(10.0) as f32;
+        return Some(AxisScale::Log(base));
+    }
+    None
+}
+
+/// Gets y axis config value from serde json.
+pub(crate) fn get_y_axis_configs_from_value(
+    t: Arc<Theme>,
+    value: &serde_json::Value,
+    key: &str,
+) -> Option<Vec<YAxisConfig>> {
+    if let Some(arr) = value.get(key)
+        && let Some(values) = arr.as_array()
+    {
+        return Some(
+            values
+                .iter()
+                .map(|item| get_y_axis_config_from_value(t.clone(), item))
+                .collect(),
+        );
+    }
+    None
+}
+
+/// Gets color value from serde json.
+pub(crate) fn get_color_slice_from_value(
+    value: &serde_json::Value,
+    key: &str,
+) -> Option<Vec<Color>> {
+    if let Some(arr) = value.get(key)
+        && let Some(values) = arr.as_array()
+    {
+        // Keep positions: a bad entry becomes the transparent default rather
+        // than shifting every later color up by one.
+        return Some(
+            values
+                .iter()
+                .map(|item| Color::parse(item.as_str().unwrap_or_default()).unwrap_or_default())
+                .collect(),
+        );
+    }
+    None
+}
+
+/// Gets string value from serde json.
+pub(crate) fn get_string_from_value(value: &serde_json::Value, key: &str) -> Option<String> {
+    if let Some(s) = value.get(key) {
+        if s.is_null() {
+            return None;
+        }
+        if let Some(v) = s.as_str() {
+            return Some(v.to_string());
+        }
+    }
+    None
+}
+
+/// Gets position value from serde json.
+pub(crate) fn get_position_from_value(value: &serde_json::Value, key: &str) -> Option<Position> {
+    if let Some(value) = get_string_from_value(value, key) {
+        let p = match value.to_lowercase().as_str() {
+            "inside" => Position::Inside,
+            "top" => Position::Top,
+            "right" => Position::Right,
+            "bottom" => Position::Bottom,
+            _ => Position::Left,
+        };
+        return Some(p);
+    }
+    None
+}
+
+/// Gets color value from serde json. An unparsable color string is ignored
+/// (the theme default stays in effect) instead of becoming transparent.
+pub(crate) fn get_color_from_value(value: &serde_json::Value, key: &str) -> Option<Color> {
+    if let Some(s) = get_string_from_value(value, key) {
+        return Color::parse(&s);
+    }
+    None
+}
+
+fn get_series_category_from_value(value: &serde_json::Value, key: &str) -> Option<SeriesCategory> {
+    if let Some(value) = value.get(key) {
+        if value.is_null() {
+            return None;
+        }
+        if let Some(value) = value.as_str() {
+            return match value.to_lowercase().as_str() {
+                "line" => Some(SeriesCategory::Line),
+                "bar" => Some(SeriesCategory::Bar),
+                _ => None,
+            };
+        }
+    }
+    None
+}
+
+/// Gets the step of a line series: `start`, `middle` or `end`.
+fn get_line_step_from_value(value: &serde_json::Value, key: &str) -> Option<LineStep> {
+    match value.get(key)?.as_str()?.to_lowercase().as_str() {
+        "start" => Some(LineStep::Start),
+        "middle" => Some(LineStep::Middle),
+        "end" => Some(LineStep::End),
+        _ => None,
+    }
+}
+
+/// Gets series symbol value from serde json.
+/// Accepts `null` (→ None marker), or an object with optional fields:
+/// `type` ("circle"|"rect"|"triangle"|"diamond", or "none" for no marker),
+/// `size`/`radius`, `color`.
+pub(crate) fn get_series_symbol_from_value(value: &serde_json::Value, key: &str) -> Option<Symbol> {
+    let v = value.get(key)?;
+    if v.is_null() {
+        return Some(Symbol::None);
+    }
+    Some(get_symbol_from_object(v))
+}
+
+/// The symbol a JSON object describes: its `type`, `size` / `radius` and
+/// `color`.
+pub(crate) fn get_symbol_from_object(v: &serde_json::Value) -> Symbol {
+    let color = get_color_from_value(v, "color");
+    let size = get_f32_from_value(v, "size")
+        .or_else(|| get_f32_from_value(v, "radius"))
+        .unwrap_or(3.0);
+    let symbol_type = v
+        .get("type")
+        .and_then(|t| t.as_str())
+        .unwrap_or("circle")
+        .to_lowercase();
+    match symbol_type.as_str() {
+        "none" => Symbol::None,
+        "rect" | "square" => Symbol::Rect(size, color),
+        "triangle" => Symbol::Triangle(size, color),
+        "diamond" => Symbol::Diamond(size, color),
+        _ => Symbol::Circle(size, color),
+    }
+}
+
+/// Gets the texts written over a chart; `None` where the key is not given.
+pub(crate) fn get_texts_from_value(
+    value: &serde_json::Value,
+    key: &str,
+) -> Option<Vec<TextConfig>> {
+    let items = value.get(key)?.as_array()?;
+    let texts = items
+        .iter()
+        .filter_map(|item| {
+            let text = get_string_from_value(item, "text").filter(|text| !text.is_empty())?;
+            Some(TextConfig {
+                text,
+                left: get_f32_from_value(item, "left"),
+                top: get_f32_from_value(item, "top"),
+                right: get_f32_from_value(item, "right"),
+                bottom: get_f32_from_value(item, "bottom"),
+                font: FontConfig {
+                    size: get_f32_from_value(item, "font_size").unwrap_or_default(),
+                    color: get_color_from_value(item, "font_color").unwrap_or_default(),
+                    weight: get_string_from_value(item, "font_weight"),
+                },
+                rotate: get_f32_from_value(item, "rotate").unwrap_or_default(),
+                reserve: get_bool_from_value(item, "reserve").unwrap_or_default(),
+            })
+        })
+        .collect();
+    Some(texts)
+}
+
+fn get_mark_lines(value: &serde_json::Value, key: &str) -> Vec<MarkLine> {
+    let mut mark_lines = vec![];
+    if let Some(data) = value.get(key)
+        && let Some(arr) = data.as_array()
+    {
+        for item in arr.iter() {
+            if let Some(value) = item.get("category") {
+                let category = match value.as_str().unwrap_or_default().to_lowercase().as_str() {
+                    "max" => MarkLineCategory::Max,
+                    "min" => MarkLineCategory::Min,
+                    "value" => MarkLineCategory::Value(
+                        get_f32_from_value(item, "value").unwrap_or_default(),
+                    ),
+                    _ => MarkLineCategory::Average,
+                };
+                mark_lines.push(MarkLine {
+                    category,
+                    color: get_color_from_value(item, "color"),
+                    stroke_width: get_f32_from_value(item, "stroke_width"),
+                    stroke_dash_array: get_string_from_value(item, "stroke_dash_array"),
+                })
+            }
+        }
+    }
+    mark_lines
+}
+
+/// One edge of a mark area: a number, or `"average"` / `"min"` / `"max"`.
+fn get_mark_value(value: Option<&serde_json::Value>) -> Option<MarkLineCategory> {
+    let value = value?;
+    if let Some(v) = value.as_f64() {
+        return Some(MarkLineCategory::Value(v as f32));
+    }
+    match value.as_str()?.to_lowercase().as_str() {
+        "max" => Some(MarkLineCategory::Max),
+        "min" => Some(MarkLineCategory::Min),
+        "average" => Some(MarkLineCategory::Average),
+        _ => None,
+    }
+}
+
+fn get_mark_areas(value: &serde_json::Value, key: &str) -> Vec<MarkArea> {
+    let mut mark_areas = vec![];
+    if let Some(data) = value.get(key)
+        && let Some(arr) = data.as_array()
+    {
+        for item in arr.iter() {
+            if let (Some(from), Some(to)) = (
+                get_mark_value(item.get("from")),
+                get_mark_value(item.get("to")),
+            ) {
+                mark_areas.push(MarkArea {
+                    from,
+                    to,
+                    color: get_color_from_value(item, "color"),
+                    opacity: get_f32_from_value(item, "opacity"),
+                });
+            }
+        }
+    }
+    mark_areas
+}
+
+fn get_mark_points(value: &serde_json::Value, key: &str) -> Vec<MarkPoint> {
+    let mut mark_points = vec![];
+    if let Some(data) = value.get(key)
+        && let Some(arr) = data.as_array()
+    {
+        for item in arr.iter() {
+            if let Some(value) = item.get("category") {
+                let category = match value.as_str().unwrap_or_default().to_lowercase().as_str() {
+                    "max" => MarkPointCategory::Max,
+                    // Which point it is is in `index`: without one there
+                    // is none to mark.
+                    "index" => match get_usize_from_value(item, "index") {
+                        Some(index) => MarkPointCategory::Index(index),
+                        None => continue,
+                    },
+                    _ => MarkPointCategory::Min,
+                };
+                mark_points.push(MarkPoint { category })
+            }
+        }
+    }
+    mark_points
+}
+
+fn get_series_colors_from_value(
+    value: &serde_json::Value,
+    key: &str,
+) -> Option<Vec<Option<Color>>> {
+    if let Some(data) = value.get(key)
+        && let Some(arr) = data.as_array()
+    {
+        // One slot per entry, so a null or bad value leaves the series
+        // color in place instead of shifting the later overrides.
+        let colors = arr
+            .iter()
+            .map(|item| item.as_str().and_then(Color::parse))
+            .collect();
+        return Some(colors);
+    }
+    None
+}
+
+/// Gets the band of a series: `{"lower": [...], "upper": [...]}`.
+fn get_series_band_from_value(value: &serde_json::Value, key: &str) -> Option<SeriesBand> {
+    let band = value.get(key)?;
+    if band.is_null() {
+        return None;
+    }
+    Some(SeriesBand {
+        lower: get_f32_slice_from_value_support_nil(band, "lower").unwrap_or_default(),
+        upper: get_f32_slice_from_value_support_nil(band, "upper").unwrap_or_default(),
+        stroke_width: get_f32_from_value(band, "stroke_width"),
+    })
+}
+
+fn get_series_from_value(value: &serde_json::Value) -> Option<Series> {
+    let name = get_string_from_value(value, "name").unwrap_or_default();
+    // An empty series is kept (it still has a legend entry) rather than
+    // silently dropped, which shifted the palette of every later series.
+    let data = get_f32_slice_from_value_support_nil(value, "data").unwrap_or_default();
+    Some(Series {
+        name,
+        data,
+        index: get_usize_from_value(value, "index"),
+        y_axis_index: get_usize_from_value(value, "y_axis_index").unwrap_or_default(),
+        label_show: get_bool_from_value(value, "label_show").unwrap_or_default(),
+        category: get_series_category_from_value(value, "category"),
+        start_index: get_usize_from_value(value, "start_index").unwrap_or_default(),
+        mark_lines: get_mark_lines(value, "mark_lines"),
+        mark_points: get_mark_points(value, "mark_points"),
+        mark_areas: get_mark_areas(value, "mark_areas"),
+        colors: get_series_colors_from_value(value, "colors"),
+        stroke_dash_array: get_string_from_value(value, "stroke_dash_array"),
+        stack: get_string_from_value(value, "stack"),
+        smooth: get_bool_from_value(value, "smooth"),
+        fill: get_bool_from_value(value, "fill"),
+        symbol: get_series_symbol_from_value(value, "symbol"),
+        x_values: get_x_values_from_value(value, "x_values").map(|(values, _)| values),
+        band: get_series_band_from_value(value, "band"),
+        step: get_line_step_from_value(value, "step"),
+        error_bar: get_series_band_from_value(value, "error_bar"),
+        ring: get_usize_from_value(value, "ring").unwrap_or_default(),
+    })
+}
+
+/// Gets series list value from serde json.
+pub(crate) fn get_series_list_from_value(value: &serde_json::Value) -> Option<Vec<Series>> {
+    if let Some(data) = value.get("series_list")
+        && let Some(arr) = data.as_array()
+    {
+        let mut series_list = vec![];
+        for (index, item) in arr.iter().enumerate() {
+            if let Some(mut series) = get_series_from_value(item) {
+                if series.index.is_none() {
+                    series.index = Some(index)
+                }
+                series_list.push(series);
+            }
+        }
+        return Some(series_list);
+    }
+    None
+}

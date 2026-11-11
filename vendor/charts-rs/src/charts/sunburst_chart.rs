@@ -1,0 +1,679 @@
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use super::Canvas;
+use super::base::ChartBase;
+use super::canvas;
+use super::color::*;
+use super::common::*;
+use super::component::*;
+use super::params::*;
+use super::theme::{get_default_theme_name, get_theme};
+use super::util::*;
+use crate::charts::measure_text_width_family;
+
+// ── Hierarchical data ─────────────────────────────────────────────────────────
+
+/// A node in the sunburst hierarchy. A node is a leaf when `children` is empty,
+/// in which case `value` is used directly; otherwise its value is the sum of
+/// its children's values.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SunburstData {
+    /// Name of the node, shown as its label: along the arc of the node
+    /// where that is long enough for it, along the radius where the arc is
+    /// too short and the ring thick enough, and not at all where it fits
+    /// neither way.
+    pub name: String,
+    /// Value of the node when it is a leaf.
+    pub value: f32,
+    /// Child nodes.
+    pub children: Vec<SunburstData>,
+    /// Optional explicit color; when `None` the color is derived from the
+    /// top-level palette and lightened with depth.
+    pub color: Option<Color>,
+}
+
+impl SunburstData {
+    /// Total value of the node: its own value when a leaf, otherwise the sum
+    /// of all descendant leaf values.
+    pub(crate) fn total(&self) -> f32 {
+        if self.children.is_empty() {
+            self.value.max(0.0)
+        } else {
+            self.children.iter().map(|c| c.total()).sum()
+        }
+    }
+}
+
+fn max_depth(nodes: &[SunburstData]) -> usize {
+    nodes
+        .iter()
+        .map(|n| {
+            if n.children.is_empty() {
+                1
+            } else {
+                1 + max_depth(&n.children)
+            }
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+/// Mixes a color toward white by `factor` (0.0 = unchanged, 1.0 = white),
+/// used to fade deeper rings while keeping the parent hue.
+pub(crate) fn lighten(c: Color, factor: f32) -> Color {
+    let f = factor.clamp(0.0, 0.85);
+    let mix = |v: u8| (v as f32 + (255.0 - v as f32) * f) as u8;
+    Color {
+        r: mix(c.r),
+        g: mix(c.g),
+        b: mix(c.b),
+        a: c.a,
+    }
+}
+
+pub(crate) fn parse_node(value: &serde_json::Value) -> Option<SunburstData> {
+    let name = get_string_from_value(value, "name").unwrap_or_default();
+    let val = get_f32_from_value(value, "value").unwrap_or_default();
+    let color = get_color_from_value(value, "color");
+    let mut children = vec![];
+    if let Some(arr) = value.get("children").and_then(|v| v.as_array()) {
+        for item in arr.iter() {
+            if let Some(node) = parse_node(item) {
+                children.push(node);
+            }
+        }
+    }
+    if name.is_empty() && children.is_empty() && val == 0.0 {
+        return None;
+    }
+    Some(SunburstData {
+        name,
+        value: val,
+        children,
+        color,
+    })
+}
+
+/// Geometry and totals shared by every ring while drawing the hierarchy.
+struct RingLayout<'a> {
+    cx: f32,
+    cy: f32,
+    grand_total: f32,
+    /// Pixel thickness of each ring level, indexed by depth.
+    thicknesses: &'a [f32],
+}
+
+// ── SunburstChart ──────────────────────────────────────────────────────────────
+
+/// A sunburst chart of hierarchical data as concentric rings.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SunburstChart {
+    /// The shared chart options (size, series, title/legend, axes); exposed
+    /// directly on the chart through `Deref`, e.g. `chart.title.text`.
+    pub base: ChartBase,
+    y_axis_configs: Vec<YAxisConfig>,
+
+    // sunburst-specific
+    /// Hierarchy roots. Multiple roots form a forest sharing the full circle.
+    pub series_data: Vec<SunburstData>,
+    /// Outer radius in pixels. `0.0` (default) auto-fits the content area.
+    pub radius: f32,
+    /// Inner radius (center hole) in pixels. Default: 0.0.
+    pub inner_radius: f32,
+    /// Starting angle in degrees, clockwise from the top. Default: 0.0.
+    pub start_angle: f32,
+    /// Relative thickness weight of each ring level; unspecified levels
+    /// default to `1.0`. E.g. `[2.0]` makes the innermost ring twice as thick
+    /// as the others. Empty (default) splits all rings equally.
+    pub level_thickness: Vec<f32>,
+}
+
+impl std::ops::Deref for SunburstChart {
+    type Target = ChartBase;
+    fn deref(&self) -> &ChartBase {
+        &self.base
+    }
+}
+impl std::ops::DerefMut for SunburstChart {
+    fn deref_mut(&mut self) -> &mut ChartBase {
+        &mut self.base
+    }
+}
+
+impl SunburstChart {
+    /// Creates a sunburst chart with the given theme.
+    pub fn new_with_theme(series_data: Vec<SunburstData>, theme: &str) -> SunburstChart {
+        let mut c = SunburstChart {
+            series_data,
+            ..Default::default()
+        };
+        c.base.fill_theme(get_theme(theme), &mut c.y_axis_configs);
+        c
+    }
+
+    /// Creates a sunburst chart with the default theme.
+    pub fn new(series_data: Vec<SunburstData>) -> SunburstChart {
+        SunburstChart::new_with_theme(series_data, &get_default_theme_name())
+    }
+
+    /// Creates a sunburst chart from JSON options.
+    pub fn from_json(json: &str) -> canvas::Result<SunburstChart> {
+        let mut c = SunburstChart {
+            ..Default::default()
+        };
+        let value =
+            c.base
+                .fill_option(json, &mut c.y_axis_configs, super::schema::SUNBURST_FIELDS)?;
+        if let Some(arr) = value.get("series_data").and_then(|v| v.as_array()) {
+            c.series_data = arr.iter().filter_map(parse_node).collect();
+        }
+        if let Some(v) = get_f32_from_value(&value, "radius") {
+            c.radius = v;
+        }
+        if let Some(v) = get_f32_from_value(&value, "inner_radius") {
+            c.inner_radius = v;
+        }
+        if let Some(v) = get_f32_from_value(&value, "start_angle") {
+            c.start_angle = v;
+        }
+        if let Some(v) = get_f32_slice_from_value(&value, "level_thickness") {
+            c.level_thickness = v;
+        }
+        Ok(c)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_nodes(
+        &self,
+        c: &mut Canvas,
+        nodes: &[SunburstData],
+        start_angle: f32,
+        total: f32,
+        // Angular extent (degrees) available to this set of siblings. The top
+        // level spans the full 360; children only span their parent's slice.
+        span: f32,
+        depth: usize,
+        inner_r: f32,
+        base_color: Color,
+        l: &RingLayout,
+    ) {
+        if total <= 0.0 {
+            return;
+        }
+        let Some(thickness) = l.thicknesses.get(depth).copied() else {
+            return;
+        };
+        let mut angle = start_angle;
+        for (i, node) in nodes.iter().enumerate() {
+            let node_total = node.total();
+            if node_total <= 0.0 {
+                continue;
+            }
+            let delta = node_total / total * span;
+            let color = node.color.unwrap_or_else(|| {
+                if depth == 0 {
+                    get_color(&self.series.colors, i)
+                } else {
+                    lighten(base_color, depth as f32 * 0.16)
+                }
+            });
+            let outer_r = inner_r + thickness;
+
+            // Tiny slices would render as degenerate arcs; skip drawing but
+            // still consume their angle so the layout stays consistent.
+            if delta >= 1.0 {
+                let (anim_class, anim_style) = if let Some(ref a) = self.animation {
+                    (
+                        Some("sunburst-anim".to_string()),
+                        Some(format!("animation-delay:{}ms", depth as u32 * a.delay)),
+                    )
+                } else {
+                    (None, None)
+                };
+                let percentage = node_total / l.grand_total;
+                let tooltip_text = self.tooltip.show.then(|| {
+                    LabelOption {
+                        series_name: node.name.clone(),
+                        category_name: node.name.clone(),
+                        value: node_total,
+                        percentage,
+                        formatter: "{a}: {c} ({d})".to_string(),
+                    }
+                    .format()
+                });
+                let mut class = anim_class;
+                if tooltip_text.is_some() {
+                    class = Some(match class {
+                        Some(c) => format!("{c} ct-trigger"),
+                        None => "ct-trigger".to_string(),
+                    });
+                }
+                c.pie(Pie {
+                    fill: color.into(),
+                    stroke_color: Some(self.background_color),
+                    cx: l.cx,
+                    cy: l.cy,
+                    r: outer_r,
+                    ir: inner_r,
+                    start_angle: angle,
+                    delta,
+                    border_radius: 0.0,
+                    class,
+                    style: anim_style,
+                    title: tooltip_text.clone(),
+                    dataset: vec![
+                        ("name".to_string(), node.name.clone()),
+                        ("value".to_string(), format_float(node_total)),
+                        ("percentage".to_string(), format_float(percentage * 100.0)),
+                        ("depth".to_string(), depth.to_string()),
+                    ],
+                });
+                // Hidden hover label right after the arc (adjacent-sibling
+                // reveal), at the middle of the ring segment.
+                if let Some(text) = tooltip_text {
+                    let p =
+                        get_pie_point(l.cx, l.cy, (inner_r + outer_r) / 2.0, angle + delta / 2.0);
+                    c.text(Text {
+                        text,
+                        class: Some("ct-tip".to_string()),
+                        font_weight: self.tooltip.font.weight.clone(),
+                        font_family: Some(self.font_family.clone()),
+                        font_color: Some(self.tooltip_font_color(self.series.label.font.color)),
+                        font_size: Some(self.tooltip_font_size(self.series.label.font.size)),
+                        x: Some(p.x),
+                        y: Some(p.y),
+                        text_anchor: Some("middle".to_string()),
+                        dominant_baseline: Some("central".to_string()),
+                        ..Default::default()
+                    });
+                }
+                self.draw_label(
+                    c, node, angle, delta, inner_r, thickness, color, node_total, l,
+                );
+            }
+
+            if !node.children.is_empty() {
+                let child_base = if depth == 0 { color } else { base_color };
+                self.draw_nodes(
+                    c,
+                    &node.children,
+                    angle,
+                    node_total,
+                    delta,
+                    depth + 1,
+                    outer_r,
+                    child_base,
+                    l,
+                );
+            }
+            angle += delta;
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_label(
+        &self,
+        c: &mut Canvas,
+        node: &SunburstData,
+        start_angle: f32,
+        delta: f32,
+        inner_r: f32,
+        thickness: f32,
+        fill: Color,
+        value: f32,
+        l: &RingLayout,
+    ) {
+        // {a}/{b}: node name, {c}: value, {d}: percentage of the grand total.
+        let text = if self.series.label.formatter.is_empty() {
+            node.name.clone()
+        } else {
+            LabelOption {
+                series_name: node.name.clone(),
+                category_name: node.name.clone(),
+                value,
+                percentage: if l.grand_total > 0.0 {
+                    value / l.grand_total
+                } else {
+                    0.0
+                },
+                formatter: self.series.label.formatter.clone(),
+            }
+            .format()
+        };
+        if text.is_empty() || thickness < 12.0 {
+            return;
+        }
+        let font_size = self.series.label.font.size.max(10.0);
+        let mid_angle = start_angle + delta / 2.0;
+        let mid_r = inner_r + thickness / 2.0;
+        let point = get_pie_point(l.cx, l.cy, mid_r, mid_angle);
+
+        let name_w = measure_text_width_family(&self.font_family, font_size, &text)
+            .map(|b| b.width())
+            .unwrap_or(text.len() as f32 * font_size * 0.6);
+        // Labels are drawn tangentially (along the arc) where the arc of the
+        // slice is long enough to hold the text. A slice too narrow for that
+        // has its label along the radius instead, where the ring is thick
+        // enough for it and the slice, at the end of the text nearer to the
+        // middle, as wide as a line of text is high. A label that fits
+        // neither way is skipped: it stays inside its own slice instead of
+        // overflowing onto its neighbours.
+        let arc_len = delta.to_radians() * mid_r;
+        let along_arc = name_w + 6.0 <= arc_len;
+        let along_radius =
+            name_w + 6.0 <= thickness && delta.to_radians() * (mid_r - name_w / 2.0) >= font_size;
+        if !along_arc && !along_radius {
+            return;
+        }
+
+        // Chart angle 0 points up and increases clockwise, which matches the
+        // SVG `rotate` convention, so the tangent at `mid_angle` is
+        // `rotate(mid_angle)` and the radius a quarter turn from it. Either
+        // way the text is flipped on the half of the chart where it would be
+        // upside-down: the bottom half along the arc, the left half along
+        // the radius.
+        let mut deg = mid_angle % 360.0;
+        if deg < 0.0 {
+            deg += 360.0;
+        }
+        if along_arc {
+            if deg > 90.0 && deg < 270.0 {
+                deg -= 180.0;
+            }
+        } else if deg < 180.0 {
+            deg -= 90.0;
+        } else {
+            deg += 90.0;
+        }
+        // The transform is emitted verbatim, so bake in the canvas offset that
+        // `Canvas::text` adds to x / y.
+        let abs_x = point.x + c.margin.left;
+        let abs_y = point.y + c.margin.top;
+        let transform = format!(
+            "rotate({} {} {})",
+            format_float(deg),
+            format_float(abs_x),
+            format_float(abs_y)
+        );
+
+        let text_color = if fill.is_light() {
+            Color {
+                r: 30,
+                g: 30,
+                b: 30,
+                a: 255,
+            }
+        } else {
+            Color {
+                r: 255,
+                g: 255,
+                b: 255,
+                a: 230,
+            }
+        };
+        c.text(Text {
+            text,
+            font_family: Some(self.font_family.clone()),
+            font_color: Some(text_color),
+            font_size: Some(font_size),
+            x: Some(point.x),
+            y: Some(point.y),
+            transform: Some(transform),
+            text_anchor: Some("middle".to_string()),
+            dominant_baseline: Some("central".to_string()),
+            class: self.animation.as_ref().map(|_| "sunburst-fade".to_string()),
+            ..Default::default()
+        });
+    }
+
+    /// Renders the chart to an SVG string.
+    pub fn svg(&self) -> canvas::Result<String> {
+        let mut c = self.new_canvas();
+
+        let axis_top = self.render_header(&mut c);
+
+        let mut content = c.child(Box {
+            top: axis_top,
+            ..Default::default()
+        });
+
+        let cw = content.width();
+        let ch = content.height();
+        if cw <= 0.0 || ch <= 0.0 || self.series_data.is_empty() {
+            return c.svg();
+        }
+
+        let total: f32 = self.series_data.iter().map(|n| n.total()).sum();
+        if total <= 0.0 {
+            return c.svg();
+        }
+
+        let depth = max_depth(&self.series_data).max(1);
+        let cx = cw / 2.0;
+        let cy = ch / 2.0;
+        let mut max_r = cw.min(ch) / 2.0 * 0.95;
+        if self.radius > 0.0 {
+            max_r = max_r.min(self.radius);
+        }
+        let inner = self.inner_radius.max(0.0);
+        let available = max_r - inner;
+        if available <= 0.0 {
+            return c.svg();
+        }
+        // Ring thicknesses from relative weights; levels without an explicit
+        // weight get 1.0, so an empty `level_thickness` splits rings equally.
+        let mut weights: Vec<f32> = (0..depth)
+            .map(|i| self.level_thickness.get(i).copied().unwrap_or(1.0).max(0.0))
+            .collect();
+        let weight_sum: f32 = weights.iter().sum();
+        if weight_sum <= 0.0 {
+            weights = vec![1.0; depth];
+        }
+        let weight_sum: f32 = weights.iter().sum();
+        // Multiply before dividing so the equal-weight case is bit-identical
+        // to the previous `available / depth` computation.
+        let thicknesses: Vec<f32> = weights.iter().map(|w| available * w / weight_sum).collect();
+
+        self.draw_nodes(
+            &mut content,
+            &self.series_data,
+            self.start_angle,
+            total,
+            360.0,
+            0,
+            inner,
+            Color::black(),
+            &RingLayout {
+                cx,
+                cy,
+                grand_total: total,
+                thicknesses: &thicknesses,
+            },
+        );
+
+        let mut css = String::new();
+        if let Some(ref anim) = self.animation {
+            css.push_str(&format!(
+                "@keyframes sunburst-grow{{from{{transform:scale(0)}}to{{transform:scale(1)}}}} \
+                 @keyframes sunburst-fade{{from{{opacity:0}}to{{opacity:1}}}} \
+                 .sunburst-anim{{transform-origin:{}px {}px;animation:sunburst-grow {}ms {} both}} \
+                 .sunburst-fade{{animation:sunburst-fade {}ms {} both}} ",
+                format_float(cx + content.margin.left),
+                format_float(cy + content.margin.top),
+                anim.duration,
+                anim.safe_easing(),
+                anim.duration,
+                anim.safe_easing()
+            ));
+        }
+        if self.tooltip.show {
+            css.push_str(TOOLTIP_STYLE);
+        }
+        if css.is_empty() {
+            c.svg()
+        } else {
+            c.svg_with_style(&css)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SunburstChart, SunburstData};
+
+    fn leaf(name: &str, value: f32) -> SunburstData {
+        SunburstData {
+            name: name.to_string(),
+            value,
+            ..Default::default()
+        }
+    }
+
+    fn make_sunburst() -> SunburstChart {
+        SunburstChart::new(vec![
+            SunburstData {
+                name: "Grandpa".to_string(),
+                children: vec![
+                    SunburstData {
+                        name: "Uncle Leo".to_string(),
+                        children: vec![leaf("Cousin Jack", 18.0), leaf("Cousin Mary", 12.0)],
+                        ..Default::default()
+                    },
+                    SunburstData {
+                        name: "Father".to_string(),
+                        children: vec![leaf("Me", 40.0), leaf("Brother Peter", 20.0)],
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            },
+            SunburstData {
+                name: "Nancy".to_string(),
+                children: vec![SunburstData {
+                    name: "Uncle Nike".to_string(),
+                    children: vec![leaf("Cousin Betty", 10.0), leaf("Cousin Jenny", 30.0)],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        ])
+    }
+
+    #[test]
+    fn sunburst_chart_basic() {
+        assert_snapshot!("sunburst_chart/basic.svg", make_sunburst().svg().unwrap());
+    }
+
+    #[test]
+    fn sunburst_chart_label_formatter() {
+        let mut chart = make_sunburst();
+        chart.series.label.formatter = "{b}: {c} ({d})".to_string();
+        let svg = chart.svg().unwrap();
+        // "Me" leaf: value 40 of grand total 130 -> 30.8%
+        assert!(
+            svg.contains("Me: 40 (30.8%)"),
+            "missing formatted leaf label"
+        );
+        // "Father" branch: 40 + 20 = 60 -> 46.2%
+        assert!(
+            svg.contains("Father: 60 (46.2%)"),
+            "missing formatted branch label"
+        );
+    }
+
+    #[test]
+    fn sunburst_chart_level_thickness() {
+        let mut chart = make_sunburst();
+        // Three levels with weights 2:1:1 over 160px (radius 180, inner 20):
+        // ring outer radii become 100, 140 and 180.
+        chart.radius = 180.0;
+        chart.inner_radius = 20.0;
+        chart.level_thickness = vec![2.0, 1.0, 1.0];
+        let svg = chart.svg().unwrap();
+        assert!(svg.contains("A100 100"), "inner ring should end at r=100");
+        assert!(svg.contains("A140 140"), "middle ring should end at r=140");
+        assert!(svg.contains("A180 180"), "outer ring should end at r=180");
+    }
+
+    #[test]
+    fn sunburst_chart_animation() {
+        let mut chart = make_sunburst();
+        chart.animation = Some(super::AnimationConfig {
+            duration: 600,
+            easing: "linear".to_string(),
+            delay: 100,
+        });
+        let svg = chart.svg().unwrap();
+        assert!(
+            svg.contains("sunburst-grow"),
+            "missing @keyframes sunburst-grow"
+        );
+        assert!(
+            svg.contains(r#"class="sunburst-anim""#),
+            "missing class attr on arc"
+        );
+        assert!(svg.contains("600ms linear"), "missing duration/easing");
+        assert!(
+            svg.contains("animation-delay:0ms"),
+            "missing delay for depth 0"
+        );
+        assert!(
+            svg.contains("animation-delay:100ms"),
+            "missing delay for depth 1"
+        );
+        assert!(
+            svg.contains("animation-delay:200ms"),
+            "missing delay for depth 2"
+        );
+        assert!(
+            svg.contains(r#"class="sunburst-fade""#),
+            "missing fade class on labels"
+        );
+    }
+
+    #[test]
+    fn sunburst_chart_basic_json() {
+        let chart = SunburstChart::from_json(
+            r##"{
+                "title_text": "Sunburst",
+                "inner_radius": 20,
+                "series_data": [
+                    {
+                        "name": "Grandpa",
+                        "children": [
+                            {"name": "Uncle Leo", "children": [
+                                {"name": "Cousin Jack", "value": 18},
+                                {"name": "Cousin Mary", "value": 12}
+                            ]},
+                            {"name": "Father", "children": [
+                                {"name": "Me", "value": 40},
+                                {"name": "Brother Peter", "value": 20}
+                            ]}
+                        ]
+                    },
+                    {
+                        "name": "Nancy",
+                        "children": [
+                            {"name": "Uncle Nike", "children": [
+                                {"name": "Cousin Betty", "value": 10},
+                                {"name": "Cousin Jenny", "value": 30}
+                            ]}
+                        ]
+                    }
+                ]
+            }"##,
+        )
+        .unwrap();
+        assert_snapshot!("sunburst_chart/basic_json.svg", chart.svg().unwrap());
+    }
+}

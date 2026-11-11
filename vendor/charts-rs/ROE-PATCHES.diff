@@ -1,0 +1,557 @@
+diff --git a/asset/candlestick_chart/basic_json.svg b/asset/candlestick_chart/basic_json.svg
+index e0f5d3e..87f0c31 100644
+--- a/asset/candlestick_chart/basic_json.svg
++++ b/asset/candlestick_chart/basic_json.svg
+@@ -1,16 +1,16 @@
+ <svg width="600" height="400" viewBox="0 0 600 400" xmlns="http://www.w3.org/2000/svg">
+ <rect x="0" y="0" width="600" height="400" fill="#FFFFFF"/>
+ <g>
+-<line stroke-width="2" x1="244.5" y1="15" x2="269.5" y2="15" stroke="#5470C6"/>
+-<circle cx="257" cy="15" r="5.5" stroke-width="2" stroke="#5470C6" fill="#FFFFFF"/>
+-<text font-size="14" x="272.5" y="19" font-family="Roboto" fill="#464646">
++<line stroke-width="2" x1="241" y1="15" x2="266" y2="15" stroke="#5470C6"/>
++<circle cx="253.5" cy="15" r="5.5" stroke-width="2" stroke="#5470C6" fill="#FFFFFF"/>
++<text font-size="14" x="269" y="19" font-family="Roboto" fill="#464646">
+ MA5
+ </text>
+ </g>
+ <g>
+-<line stroke-width="2" x1="308.5" y1="15" x2="333.5" y2="15" stroke="#91CC75"/>
+-<circle cx="321" cy="15" r="5.5" stroke-width="2" stroke="#91CC75" fill="#FFFFFF"/>
+-<text font-size="14" x="336.5" y="19" font-family="Roboto" fill="#464646">
++<line stroke-width="2" x1="305" y1="15" x2="330" y2="15" stroke="#91CC75"/>
++<circle cx="317.5" cy="15" r="5.5" stroke-width="2" stroke="#91CC75" fill="#FFFFFF"/>
++<text font-size="14" x="333" y="19" font-family="Roboto" fill="#464646">
+ 日K
+ </text>
+ </g>
+diff --git a/asset/candlestick_chart/sh.svg b/asset/candlestick_chart/sh.svg
+index ea3d6aa..ddfbe2f 100644
+--- a/asset/candlestick_chart/sh.svg
++++ b/asset/candlestick_chart/sh.svg
+@@ -1,16 +1,16 @@
+ <svg width="600" height="400" viewBox="0 0 600 400" xmlns="http://www.w3.org/2000/svg">
+ <rect x="0" y="0" width="600" height="400" fill="#FFFFFF"/>
+ <g>
+-<line stroke-width="2" x1="244.5" y1="15" x2="269.5" y2="15" stroke="#5470C6"/>
+-<circle cx="257" cy="15" r="5.5" stroke-width="2" stroke="#5470C6" fill="#FFFFFF"/>
+-<text font-size="14" x="272.5" y="19" font-family="Roboto" fill="#464646">
++<line stroke-width="2" x1="241" y1="15" x2="266" y2="15" stroke="#5470C6"/>
++<circle cx="253.5" cy="15" r="5.5" stroke-width="2" stroke="#5470C6" fill="#FFFFFF"/>
++<text font-size="14" x="269" y="19" font-family="Roboto" fill="#464646">
+ MA5
+ </text>
+ </g>
+ <g>
+-<line stroke-width="2" x1="308.5" y1="15" x2="333.5" y2="15" stroke="#91CC75"/>
+-<circle cx="321" cy="15" r="5.5" stroke-width="2" stroke="#91CC75" fill="#FFFFFF"/>
+-<text font-size="14" x="336.5" y="19" font-family="Roboto" fill="#464646">
++<line stroke-width="2" x1="305" y1="15" x2="330" y2="15" stroke="#91CC75"/>
++<circle cx="317.5" cy="15" r="5.5" stroke-width="2" stroke="#91CC75" fill="#FFFFFF"/>
++<text font-size="14" x="333" y="19" font-family="Roboto" fill="#464646">
+ 日K
+ </text>
+ </g>
+diff --git a/asset/font/roboto_measure.txt b/asset/font/roboto_measure.txt
+index e79742b..ce464ad 100644
+--- a/asset/font/roboto_measure.txt
++++ b/asset/font/roboto_measure.txt
+@@ -901,7 +901,7 @@ U+FFFD 10x13 12x16 14x17 18x22
+ "1,234,567.89" 60x12 72x14 81x15 110x20
+ "Search Engine: 33.3%" 104x13 122x15 140x16 181x21
+ "AVAWA To. fi fl ffi" 88x11 103x13 120x14 153x18
+-"邮件营销" 19x10 23x12 27x13 32x17
++"邮件营销" 40x10 48x12 56x13 72x17
+ "😀" 4x10 5x12 6x13 8x17
+ "a\tb" 12x11 14x13 16x14 20x18
+ "\0\u{7f}" 0x10 0x12 0x13 0x17
+diff --git a/src/charts/bar_chart.rs b/src/charts/bar_chart.rs
+index 3081d5a..c4c9969 100644
+--- a/src/charts/bar_chart.rs
++++ b/src/charts/bar_chart.rs
+@@ -34,6 +34,10 @@ pub struct BarChart {
+     /// default) or in the middle of the bar (`Inside`), which suits stacked
+     /// bars.
+     pub series_label_position: Option<Position>,
++    /// ROE-PATCH: gap between bars of a group, percent of the bar width; `None` is 3px.
++    pub bar_gap_pct: Option<f32>,
++    /// ROE-PATCH: blank of a category band, percent of the bar width (gapWidth); `None` is 5px per side.
++    pub bar_margin_pct: Option<f32>,
+ }
+ 
+ impl std::ops::Deref for BarChart {
+@@ -154,6 +158,8 @@ impl BarChart {
+             self.animation.as_ref(),
+             self.tooltip.show,
+             self.series_label_position == Some(Position::Inside),
++            self.bar_gap_pct,
++            self.bar_margin_pct,
+         );
+ 
+         let mut line_series_labels_list = self.render_line(
+diff --git a/src/charts/base.rs b/src/charts/base.rs
+index 4b343c2..0cb452b 100644
+--- a/src/charts/base.rs
++++ b/src/charts/base.rs
+@@ -96,6 +96,10 @@ pub struct ChartBase {
+     /// Texts written over the chart: a copyright line, a watermark. One
+     /// that is to have room of its own asks for it with `reserve`.
+     pub texts: Vec<TextConfig>,
++    /// ROE-PATCH: explicit legend entries (name, color) replacing the ones
++    /// derived from the series; for charts whose legend is not the series
++    /// (waterfall increase/decrease/total). None = upstream behavior.
++    pub legend_override: Option<Vec<(String, Color)>>,
+ }
+ 
+ /// Gets y axis config by index.
+@@ -1051,11 +1055,12 @@ impl ChartBase {
+             return 0.0;
+         }
+         let legend_margin = self.legend.margin.unwrap_or_default();
+-        let rows = wrap_legends_to_rows(
++        let rows = super::component::wrap_legends_to_rows_with(
+             &self.font_family,
+             self.legend.font.size,
+             &legends,
+             width - legend_margin.left - legend_margin.right,
++            super::component::legend_marker_width(&self.legend.category),
+         );
+         (self.legend.font.size + LEGEND_MARGIN) * rows.len() as f32
+             + legend_margin.top
+@@ -1069,7 +1074,12 @@ impl ChartBase {
+         if legends.is_empty() {
+             return 0.0;
+         }
+-        let widths = measure_legend_widths(&self.font_family, self.legend.font.size, &legends);
++        let widths = super::component::measure_legend_widths_with(
++            &self.font_family,
++            self.legend.font.size,
++            &legends,
++            super::component::legend_marker_width(&self.legend.category),
++        );
+         let max_width = widths.iter().copied().fold(0.0_f32, f32::max);
+         let legend_margin = self.legend.margin.unwrap_or_default();
+         let margin_width = legend_margin.left + legend_margin.right;
+@@ -1205,11 +1215,12 @@ impl ChartBase {
+         }
+         let legends: Vec<&str> = entries.iter().map(|(name, _)| *name).collect();
+         let legend_width = width - margin.left - margin.right;
+-        let rows = wrap_legends_to_rows(
++        let rows = super::component::wrap_legends_to_rows_with(
+             &self.font_family,
+             self.legend.font.size,
+             &legends,
+             legend_width,
++            super::component::legend_marker_width(&self.legend.category),
+         );
+         let (mut left, mut right) = (f32::MAX, f32::MIN);
+         for (row_width, _) in rows.iter() {
+@@ -1253,12 +1264,22 @@ impl ChartBase {
+         if !self.legend.show.unwrap_or(true) {
+             return vec![];
+         }
++        if let Some(items) = &self.legend_override {
++            return items.iter().map(|(n, c)| (n.as_str(), *c)).collect();
++        }
+         self.series_list
+             .iter()
+             .enumerate()
+-            .map(|(index, series)| {
++            .filter_map(|(index, series)| {
++                // ROE-PATCH: the rings of nested pies repeat the slice names;
++                // only the first of each name is listed.
++                if series.ring > 0
++                    && self.series_list[..index].iter().any(|s| s.name == series.name)
++                {
++                    return None;
++                }
+                 let color = get_color(&self.series.colors, series.index.unwrap_or(index));
+-                (series.name.as_str(), color)
++                Some((series.name.as_str(), color))
+             })
+             .collect()
+     }
+@@ -1274,11 +1295,12 @@ impl ChartBase {
+         let legend_margin_value = legend_margin.top + legend_margin.bottom;
+         let mut legend_canvas = c.child(legend_margin);
+         let legend_canvas_width = legend_canvas.width();
+-        let rows = wrap_legends_to_rows(
++        let rows = super::component::wrap_legends_to_rows_with(
+             &self.font_family,
+             self.legend.font.size,
+             &legends,
+             legend_canvas_width,
++            super::component::legend_marker_width(&self.legend.category),
+         );
+         let mut current_legend_index = 0;
+         let legend_unit_height = self.legend.font.size + LEGEND_MARGIN;
+@@ -2045,6 +2067,8 @@ impl ChartBase {
+         animation: Option<&AnimationConfig>,
+         tooltip: bool,
+         label_inside: bool,
++        bar_chart_gap_pct: Option<f32>,
++        bar_chart_margin_pct: Option<f32>,
+     ) -> Vec<Vec<SeriesLabel>> {
+         if series_list.is_empty() {
+             return vec![];
+@@ -2063,7 +2087,6 @@ impl ChartBase {
+         let bar_chart_margin = 5.0_f32;
+         let bar_chart_gap = 3.0_f32;
+         let bar_chart_min_width = 1.0_f32;
+-        let bar_chart_margin_width = bar_chart_margin * 2.0;
+ 
+         // Assign each series a visual slot index.
+         // Non-stacked series each occupy their own slot.
+@@ -2090,6 +2113,27 @@ impl ChartBase {
+             return vec![];
+         }
+ 
++        // ROE-PATCH: margin (each side of a band) and gap (between slots) from
++        // percentages, as Office's gapWidth: gap = r * bar width. `None` keeps
++        // the fixed upstream values.
++        let (bar_chart_margin, bar_chart_gap, bar_chart_margin_width) = {
++            let n = slot_count as f32;
++            let margin = match bar_chart_margin_pct {
++                Some(p) if p.is_finite() => {
++                    let r = (p / 100.0).max(0.0);
++                    r * unit_width / (1.0 + r) / 2.0
++                }
++                _ => bar_chart_margin,
++            };
++            let gap = match bar_chart_gap_pct {
++                Some(p) if p.is_finite() => {
++                    let r = (p / 100.0).max(0.0);
++                    r * (unit_width - margin * 2.0).max(0.0) / (n + r * (n - 1.0))
++                }
++                _ => bar_chart_gap,
++            };
++            (margin, gap, margin * 2.0)
++        };
+         let bar_chart_gap_width = bar_chart_gap * (slot_count - 1) as f32;
+         // A narrow band (many categories in a small canvas) has less room than
+         // the fixed margins and gaps need, which would give a negative bar
+diff --git a/src/charts/canvas.rs b/src/charts/canvas.rs
+index f621dd9..0dd7168 100644
+--- a/src/charts/canvas.rs
++++ b/src/charts/canvas.rs
+@@ -451,7 +451,7 @@ impl Canvas {
+         let b = Box {
+             left: c.left,
+             top: c.top,
+-            right: c.left + measurement.width() + LEGEND_WIDTH,
++            right: c.left + measurement.width() + super::component::legend_marker_width(&c.category),
+             bottom: c.top + measurement.height(),
+         };
+         self.append(Component::Legend(c));
+diff --git a/src/charts/component.rs b/src/charts/component.rs
+index cc31d5a..f9a5498 100644
+--- a/src/charts/component.rs
++++ b/src/charts/component.rs
+@@ -2645,28 +2645,58 @@ pub(crate) static LEGEND_HEIGHT: f32 = 20.0;
+ pub(crate) static LEGEND_TEXT_MARGIN: f32 = 3.0;
+ pub(crate) static LEGEND_MARGIN: f32 = 8.0;
+ 
++/// ROE-PATCH: width of the marker area of a legend entry.
++pub(crate) fn legend_marker_width(category: &LegendCategory) -> f32 {
++    if *category == LegendCategory::Square {
++        10.0
++    } else {
++        LEGEND_WIDTH
++    }
++}
++
++#[allow(dead_code)]
+ pub(crate) fn measure_legend_widths(
+     font_family: &str,
+     font_size: f32,
+     legends: &[&str],
++) -> Vec<f32> {
++    measure_legend_widths_with(font_family, font_size, legends, LEGEND_WIDTH)
++}
++
++pub(crate) fn measure_legend_widths_with(
++    font_family: &str,
++    font_size: f32,
++    legends: &[&str],
++    marker_width: f32,
+ ) -> Vec<f32> {
+     legends
+         .iter()
+         .map(|item| {
+             let text_box = measure_text_width_family(font_family, font_size, item.to_owned())
+                 .unwrap_or_default();
+-            text_box.width() + LEGEND_WIDTH + LEGEND_TEXT_MARGIN
++            text_box.width() + marker_width + LEGEND_TEXT_MARGIN
+         })
+         .collect()
+ }
+ 
++#[allow(dead_code)]
+ pub(crate) fn wrap_legends_to_rows<'a>(
+     font_family: &str,
+     font_size: f32,
+     legends: &[&'a str],
+     max_width: f32,
+ ) -> Vec<(f32, Vec<&'a str>)> {
+-    let widths = measure_legend_widths(font_family, font_size, legends);
++    wrap_legends_to_rows_with(font_family, font_size, legends, max_width, LEGEND_WIDTH)
++}
++
++pub(crate) fn wrap_legends_to_rows_with<'a>(
++    font_family: &str,
++    font_size: f32,
++    legends: &[&'a str],
++    max_width: f32,
++    marker_width: f32,
++) -> Vec<(f32, Vec<&'a str>)> {
++    let widths = measure_legend_widths_with(font_family, font_size, legends, marker_width);
+     let mut rows = Vec::new();
+     let mut current_row_legends = Vec::new();
+     let mut current_row_width: f32 = 0.0;
+@@ -2719,6 +2749,8 @@ pub enum LegendCategory {
+     Circle,
+     /// A rectangular marker.
+     Rect,
++    /// ROE-PATCH: a 10x10 rounded square marker; the marker area is 10 wide.
++    Square,
+ }
+ 
+ #[derive(Clone, PartialEq, Debug, Default)]
+@@ -2783,6 +2815,23 @@ impl Legend {
+                     .svg(),
+                 );
+             }
++            LegendCategory::Square => {
++                let size = 10.0_f32;
++                data.push(
++                    Rect {
++                        color: self.stroke_color,
++                        fill: self.stroke_color.map(|c| c.into()),
++                        left: self.left,
++                        top: self.top + (LEGEND_HEIGHT - size) / 2.0,
++                        width: size,
++                        height: size,
++                        rx: Some(2.0),
++                        ry: Some(2.0),
++                        ..Default::default()
++                    }
++                    .svg(),
++                );
++            }
+             LegendCategory::Circle => {
+                 data.push(
+                     Circle {
+@@ -2831,8 +2880,12 @@ impl Legend {
+                 font_color: self.font_color,
+                 font_size: Some(self.font_size),
+                 font_weight: self.font_weight.clone(),
+-                x: Some(self.left + LEGEND_WIDTH + LEGEND_TEXT_MARGIN),
+-                y: Some(self.top + self.font_size),
++                x: Some(self.left + legend_marker_width(&self.category) + LEGEND_TEXT_MARGIN),
++                y: Some(if self.category == LegendCategory::Square {
++                    self.top + LEGEND_HEIGHT / 2.0 + self.font_size * 0.35
++                } else {
++                    self.top + self.font_size
++                }),
+                 ..Default::default()
+             }
+             .svg(),
+diff --git a/src/charts/font.rs b/src/charts/font.rs
+index 4703cce..fba2a92 100644
+--- a/src/charts/font.rs
++++ b/src/charts/font.rs
+@@ -616,6 +616,22 @@ impl<'a> Extent<'a> {
+         }
+         self.count += 1;
+ 
++        // ROE-PATCH: a full-width character is one em wide and stands on the
++        // baseline; position and line state stay as for any other glyph.
++        let em = self.scale * self.font.units_per_em;
++        if is_full_width(c) && em.is_finite() && em > 0.0 {
++            let w = em.ceil();
++            let right = self.position - self.line_start + w;
++            if right > self.right {
++                self.right = right;
++            }
++            if self.baseline > self.bottom {
++                self.bottom = self.baseline;
++            }
++            self.position += w;
++            return;
++        }
++
+         // A control character takes no room.
+         let glyph = if matches!(c, '\0'..='\x1F' | '\x7F') {
+             Glyph::default()
+@@ -662,6 +678,15 @@ impl<'a> Extent<'a> {
+ }
+ 
+ /// Measures the display area of text of a specified font size.
++/// ROE-PATCH: characters drawn by a CJK font as a full-width box. The bundled
++/// Roboto has no glyph for them, which would measure them as one narrow box.
++fn is_full_width(c: char) -> bool {
++    matches!(
++        c as u32,
++        0x2E80..=0x9FFF | 0xAC00..=0xD7AF | 0xF900..=0xFAFF | 0xFF00..=0xFFEF
++    )
++}
++
+ fn measure_text(font: &FontFace, font_size: f32, text: &str) -> Box {
+     let mut extent = Extent::new(font, font_size);
+     for c in text.chars() {
+diff --git a/src/charts/funnel_chart.rs b/src/charts/funnel_chart.rs
+index 3965a0e..f576ee9 100644
+--- a/src/charts/funnel_chart.rs
++++ b/src/charts/funnel_chart.rs
+@@ -44,6 +44,15 @@ pub struct FunnelChart {
+ 
+     /// Minimum trapezoid width for the narrowest end, in pixels (default: 20).
+     pub min_width: f32,
++
++    /// ROE-PATCH: if `true`, every stage is a rectangle (bottom width = top width). Default `false`.
++    pub funnel_rect: bool,
++
++    /// ROE-PATCH: if `true`, keep the series order instead of sorting by value. Default `false`.
++    pub funnel_keep_order: bool,
++
++    /// ROE-PATCH: stage outline (color, width). `None` keeps upstream behavior.
++    pub funnel_stroke: Option<(crate::Color, f32)>,
+ }
+ 
+ impl std::ops::Deref for FunnelChart {
+@@ -148,7 +157,8 @@ impl FunnelChart {
+             })
+             .collect();
+ 
+-        if self.sort_ascending {
++        if self.funnel_keep_order {
++        } else if self.sort_ascending {
+             stages.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+         } else {
+             stages.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+@@ -179,7 +189,9 @@ impl FunnelChart {
+         for (stage_idx, (color_idx, val, name)) in stages.iter().enumerate() {
+             let top_w = (val / max_val) * funnel_width;
+             // bottom width = next stage's width (or min_width for last stage)
+-            let bot_w = if stage_idx + 1 < n {
++            let bot_w = if self.funnel_rect {
++                top_w
++            } else if stage_idx + 1 < n {
+                 let next_val = stages[stage_idx + 1].1;
+                 ((next_val / max_val) * funnel_width).max(self.min_width)
+             } else {
+@@ -219,7 +231,8 @@ impl FunnelChart {
+                 });
+             }
+             c.polygon(Polygon {
+-                color: Some(color),
++                color: Some(self.funnel_stroke.map(|s| s.0).unwrap_or(color)),
++                style: self.funnel_stroke.map(|s| format!("stroke-width:{}", s.1)),
+                 fill: Some(color),
+                 points: vec![
+                     (x_left_top, y_top).into(),
+diff --git a/src/charts/horizontal_bar_chart.rs b/src/charts/horizontal_bar_chart.rs
+index 9616e5f..dcf6625 100644
+--- a/src/charts/horizontal_bar_chart.rs
++++ b/src/charts/horizontal_bar_chart.rs
+@@ -37,6 +37,8 @@ pub struct HorizontalBarChart {
+     // series
+     /// Position of the series value labels.
+     pub series_label_position: Option<Position>,
++    /// ROE-PATCH: blank share of each category row, 0..1; `None` is 5px per side.
++    pub bar_margin_pct: Option<f32>,
+ }
+ 
+ impl std::ops::Deref for HorizontalBarChart {
+@@ -290,7 +292,11 @@ impl HorizontalBarChart {
+             // `x_axis_data.len()`), not the first series' length: a short/empty
+             // first series must not divide by zero or misplace every bar.
+             let unit_height = c1.height().max(0.0) / category_count as f32;
+-            let bar_chart_margin = 5.0_f32;
++            // ROE-PATCH: `None` keeps the upstream 5px.
++            let bar_chart_margin = match self.bar_margin_pct {
++                Some(p) if p.is_finite() => unit_height * p.clamp(0.0, 0.95) / 2.0,
++                _ => 5.0_f32,
++            };
+             let bar_chart_gap = 3.0_f32;
+             let bar_chart_min_height = 1.0_f32;
+ 
+diff --git a/src/charts/params.rs b/src/charts/params.rs
+index 3466751..f1dd64e 100644
+--- a/src/charts/params.rs
++++ b/src/charts/params.rs
+@@ -181,6 +181,7 @@ pub(crate) fn get_legend_category_from_value(
+                 "rect" => LegendCategory::Rect,
+                 "round_rect" => LegendCategory::RoundRect,
+                 "circle" => LegendCategory::Circle,
++                "square" => LegendCategory::Square,
+                 _ => LegendCategory::Normal,
+             };
+             return Some(value);
+diff --git a/src/charts/pie_chart.rs b/src/charts/pie_chart.rs
+index 949f429..26016b7 100644
+--- a/src/charts/pie_chart.rs
++++ b/src/charts/pie_chart.rs
+@@ -61,6 +61,9 @@ pub struct PieChart {
+     /// Gap between two rings of nested pies (series with a `ring`), in
+     /// pixels; `None` is 6.
+     pub ring_gap: Option<f32>,
++    /// ROE-PATCH: stroke color of the slices (e.g. white separators); `None` is the
++    /// upstream output.
++    pub slice_stroke_color: Option<Color>,
+ }
+ 
+ impl std::ops::Deref for PieChart {
+@@ -316,6 +319,7 @@ impl PieChart {
+             };
+             let mut pie = Pie {
+                 fill: color.into(),
++                stroke_color: self.slice_stroke_color,
+                 cx,
+                 cy,
+                 r: cr,
+diff --git a/src/charts/waterfall_chart.rs b/src/charts/waterfall_chart.rs
+index 1fab9c1..e812541 100644
+--- a/src/charts/waterfall_chart.rs
++++ b/src/charts/waterfall_chart.rs
+@@ -68,7 +68,8 @@ pub struct WaterfallChart {
+     // x axis
+ 
+     // y axis
+-    y_axis_configs: Vec<YAxisConfig>,
++    /// ROE-PATCH: public, like the other charts (axis range and fonts).
++    pub y_axis_configs: Vec<YAxisConfig>,
+ 
+     // grid
+ 
+@@ -97,6 +98,10 @@ pub struct WaterfallChart {
+ 
+     /// Fraction of each x-unit occupied by a bar (0..1, default: 0.6).
+     pub bar_width_ratio: f32,
++    /// ROE-PATCH: show delta labels with their sign (-40 instead of 40).
++    pub label_signed: bool,
++    /// ROE-PATCH: corner radius of the bars; None keeps the upstream 2.0.
++    pub bar_radius: Option<f32>,
+ }
+ 
+ impl std::ops::Deref for WaterfallChart {
+@@ -421,8 +426,8 @@ impl WaterfallChart {
+                 top: y_high,
+                 width: bar_w,
+                 height: bar_h,
+-                rx: Some(2.0),
+-                ry: Some(2.0),
++                rx: Some(self.bar_radius.unwrap_or(2.0)),
++                ry: Some(self.bar_radius.unwrap_or(2.0)),
+                 title: tooltip_text.clone(),
+                 class: tooltip_text.as_ref().map(|_| "ct-trigger".to_string()),
+                 dataset: vec![
+@@ -455,7 +460,7 @@ impl WaterfallChart {
+                 let label_value = if item.is_total {
+                     bar_top_val
+                 } else {
+-                    item.value.abs()
++                    if self.label_signed { item.value } else { item.value.abs() }
+                 };
+                 let label_opt = LabelOption {
+                     value: label_value,

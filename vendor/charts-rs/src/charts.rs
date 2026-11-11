@@ -1,0 +1,211 @@
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+/// Compares `$actual` with the snapshot file `asset/$path`.
+///
+/// Run the suite with `UPDATE_SNAPSHOTS=1` to rewrite the snapshots from the
+/// current output instead of comparing, then review `git diff asset/`.
+#[cfg(test)]
+macro_rules! assert_snapshot {
+    ($path:literal, $actual:expr $(,)?) => {{
+        let actual: &str = &$actual;
+        let file = concat!(env!("CARGO_MANIFEST_DIR"), "/asset/", $path);
+        if std::env::var_os("UPDATE_SNAPSHOTS").is_some() {
+            std::fs::write(file, actual).expect("write snapshot");
+        } else {
+            pretty_assertions::assert_eq!(
+                include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/asset/", $path)),
+                actual
+            );
+        }
+    }};
+}
+
+/// Writes a generated file under `asset/` only when `UPDATE_SNAPSHOTS=1` is
+/// set, so a plain test run never dirties the checked-in preview images.
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) fn save_test_asset(path: &str, data: &[u8]) {
+    if std::env::var_os("UPDATE_SNAPSHOTS").is_some() {
+        let file = format!("{}/asset/{}", env!("CARGO_MANIFEST_DIR"), path);
+        std::fs::write(file, data).expect("write asset");
+    }
+}
+
+mod bar_chart;
+mod base;
+mod box_plot_chart;
+mod bullet_chart;
+mod calendar_chart;
+mod candlestick_chart;
+mod canvas;
+mod chord_chart;
+mod color;
+mod common;
+mod compact;
+mod component;
+#[cfg(feature = "raster")]
+mod encoder;
+mod error;
+mod font;
+mod funnel_chart;
+mod gantt_chart;
+mod gauge_chart;
+mod graph_chart;
+mod heatmap_chart;
+mod histogram_chart;
+mod horizontal_bar_chart;
+mod line_chart;
+mod lines_chart;
+mod map_chart;
+mod multi_chart;
+mod parallel_chart;
+mod params;
+mod path;
+mod pie_chart;
+mod polar_bar_chart;
+mod radar_chart;
+mod sankey_chart;
+mod scatter_chart;
+mod schema;
+mod sunburst_chart;
+mod table_chart;
+mod theme;
+mod theme_river_chart;
+mod tree_chart;
+mod treemap_chart;
+mod util;
+mod waterfall_chart;
+mod x_axis;
+
+pub use bar_chart::BarChart;
+pub use base::ChartBase;
+pub use box_plot_chart::{BoxPlotChart, BoxPlotSeries};
+pub use bullet_chart::{Bullet, BulletChart};
+pub use canvas::Canvas;
+pub use color::Color;
+pub use common::{
+    Align, AnimationConfig, AxisLabelOverflow, AxisScale, AxisType, Fill, FontConfig, GridConfig,
+    LegendConfig, LineStep, MarkArea, MarkLine, MarkLineCategory, MarkPoint, MarkPointCategory,
+    Position, Series, SeriesBand, SeriesCategory, SeriesConfig, SeriesLabel, SeriesLabelConfig,
+    Symbol, TextConfig, TitleConfig, TooltipConfig, XAxisConfig, YAxisConfig,
+};
+pub use compact::compact_svg;
+pub use component::{
+    Axis, Circle, Grid, Legend, LegendCategory, Line, Pie, Polygon, Polyline, Rect, Ribbon, Sector,
+    Shape, SmoothBand, SmoothLine, SmoothLineFill, StraightLine, StraightLineFill, Text,
+    svg_with_accessibility,
+};
+#[cfg(feature = "raster")]
+pub use encoder::*;
+pub use error::{Error, Result};
+
+pub use calendar_chart::CalendarChart;
+pub use candlestick_chart::{CandlestickChart, CandlestickStyle};
+pub use chord_chart::{ChordChart, ChordLink, ChordNode};
+pub use font::{
+    DEFAULT_FONT_DATA, DEFAULT_FONT_FAMILY, add_fonts, get_font_families, measure_text_width_family,
+};
+pub use funnel_chart::FunnelChart;
+pub use gantt_chart::{GanttChart, GanttTask};
+pub use gauge_chart::GaugeChart;
+pub use graph_chart::{GraphChart, GraphLink, GraphNode};
+pub use heatmap_chart::{HeatmapChart, HeatmapData, HeatmapSeries, HeatmapSymbol};
+pub use histogram_chart::HistogramChart;
+pub use horizontal_bar_chart::HorizontalBarChart;
+pub use line_chart::LineChart;
+pub use lines_chart::{FlowLine, LinesChart};
+pub use map_chart::{MapChart, MapProjection, MapRegion};
+pub use multi_chart::{ChildChart, MultiChart};
+pub use parallel_chart::ParallelChart;
+// Drawing helpers: public for compatibility, but not part of the documented
+// chart API.
+#[doc(hidden)]
+pub use path::{QuadraticBezier, SmoothCurve};
+pub use pie_chart::PieChart;
+pub use polar_bar_chart::{PolarAxis, PolarBarChart};
+pub use radar_chart::{RadarChart, RadarIndicator, RadarShape};
+pub use sankey_chart::{SankeyChart, SankeyLink, SankeyNode};
+pub use scatter_chart::{DensityContour, MarginalHistogram, Regression, ScatterChart};
+pub use sunburst_chart::{SunburstChart, SunburstData};
+pub use table_chart::{
+    SparklineType, TableBodyConfig, TableCellStyle, TableChart, TableHeaderConfig, TableSparkline,
+};
+pub use theme::Theme;
+pub use theme::{
+    THEME_ANT, THEME_CHALK, THEME_DARK, THEME_GRAFANA, THEME_LIGHT, THEME_SHADCN, THEME_SHINE,
+    THEME_VINTAGE, THEME_WALDEN, THEME_WESTEROS, add_theme, get_theme, list_theme_name,
+};
+pub use theme_river_chart::ThemeRiverChart;
+pub use tree_chart::{TreeChart, TreeData};
+pub use treemap_chart::TreemapChart;
+#[doc(hidden)]
+pub use util::{AxisValues, convert_to_points, get_quadrant};
+pub use util::{Box, Margin, NIL_VALUE, Point, format_string};
+pub use waterfall_chart::{WaterfallChart, WaterfallData};
+
+/// Behavior shared by every chart type, so mixed charts can be held and
+/// rendered uniformly (e.g. `Vec<Box<dyn Chart>>`).
+pub trait Chart {
+    /// Renders the chart to an SVG string.
+    fn svg(&self) -> Result<String>;
+    /// Creates the chart from a JSON string.
+    fn from_json(json: &str) -> Result<Self>
+    where
+        Self: Sized;
+}
+
+macro_rules! impl_chart {
+    ($($chart:ty),+ $(,)?) => {
+        $(
+            impl Chart for $chart {
+                fn svg(&self) -> Result<String> {
+                    <$chart>::svg(self)
+                }
+                fn from_json(json: &str) -> Result<Self> {
+                    <$chart>::from_json(json)
+                }
+            }
+        )+
+    };
+}
+impl_chart!(
+    BarChart,
+    BoxPlotChart,
+    BulletChart,
+    CalendarChart,
+    CandlestickChart,
+    ChordChart,
+    FunnelChart,
+    GanttChart,
+    GaugeChart,
+    GraphChart,
+    HeatmapChart,
+    HistogramChart,
+    HorizontalBarChart,
+    LineChart,
+    LinesChart,
+    MapChart,
+    MultiChart,
+    ParallelChart,
+    PieChart,
+    PolarBarChart,
+    RadarChart,
+    SankeyChart,
+    ScatterChart,
+    SunburstChart,
+    TableChart,
+    ThemeRiverChart,
+    TreeChart,
+    TreemapChart,
+    WaterfallChart,
+);

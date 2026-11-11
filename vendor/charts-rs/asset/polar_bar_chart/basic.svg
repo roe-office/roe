@@ -1,0 +1,92 @@
+<svg width="600" height="400" viewBox="0 0 600 400" xmlns="http://www.w3.org/2000/svg">
+<rect x="0" y="0" width="600" height="400" fill="#FFFFFF"/>
+<text font-size="18" x="276.5" y="5" dy="15" font-weight="bold" dominant-baseline="middle" font-family="Roboto" fill="#464646">
+Visits
+</text>
+<g>
+<line stroke-width="2" x1="227.5" y1="50" x2="252.5" y2="50" stroke="#5470C6"/>
+<circle cx="240" cy="50" r="5.5" stroke-width="2" stroke="#5470C6" fill="#FFFFFF"/>
+<text font-size="14" x="255.5" y="54" font-family="Roboto" fill="#464646">
+Email
+</text>
+</g>
+<g>
+<line stroke-width="2" x1="296.5" y1="50" x2="321.5" y2="50" stroke="#91CC75"/>
+<circle cx="309" cy="50" r="5.5" stroke-width="2" stroke="#91CC75" fill="#FFFFFF"/>
+<text font-size="14" x="324.5" y="54" font-family="Roboto" fill="#464646">
+Search
+</text>
+</g>
+<circle cx="300" cy="228.5" r="24.1" stroke-width="1" stroke="#E0E6F2" fill="none"/>
+<circle cx="300" cy="228.5" r="48.2" stroke-width="1" stroke="#E0E6F2" fill="none"/>
+<circle cx="300" cy="228.5" r="72.2" stroke-width="1" stroke="#E0E6F2" fill="none"/>
+<circle cx="300" cy="228.5" r="96.3" stroke-width="1" stroke="#E0E6F2" fill="none"/>
+<circle cx="300" cy="228.5" r="120.4" stroke-width="1" stroke="#E0E6F2" fill="none"/>
+<circle cx="300" cy="228.5" r="144.5" stroke-width="1" stroke="#E0E6F2" fill="none"/>
+<line stroke-width="1" x1="300" y1="228.5" x2="300" y2="84" stroke="#E0E6F2"/>
+<line stroke-width="1" x1="300" y1="228.5" x2="413" y2="138.4" stroke="#E0E6F2"/>
+<line stroke-width="1" x1="300" y1="228.5" x2="440.9" y2="260.7" stroke="#E0E6F2"/>
+<line stroke-width="1" x1="300" y1="228.5" x2="362.7" y2="358.7" stroke="#E0E6F2"/>
+<line stroke-width="1" x1="300" y1="228.5" x2="237.3" y2="358.7" stroke="#E0E6F2"/>
+<line stroke-width="1" x1="300" y1="228.5" x2="159.1" y2="260.7" stroke="#E0E6F2"/>
+<line stroke-width="1" x1="300" y1="228.5" x2="187" y2="138.4" stroke="#E0E6F2"/>
+<path d="M304.3,180.5 A48.2 48.2 0 0 1 320.9,185.1 L300,228.5 Z" fill="#5470C6" data-series="Email" data-category="Mon" data-value="120"/>
+<path d="M344.2,199.3 A53 53 0 0 1 351.7,216.7 L300,228.5 Z" fill="#5470C6" data-series="Email" data-category="Tue" data-value="132"/>
+<path d="M338.6,241 A40.5 40.5 0 0 1 331.7,253.8 L300,228.5 Z" fill="#5470C6" data-series="Email" data-category="Wed" data-value="101"/>
+<path d="M318.9,278.9 A53.8 53.8 0 0 1 300,282.3 L300,228.5 Z" fill="#5470C6" data-series="Email" data-category="Thu" data-value="134"/>
+<path d="M281.5,259.5 A36.1 36.1 0 0 1 271.8,251 L300,228.5 Z" fill="#5470C6" data-series="Email" data-category="Fri" data-value="90"/>
+<path d="M208.5,240.9 A92.3 92.3 0 0 1 210,208 L300,228.5 Z" fill="#5470C6" data-series="Email" data-category="Sat" data-value="230"/>
+<path d="M239.1,170.2 A84.3 84.3 0 0 1 263.4,152.6 L300,228.5 Z" fill="#5470C6" data-series="Email" data-category="Sun" data-value="210"/>
+<path d="M338.3,148.9 A88.3 88.3 0 0 1 363.8,167.5 L300,228.5 Z" fill="#91CC75" data-series="Search" data-category="Mon" data-value="220"/>
+<path d="M371.2,212.2 A73.1 73.1 0 0 1 372.4,238.3 L300,228.5 Z" fill="#91CC75" data-series="Search" data-category="Tue" data-value="182"/>
+<path d="M359.9,276.3 A76.7 76.7 0 0 1 339.3,294.3 L300,228.5 Z" fill="#91CC75" data-series="Search" data-category="Wed" data-value="191"/>
+<path d="M300,322.4 A93.9 93.9 0 0 1 267,316.4 L300,228.5 Z" fill="#91CC75" data-series="Search" data-category="Thu" data-value="234"/>
+<path d="M209,301.1 A116.4 116.4 0 0 1 189.3,264.5 L300,228.5 Z" fill="#91CC75" data-series="Search" data-category="Fri" data-value="290"/>
+<path d="M170.9,199 A132.5 132.5 0 0 1 189.5,155.5 L300,228.5 Z" fill="#91CC75" data-series="Search" data-category="Sat" data-value="330"/>
+<path d="M246,116.4 A124.4 124.4 0 0 1 288.8,104.6 L300,228.5 Z" fill="#91CC75" data-series="Search" data-category="Sun" data-value="310"/>
+<rect x="269" y="85" width="28" height="14" rx="2" ry="2" fill="#FFFFFF" fill-opacity="0.78"/>
+<text font-size="14" x="295" y="92" dominant-baseline="central" text-anchor="end" font-family="Roboto" fill="#6E7079">
+360
+</text>
+<rect x="269" y="109.1" width="28" height="14" rx="2" ry="2" fill="#FFFFFF" fill-opacity="0.78"/>
+<text font-size="14" x="295" y="116.1" dominant-baseline="central" text-anchor="end" font-family="Roboto" fill="#6E7079">
+300
+</text>
+<rect x="269" y="133.2" width="28" height="14" rx="2" ry="2" fill="#FFFFFF" fill-opacity="0.78"/>
+<text font-size="14" x="295" y="140.2" dominant-baseline="central" text-anchor="end" font-family="Roboto" fill="#6E7079">
+240
+</text>
+<rect x="269" y="157.2" width="28" height="14" rx="2" ry="2" fill="#FFFFFF" fill-opacity="0.78"/>
+<text font-size="14" x="295" y="164.2" dominant-baseline="central" text-anchor="end" font-family="Roboto" fill="#6E7079">
+180
+</text>
+<rect x="269" y="181.3" width="28" height="14" rx="2" ry="2" fill="#FFFFFF" fill-opacity="0.78"/>
+<text font-size="14" x="295" y="188.3" dominant-baseline="central" text-anchor="end" font-family="Roboto" fill="#6E7079">
+120
+</text>
+<rect x="277" y="205.4" width="20" height="14" rx="2" ry="2" fill="#FFFFFF" fill-opacity="0.78"/>
+<text font-size="14" x="295" y="212.4" dominant-baseline="central" text-anchor="end" font-family="Roboto" fill="#6E7079">
+60
+</text>
+<text font-size="14" x="365.3" y="92.9" dominant-baseline="central" text-anchor="start" font-family="Roboto" fill="#6E7079">
+Mon
+</text>
+<text font-size="14" x="446.7" y="195" dominant-baseline="central" text-anchor="start" font-family="Roboto" fill="#6E7079">
+Tue
+</text>
+<text font-size="14" x="417.7" y="322.3" dominant-baseline="central" text-anchor="start" font-family="Roboto" fill="#6E7079">
+Wed
+</text>
+<text font-size="14" x="300" y="386" dominant-baseline="central" text-anchor="middle" font-family="Roboto" fill="#6E7079">
+Thu
+</text>
+<text font-size="14" x="182.3" y="322.3" dominant-baseline="central" text-anchor="end" font-family="Roboto" fill="#6E7079">
+Fri
+</text>
+<text font-size="14" x="153.3" y="195" dominant-baseline="central" text-anchor="end" font-family="Roboto" fill="#6E7079">
+Sat
+</text>
+<text font-size="14" x="234.7" y="92.9" dominant-baseline="central" text-anchor="end" font-family="Roboto" fill="#6E7079">
+Sun
+</text>
+</svg>

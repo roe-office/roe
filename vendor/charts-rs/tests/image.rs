@@ -1,0 +1,1351 @@
+mod common;
+
+#[test]
+#[cfg(feature = "image-encoder")]
+fn generate_image() {
+    use charts_rs::{
+        Align, BarChart, Box, BoxPlotChart, BoxPlotSeries, CalendarChart, CandlestickChart,
+        FunnelChart, GaugeChart, HeatmapChart, HorizontalBarChart, LineChart, MarkLine,
+        MarkLineCategory, MultiChart, PieChart, RadarChart, ScatterChart, SeriesCategory,
+        SunburstChart, THEME_GRAFANA, TableCellStyle, TableChart, TreemapChart, WaterfallChart,
+        svg_to_avif, svg_to_png, svg_to_webp,
+    };
+    // bar chart
+    let mut bar_chart = BarChart::new_with_theme(
+        vec![
+            ("Evaporation", vec![2.0, 4.9, 7.0, 23.2, 25.6, 76.7, 135.6]).into(),
+            (
+                "Precipitation",
+                vec![2.6, 5.9, 9.0, 26.4, 28.7, 70.7, 175.6],
+            )
+                .into(),
+            ("Temperature", vec![2.0, 2.2, 3.3, 4.5, 6.3, 10.2, 20.3]).into(),
+        ],
+        vec![
+            "Mon".to_string(),
+            "Tue".to_string(),
+            "Wed".to_string(),
+            "Thu".to_string(),
+            "Fri".to_string(),
+            "Sat".to_string(),
+            "Sun".to_string(),
+        ],
+        THEME_GRAFANA,
+    );
+    bar_chart.title.text = "Mixed Line and Bar".to_string();
+    bar_chart.legend.margin = Some(Box {
+        top: bar_chart.title.height,
+        bottom: 5.0,
+        ..Default::default()
+    });
+    bar_chart.series_list[2].category = Some(SeriesCategory::Line);
+    bar_chart.series_list[2].y_axis_index = 1;
+    bar_chart.series_list[2].label_show = true;
+    bar_chart.x_axis.name_rotate = 0.785;
+
+    bar_chart
+        .y_axis_configs
+        .push(bar_chart.y_axis_configs[0].clone());
+    bar_chart.y_axis_configs[0].formatter = Some("{c} ml".to_string());
+    bar_chart.y_axis_configs[1].formatter = Some("{c} °C".to_string());
+
+    let buf = svg_to_png(&bar_chart.svg().unwrap()).unwrap();
+    common::save_asset("image/mix-line-bar.png", &buf);
+
+    // horizontal bar chart
+    let mut horizontal_bar_chart = HorizontalBarChart::new_with_theme(
+        vec![
+            (
+                "2011",
+                vec![18203.0, 23489.0, 29034.0, 104970.0, 131744.0, 630230.0],
+            )
+                .into(),
+            (
+                "2012",
+                vec![19325.0, 23438.0, 31000.0, 121594.0, 134141.0, 681807.0],
+            )
+                .into(),
+        ],
+        vec![
+            "Brazil".to_string(),
+            "Indonesia".to_string(),
+            "USA".to_string(),
+            "India".to_string(),
+            "China".to_string(),
+            "World".to_string(),
+        ],
+        THEME_GRAFANA,
+    );
+    for series_list in horizontal_bar_chart.series_list.iter_mut() {
+        series_list.label_show = true;
+    }
+    horizontal_bar_chart.margin.right = 30.0;
+    horizontal_bar_chart.title.text = "World Population".to_string();
+    horizontal_bar_chart.title.align = Align::Left;
+    let buf = svg_to_png(&horizontal_bar_chart.svg().unwrap()).unwrap();
+    common::save_asset("image/horizontal-bar.png", &buf);
+
+    // line chart
+    let mut line_chart = LineChart::new_with_theme(
+        vec![
+            (
+                "Email & Instagram",
+                vec![120.0, 132.0, 101.0, 134.0, 90.0, 230.0, 210.0],
+            )
+                .into(),
+            (
+                "Union Ads",
+                vec![220.0, 182.0, 191.0, 234.0, 290.0, 330.0, 310.0],
+            )
+                .into(),
+            (
+                "Direct",
+                vec![320.0, 332.0, 301.0, 334.0, 390.0, 330.0, 320.0],
+            )
+                .into(),
+            (
+                "Search Engine",
+                vec![820.0, 932.0, 901.0, 934.0, 1290.0, 1330.0, 1320.0],
+            )
+                .into(),
+        ],
+        vec![
+            "Mon & Mo".to_string(),
+            "Tue".to_string(),
+            "Wed".to_string(),
+            "Thu".to_string(),
+            "Fri".to_string(),
+            "Sat".to_string(),
+            "Sun".to_string(),
+        ],
+        THEME_GRAFANA,
+    );
+    line_chart.margin.right = 50.0;
+    line_chart.title.text = "Smoothed Line & Instagram Chart".to_string();
+    line_chart.legend.margin = Some(Box {
+        top: line_chart.title.height,
+        bottom: 5.0,
+        ..Default::default()
+    });
+    line_chart.series.smooth = true;
+    line_chart.series_list[3].label_show = true;
+    line_chart.series_list[3].mark_lines = vec![MarkLine {
+        category: MarkLineCategory::Average,
+        ..Default::default()
+    }];
+    let buf = svg_to_png(&line_chart.svg().unwrap()).unwrap();
+    common::save_asset("image/line.png", &buf);
+
+    // pie chart
+    let mut pie_chart = PieChart::new_with_theme(
+        vec![
+            ("rose 1", vec![40.0]).into(),
+            ("rose 2", vec![38.0]).into(),
+            ("rose 3", vec![32.0]).into(),
+            ("rose 4", vec![30.0]).into(),
+            ("rose 5", vec![28.0]).into(),
+            ("rose 6", vec![26.0]).into(),
+            ("rose 7", vec![22.0]).into(),
+            ("rose 8", vec![18.0]).into(),
+        ],
+        THEME_GRAFANA,
+    );
+    pie_chart.title.text = "Nightingale Chart".to_string();
+    pie_chart.sub_title.text = "Fake Data".to_string();
+    let buf = svg_to_png(&pie_chart.svg().unwrap()).unwrap();
+    common::save_asset("image/pie.png", &buf);
+
+    // radar chart
+    let radar_chart = RadarChart::new_with_theme(
+        vec![
+            (
+                "Allocated Budget",
+                vec![4200.0, 3000.0, 20000.0, 35000.0, 50000.0, 18000.0],
+            )
+                .into(),
+            (
+                "Actual Spending",
+                vec![5000.0, 14000.0, 28000.0, 26000.0, 42000.0, 21000.0],
+            )
+                .into(),
+        ],
+        vec![
+            ("Sales", 6500.0).into(),
+            ("Administration", 16000.0).into(),
+            ("Information Technology", 30000.0).into(),
+            ("Customer Support", 38000.0).into(),
+            ("Development", 52000.0).into(),
+            ("Marketing", 25000.0).into(),
+        ],
+        THEME_GRAFANA,
+    );
+    let buf = svg_to_png(&radar_chart.svg().unwrap()).unwrap();
+    common::save_asset("image/radar.png", &buf);
+
+    // scatter chart
+    let mut scatter_chart = ScatterChart::new_with_theme(
+        vec![
+            (
+                "Female",
+                vec![
+                    161.2, 51.6, 167.5, 59.0, 159.5, 49.2, 157.0, 63.0, 155.8, 53.6, 170.0, 59.0,
+                    159.1, 47.6, 166.0, 69.8, 176.2, 66.8, 160.2, 75.2, 172.5, 55.2, 170.9, 54.2,
+                    172.9, 62.5, 153.4, 42.0, 160.0, 50.0, 147.2, 49.8, 168.2, 49.2, 175.0, 73.2,
+                    157.0, 47.8, 167.6, 68.8, 159.5, 50.6, 175.0, 82.5, 166.8, 57.2, 176.5, 87.8,
+                    170.2, 72.8,
+                ],
+            )
+                .into(),
+            (
+                "Male",
+                vec![
+                    174.0, 65.6, 175.3, 71.8, 193.5, 80.7, 186.5, 72.6, 187.2, 78.8, 181.5, 74.8,
+                    184.0, 86.4, 184.5, 78.4, 175.0, 62.0, 184.0, 81.6, 180.0, 76.6, 177.8, 83.6,
+                    192.0, 90.0, 176.0, 74.6, 174.0, 71.0, 184.0, 79.6, 192.7, 93.8, 171.5, 70.0,
+                    173.0, 72.4, 176.0, 85.9, 176.0, 78.8, 180.5, 77.8, 172.7, 66.2, 176.0, 86.4,
+                    173.5, 81.8,
+                ],
+            )
+                .into(),
+        ],
+        THEME_GRAFANA,
+    );
+
+    scatter_chart.title.text = "Male and female height and weight distribution".to_string();
+    scatter_chart.margin.right = 20.0;
+    scatter_chart.title.align = Align::Left;
+    scatter_chart.sub_title.text = "Data from: Heinz 2003".to_string();
+    scatter_chart.sub_title.align = Align::Left;
+    scatter_chart.legend.align = Align::Right;
+    scatter_chart.y_axis_configs[0].min = Some(40.0);
+    scatter_chart.y_axis_configs[0].max = Some(130.0);
+    scatter_chart.y_axis_configs[0].formatter = Some("{c} kg".to_string());
+
+    scatter_chart.x_axis_config.min = Some(140.0);
+    scatter_chart.x_axis_config.max = Some(230.0);
+    scatter_chart.x_axis_config.formatter = Some("{c} cm".to_string());
+
+    scatter_chart.series_symbol_sizes = vec![6.0, 6.0];
+    let buf = svg_to_png(&scatter_chart.svg().unwrap()).unwrap();
+    common::save_asset("image/scatter.png", &buf);
+
+    let mut candlestick_chart = CandlestickChart::new_with_theme(
+        vec![
+            // 从第6个点开始
+            (
+                "MA5",
+                vec![
+                    2352.93, 2378.48, 2394.81, 2409.64, 2420.04, 2426.66, 2429.33, 2428.01,
+                    2417.97, 2410.51, 2391.99, 2368.35, 2349.20, 2331.29, 2314.49, 2322.42,
+                    2331.49, 2321.01, 2327.60, 2334.39, 2326.13, 2317.95, 2325.39, 2317.45,
+                    2300.81, 2290.01, 2281.96, 2267.85, 2262.02, 2272.7, 2283.49, 2293.46, 2310.80,
+                    2318.85, 2315.63, 2298.04, 2279.71, 2261.25, 2247.26, 2232.06, 2227.12,
+                    2224.95, 2223.30, 2221.66, 2217.96, 2212.03, 2205.85, 2199.38, 2194.99,
+                    2202.56, 2214.61, 2212.55, 2217.45, 2217.79, 2204.45,
+                ],
+            )
+                .into(),
+            (
+                "K",
+                vec![
+                    2320.26, 2320.26, 2287.3, 2362.94, 2300.0, 2291.3, 2288.26, 2308.38, 2295.35,
+                    2346.5, 2295.35, 2346.92, 2347.22, 2358.98, 2337.35, 2363.8, 2360.75, 2382.48,
+                    2347.89, 2383.76, 2383.43, 2385.42, 2371.23, 2391.82, 2377.41, 2419.02,
+                    2369.57, 2421.15, 2425.92, 2428.15, 2417.58, 2440.38, 2411.0, 2433.13, 2403.3,
+                    2437.42, 2432.68, 2434.48, 2427.7, 2441.73, 2430.69, 2418.53, 2394.22, 2433.89,
+                    2416.62, 2432.4, 2414.4, 2443.03, 2441.91, 2421.56, 2415.43, 2444.8, 2420.26,
+                    2382.91, 2373.53, 2427.07, 2383.49, 2397.18, 2370.61, 2397.94, 2378.82,
+                    2325.95, 2309.17, 2378.82, 2322.94, 2314.16, 2308.76, 2330.88, 2320.62,
+                    2325.82, 2315.01, 2338.78, 2313.74, 2293.34, 2289.89, 2340.71, 2297.77,
+                    2313.22, 2292.03, 2324.63, 2322.32, 2365.59, 2308.92, 2366.16, 2364.54,
+                    2359.51, 2330.86, 2369.65, 2332.08, 2273.4, 2259.25, 2333.54, 2274.81, 2326.31,
+                    2270.1, 2328.14, 2333.61, 2347.18, 2321.6, 2351.44, 2340.44, 2324.29, 2304.27,
+                    2352.02, 2326.42, 2318.61, 2314.59, 2333.67, 2314.68, 2310.59, 2296.58,
+                    2320.96, 2309.16, 2286.6, 2264.83, 2333.29, 2282.17, 2263.97, 2253.25, 2286.33,
+                    2255.77, 2270.28, 2253.31, 2276.22, 2269.31, 2278.4, 2250.0, 2312.08, 2267.29,
+                    2240.02, 2239.21, 2276.05, 2244.26, 2257.43, 2232.02, 2261.31, 2257.74,
+                    2317.37, 2257.42, 2317.86, 2318.21, 2324.24, 2311.6, 2330.81, 2321.4, 2328.28,
+                    2314.97, 2332.0, 2334.74, 2326.72, 2319.91, 2344.89, 2318.58, 2297.67, 2281.12,
+                    2319.99, 2299.38, 2301.26, 2289.0, 2323.48, 2273.55, 2236.3, 2232.91, 2273.55,
+                    2238.49, 2236.62, 2228.81, 2246.87, 2229.46, 2234.4, 2227.31, 2243.95, 2234.9,
+                    2227.74, 2220.44, 2253.42, 2232.69, 2225.29, 2217.25, 2241.34, 2196.24,
+                    2211.59, 2180.67, 2212.59, 2215.47, 2225.77, 2215.47, 2234.73, 2224.93,
+                    2226.13, 2212.56, 2233.04, 2236.98, 2219.55, 2217.26, 2242.48, 2218.09,
+                    2206.78, 2204.44, 2226.26, 2199.91, 2181.94, 2177.39, 2204.99, 2169.63,
+                    2194.85, 2165.78, 2196.43, 2195.03, 2193.8, 2178.47, 2197.51, 2181.82, 2197.6,
+                    2175.44, 2206.03, 2201.12, 2244.64, 2200.58, 2250.11, 2236.4, 2242.17, 2232.26,
+                    2245.12, 2242.62, 2184.54, 2182.81, 2242.62, 2187.35, 2218.32, 2184.11,
+                    2226.12, 2213.19, 2199.31, 2191.85, 2224.63, 2203.89, 2177.91, 2173.86,
+                    2210.58,
+                ],
+            )
+                .into(),
+        ],
+        vec![
+            "2013/1/24".to_string(),
+            "2013/1/25".to_string(),
+            "2013/1/28".to_string(),
+            "2013/1/29".to_string(),
+            "2013/1/30".to_string(),
+            "2013/1/31".to_string(),
+            "2013/2/1".to_string(),
+            "2013/2/4".to_string(),
+            "2013/2/5".to_string(),
+            "2013/2/6".to_string(),
+            "2013/2/7".to_string(),
+            "2013/2/8".to_string(),
+            "2013/2/18".to_string(),
+            "2013/2/19".to_string(),
+            "2013/2/20".to_string(),
+            "2013/2/21".to_string(),
+            "2013/2/22".to_string(),
+            "2013/2/25".to_string(),
+            "2013/2/26".to_string(),
+            "2013/2/27".to_string(),
+            "2013/2/28".to_string(),
+            "2013/3/1".to_string(),
+            "2013/3/4".to_string(),
+            "2013/3/5".to_string(),
+            "2013/3/6".to_string(),
+            "2013/3/7".to_string(),
+            "2013/3/8".to_string(),
+            "2013/3/11".to_string(),
+            "2013/3/12".to_string(),
+            "2013/3/13".to_string(),
+            "2013/3/14".to_string(),
+            "2013/3/15".to_string(),
+            "2013/3/18".to_string(),
+            "2013/3/18".to_string(),
+            "2013/3/20".to_string(),
+            "2013/3/21".to_string(),
+            "2013/3/22".to_string(),
+            "2013/3/25".to_string(),
+            "2013/3/26".to_string(),
+            "2013/3/27".to_string(),
+            "2013/3/28".to_string(),
+            "2013/3/29".to_string(),
+            "2013/4/1".to_string(),
+            "2013/4/2".to_string(),
+            "2013/4/3".to_string(),
+            "2013/4/8".to_string(),
+            "2013/4/9".to_string(),
+            "2013/4/10".to_string(),
+            "2013/4/11".to_string(),
+            "2013/4/12".to_string(),
+            "2013/4/15".to_string(),
+            "2013/4/16".to_string(),
+            "2013/4/17".to_string(),
+            "2013/4/18".to_string(),
+            "2013/4/19".to_string(),
+            "2013/4/22".to_string(),
+            "2013/4/23".to_string(),
+            "2013/4/24".to_string(),
+            "2013/4/25".to_string(),
+            "2013/4/26".to_string(),
+        ],
+        THEME_GRAFANA,
+    );
+    candlestick_chart.series_list[0].category = Some(SeriesCategory::Line);
+    candlestick_chart.series_list[0].start_index = 5;
+    candlestick_chart.y_axis_configs[0].min = Some(2100.0);
+    candlestick_chart.y_axis_configs[0].max = Some(2460.0);
+    candlestick_chart.y_axis_configs[0].formatter = Some("{t}".to_string());
+    let buf = svg_to_png(&candlestick_chart.svg().unwrap()).unwrap();
+    common::save_asset("image/candlestick.png", &buf);
+    candlestick_chart.candlestick_style = charts_rs::CandlestickStyle::Ohlc;
+    let buf = svg_to_png(&candlestick_chart.svg().unwrap()).unwrap();
+    common::save_asset("image/candlestick-ohlc.png", &buf);
+
+    // table chart
+    let mut table_chart = TableChart::new_with_theme(
+        vec![
+            vec![
+                "Name".to_string(),
+                "Price".to_string(),
+                "Change".to_string(),
+            ],
+            vec![
+                "Datadog Inc".to_string(),
+                "97.32".to_string(),
+                "-7.49%".to_string(),
+            ],
+            vec![
+                "Hashicorp Inc".to_string(),
+                "28.66".to_string(),
+                "-9.25%".to_string(),
+            ],
+            vec![
+                "Gitlab Inc".to_string(),
+                "51.63".to_string(),
+                "+4.32%".to_string(),
+            ],
+        ],
+        THEME_GRAFANA,
+    );
+    let green = "#2d7c2b".into();
+    let red = "#a93b01".into();
+    table_chart.cell_styles = vec![
+        TableCellStyle {
+            indexes: vec![1, 2],
+            font_weight: Some("bold".to_string()),
+            background_color: Some(green),
+            ..Default::default()
+        },
+        TableCellStyle {
+            indexes: vec![2, 2],
+            font_weight: Some("bold".to_string()),
+            background_color: Some(green),
+            ..Default::default()
+        },
+        TableCellStyle {
+            indexes: vec![3, 2],
+            font_weight: Some("bold".to_string()),
+            background_color: Some(red),
+            ..Default::default()
+        },
+    ];
+    table_chart.title.text = "NASDAQ".to_string();
+    let buf = svg_to_avif(&table_chart.svg().unwrap()).unwrap();
+    common::save_asset("image/table.avif", &buf);
+
+    let sparkline =
+        charts_rs::TableChart::from_json(include_str!("../asset/table_chart/sparkline.json"))
+            .unwrap();
+    let buf = svg_to_png(&sparkline.svg().unwrap()).unwrap();
+    common::save_asset("image/table-sparkline.png", &buf);
+
+    let multi_chart_json = r###"{
+            "type": "multi_chart",
+            "margin": {
+              "left": 10,
+              "top": 10,
+              "right": 10,
+              "bottom": 10
+            },
+            "background_color": "#fff",
+            "child_charts": [
+              {
+                "quality": 80,
+                "width": 400,
+                "height": 300,
+                "margin": {
+                  "left": 5,
+                  "top": 5,
+                  "right": 5,
+                  "bottom": 5
+                },
+                "font_family": "Roboto",
+                "title_font_size": 18,
+                "title_font_weight": "bold",
+                "title_margin": {
+                  "left": 0,
+                  "top": 0,
+                  "right": 0,
+                  "bottom": 0
+                },
+                "title_align": "right",
+                "title_height": 30,
+                "sub_title_text": "Sub Title",
+                "sub_title_font_size": 14,
+                "sub_title_margin": {
+                  "left": 0,
+                  "top": 0,
+                  "right": 0,
+                  "bottom": 0
+                },
+                "sub_title_align": "center",
+                "sub_title_height": 20,
+                "legend_font_size": 14,
+                "legend_align": "left",
+                "legend_margin": {
+                  "left": 0,
+                  "top": 0,
+                  "right": 0,
+                  "bottom": 0
+                },
+                "legend_category": "normal",
+                "legend_show": true,
+                "x_axis_height": 30,
+                "x_axis_font_size": 14,
+                "x_axis_name_gap": 5,
+                "x_axis_name_rotate": 0,
+                "x_boundary_gap": true,
+                "x_axis_margin": {
+                  "left": 0,
+                  "top": 0,
+                  "right": 0,
+                  "bottom": 0
+                },
+                "type": "bar",
+                "title_text": "Bar Chart",
+                "x_axis_data": [
+                  "Mon",
+                  "Tue",
+                  "Wed",
+                  "Thu",
+                  "Fri",
+                  "Sat",
+                  "Sun"
+                ],
+                "series_list": [
+                  {
+                    "name": "Email",
+                    "label_show": true,
+                    "data": [
+                      120,
+                      132,
+                      101,
+                      134,
+                      90,
+                      230,
+                      210
+                    ]
+                  },
+                  {
+                    "name": "Union Ads",
+                    "label_show": true,
+                    "data": [
+                      220,
+                      182,
+                      191,
+                      234,
+                      290,
+                      330,
+                      310
+                    ]
+                  }
+                ]
+              },
+              {
+                "quality": 80,
+                "width": 400,
+                "height": 300,
+                "margin": {
+                  "left": 15,
+                  "top": 15,
+                  "right": 15,
+                  "bottom": 15
+                },
+                "font_family": "Roboto",
+                "title_font_size": 18,
+                "title_font_weight": "bold",
+                "title_margin": {
+                  "left": 0,
+                  "top": 0,
+                  "right": 0,
+                  "bottom": 0
+                },
+                "title_align": "left",
+                "title_height": 30,
+                "sub_title_text": "Sub Title",
+                "sub_title_font_size": 14,
+                "sub_title_margin": {
+                  "left": 0,
+                  "top": 0,
+                  "right": 0,
+                  "bottom": 0
+                },
+                "sub_title_align": "center",
+                "sub_title_height": 20,
+                "legend_font_size": 14,
+                "legend_align": "right",
+                "legend_margin": {
+                  "left": 0,
+                  "top": 0,
+                  "right": 0,
+                  "bottom": 0
+                },
+                "legend_category": "round_rect",
+                "legend_show": true,
+                "x_axis_height": 30,
+                "x_axis_font_size": 14,
+                "x_axis_name_gap": 5,
+                "x_axis_name_rotate": 0,
+                "x_boundary_gap": false,
+                "x_axis_margin": {
+                  "left": 0,
+                  "top": 0,
+                  "right": 0,
+                  "bottom": 0
+                },
+                "x": 420,
+                "y": 10,
+                "type": "line",
+                "title_text": "Line Chart",
+                "x_axis_data": [
+                  "Mon",
+                  "Tue",
+                  "Wed",
+                  "Thu",
+                  "Fri",
+                  "Sat",
+                  "Sun"
+                ],
+                "series_list": [
+                  {
+                    "name": "Email",
+                    "label_show": true,
+                    "data": [
+                      120,
+                      132,
+                      101,
+                      134,
+                      90,
+                      230,
+                      210
+                    ]
+                  },
+                  {
+                    "name": "Union Ads",
+                    "label_show": true,
+                    "data": [
+                      220,
+                      182,
+                      191,
+                      234,
+                      290,
+                      330,
+                      310
+                    ]
+                  }
+                ]
+              },
+              {
+                "quality": 80,
+                "width": 400,
+                "height": 300,
+                "margin": {
+                  "left": 5,
+                  "top": 5,
+                  "right": 20,
+                  "bottom": 5
+                },
+                "font_family": "Roboto",
+                "title_font_size": 18,
+                "title_font_weight": "bold",
+                "title_margin": {
+                  "left": 0,
+                  "top": 0,
+                  "right": 0,
+                  "bottom": 0
+                },
+                "title_align": "left",
+                "title_height": 30,
+                "sub_title_text": "Data from: Heinz 2003",
+                "sub_title_font_size": 14,
+                "sub_title_margin": {
+                  "left": 0,
+                  "top": 0,
+                  "right": 0,
+                  "bottom": 0
+                },
+                "sub_title_align": "left",
+                "sub_title_height": 20,
+                "legend_font_size": 14,
+                "legend_align": "right",
+                "legend_margin": {
+                  "left": 0,
+                  "top": 0,
+                  "right": 0,
+                  "bottom": 0
+                },
+                "legend_category": "normal",
+                "legend_show": true,
+                "x_axis_height": 30,
+                "x_axis_font_size": 14,
+                "x_axis_name_gap": 5,
+                "x_axis_name_rotate": 0,
+                "x_boundary_gap": true,
+                "x_axis_margin": {
+                  "left": 0,
+                  "top": 0,
+                  "right": 0,
+                  "bottom": 0
+                },
+                "x": 10,
+                "y": 320,
+                "type": "scatter",
+                "title_text": "Height and weight",
+                "y_axis_configs": [
+                  {
+                    "axis_min": 40,
+                    "axis_max": 100,
+                    "axis_formatter": "{c} kg"
+                  }
+                ],
+                "x_axis_config": {
+                  "axis_min": 140,
+                  "axis_max": 200,
+                  "axis_formatter": "{c} cm"
+                },
+                "series_list": [
+                  {
+                    "name": "Female",
+                    "data": [
+                      161.2,
+                      51.6,
+                      167.5,
+                      59,
+                      159.5,
+                      49.2,
+                      157,
+                      63,
+                      155.8,
+                      53.6,
+                      170,
+                      59,
+                      159.1,
+                      47.6,
+                      166,
+                      69.8,
+                      176.2,
+                      66.8,
+                      160.2,
+                      75.2,
+                      172.5,
+                      55.2,
+                      170.9,
+                      54.2,
+                      172.9,
+                      62.5,
+                      153.4,
+                      42,
+                      160,
+                      50,
+                      147.2,
+                      49.8,
+                      168.2,
+                      49.2,
+                      175,
+                      73.2,
+                      157,
+                      47.8,
+                      167.6,
+                      68.8,
+                      159.5,
+                      50.6,
+                      175,
+                      82.5,
+                      166.8,
+                      57.2,
+                      176.5,
+                      87.8,
+                      170.2,
+                      72.8
+                    ]
+                  },
+                  {
+                    "name": "Male",
+                    "data": [
+                      174,
+                      65.6,
+                      175.3,
+                      71.8,
+                      193.5,
+                      80.7,
+                      186.5,
+                      72.6,
+                      187.2,
+                      78.8,
+                      181.5,
+                      74.8,
+                      184,
+                      86.4,
+                      184.5,
+                      78.4,
+                      175,
+                      62,
+                      184,
+                      81.6,
+                      180,
+                      76.6,
+                      177.8,
+                      83.6,
+                      192,
+                      90,
+                      176,
+                      74.6,
+                      174,
+                      71,
+                      184,
+                      79.6,
+                      192.7,
+                      93.8,
+                      171.5,
+                      70,
+                      173,
+                      72.4,
+                      176,
+                      85.9,
+                      176,
+                      78.8,
+                      180.5,
+                      77.8,
+                      172.7,
+                      66.2,
+                      176,
+                      86.4,
+                      173.5,
+                      81.8
+                    ]
+                  }
+                ],
+                "series_symbol_sizes": [
+                  6,
+                  6
+                ]
+              },
+              {
+                "quality": 80,
+                "width": 400,
+                "height": 300,
+                "margin": {
+                  "left": 5,
+                  "top": 5,
+                  "right": 5,
+                  "bottom": 5
+                },
+                "font_family": "Roboto",
+                "title_font_size": 18,
+                "title_font_weight": "bold",
+                "title_margin": {
+                  "left": 0,
+                  "top": 0,
+                  "right": 0,
+                  "bottom": 0
+                },
+                "title_align": "center",
+                "title_height": 30,
+                "sub_title_text": "Sub Title",
+                "sub_title_font_size": 14,
+                "sub_title_margin": {
+                  "left": 0,
+                  "top": 0,
+                  "right": 0,
+                  "bottom": 0
+                },
+                "sub_title_align": "center",
+                "sub_title_height": 20,
+                "legend_font_size": 14,
+                "legend_align": "center",
+                "legend_margin": {
+                  "top": 50
+                },
+                "legend_category": "normal",
+                "legend_show": true,
+                "x_axis_height": 30,
+                "x_axis_font_size": 14,
+                "x_axis_name_gap": 5,
+                "x_axis_name_rotate": 0,
+                "x_boundary_gap": true,
+                "x_axis_margin": {
+                  "left": 0,
+                  "top": 0,
+                  "right": 0,
+                  "bottom": 0
+                },
+                "x": 420,
+                "y": 320,
+                "type": "pie",
+                "title_text": "Nightingale Chart",
+                "series_list": [
+                  {
+                    "name": "rose 1",
+                    "data": [
+                      40
+                    ]
+                  },
+                  {
+                    "name": "rose 2",
+                    "data": [
+                      38
+                    ]
+                  },
+                  {
+                    "name": "rose 3",
+                    "data": [
+                      32
+                    ]
+                  },
+                  {
+                    "name": "rose 4",
+                    "data": [
+                      30
+                    ]
+                  },
+                  {
+                    "name": "rose 5",
+                    "data": [
+                      28
+                    ]
+                  },
+                  {
+                    "name": "rose 6",
+                    "data": [
+                      26
+                    ]
+                  },
+                  {
+                    "name": "rose 7",
+                    "data": [
+                      22
+                    ]
+                  },
+                  {
+                    "name": "rose 8",
+                    "data": [
+                      18
+                    ]
+                  }
+                ]
+              }
+            ],
+            "theme": "grafana"
+          }"###;
+    let multi_chart = MultiChart::from_json(multi_chart_json).unwrap();
+    let buf = svg_to_webp(&multi_chart.svg().unwrap()).unwrap();
+    common::save_asset("image/multi-chart.webp", &buf);
+
+    let aligned = MultiChart::from_json(include_str!("../asset/multi_chart/aligned.json")).unwrap();
+    let buf = svg_to_png(&aligned.svg().unwrap()).unwrap();
+    common::save_asset("image/multi-aligned.png", &buf);
+
+    // theme preview image for shadcn
+    let shadcn_chart = MultiChart::from_json(
+        &multi_chart_json.replace(r###""theme": "grafana""###, r###""theme": "shadcn""###),
+    )
+    .unwrap();
+    let buf = svg_to_png(&shadcn_chart.svg().unwrap()).unwrap();
+    common::save_asset("image/theme-shadcn.png", &buf);
+
+    let heatmap_chart = HeatmapChart::from_json(
+      r###"{
+          "theme": "grafana",
+          "y_axis_data": [
+              "Saturday",
+              "Friday",
+              "Thursday",
+              "Wednesday",
+              "Tuesday",
+              "Monday",
+              "Sunday"
+          ],
+          "x_axis_data": [
+              "12a", "1a", "2a", "3a", "4a", "5a", "6a", "7a", "8a", "9a", "10a", "11a", "12p", "1p",
+              "2p", "3p", "4p", "5p", "6p", "7p", "8p", "9p", "10p", "11p"
+          ],
+          "series": {
+              "data": [
+                  [0, 9.0],
+                  [1, 3.0],
+                  [7, 3.0],
+                  [12, 3.0],
+                  [24, 12.0],
+                  [28, 10.0],
+                  [31, 8.0],
+                  [50, 4.0],
+                  [63, 2.0]
+              ]
+          }
+  }"###,
+  )
+  .unwrap();
+    let buf = svg_to_png(&heatmap_chart.svg().unwrap()).unwrap();
+    common::save_asset("image/heatmap.png", &buf);
+
+    // treemap chart
+    let treemap_chart = TreemapChart::new_with_theme(
+        vec![
+            ("nodeExcel", vec![600.0]).into(),
+            ("nodePPT", vec![500.0]).into(),
+            ("nodeDoc", vec![400.0]).into(),
+            ("nodeWeb", vec![300.0]).into(),
+            ("nodeWord", vec![200.0]).into(),
+            ("nodeOther", vec![100.0]).into(),
+        ],
+        THEME_GRAFANA,
+    );
+    let buf = svg_to_png(&treemap_chart.svg().unwrap()).unwrap();
+    common::save_asset("image/treemap.png", &buf);
+
+    // box plot chart
+    let box_plot_chart = BoxPlotChart::new_with_theme(
+        vec![
+            BoxPlotSeries {
+                name: "Series A".to_string(),
+                data: vec![
+                    [3.0, 10.0, 18.0, 28.0, 40.0],
+                    [5.0, 14.0, 22.0, 32.0, 45.0],
+                    [1.0, 8.0, 15.0, 24.0, 35.0],
+                    [6.0, 12.0, 20.0, 30.0, 42.0],
+                ],
+                index: None,
+            },
+            BoxPlotSeries {
+                name: "Series B".to_string(),
+                data: vec![
+                    [5.0, 13.0, 21.0, 31.0, 43.0],
+                    [2.0, 9.0, 17.0, 26.0, 38.0],
+                    [4.0, 11.0, 19.0, 29.0, 41.0],
+                    [7.0, 15.0, 23.0, 33.0, 46.0],
+                ],
+                index: None,
+            },
+        ],
+        vec![
+            "Category A".to_string(),
+            "Category B".to_string(),
+            "Category C".to_string(),
+            "Category D".to_string(),
+        ],
+        THEME_GRAFANA,
+    );
+    let buf = svg_to_png(&box_plot_chart.svg().unwrap()).unwrap();
+    common::save_asset("image/box-plot.png", &buf);
+
+    // funnel chart
+    let funnel_chart = FunnelChart::from_json(
+        r##"{
+            "theme": "grafana",
+            "title_text": "Funnel Chart",
+            "legend_show": false,
+            "series_label_position": "inside",
+            "funnel_gap": 4,
+            "series_list": [
+                {"name": "Impression", "data": [60000]},
+                {"name": "Click",      "data": [40000]},
+                {"name": "Inquiry",    "data": [20000]},
+                {"name": "Order",      "data": [8000]},
+                {"name": "Re-order",   "data": [2000]}
+            ]
+        }"##,
+    )
+    .unwrap();
+    let buf = svg_to_png(&funnel_chart.svg().unwrap()).unwrap();
+    common::save_asset("image/funnel.png", &buf);
+
+    // waterfall chart
+    let waterfall_chart = WaterfallChart::from_json(
+        r#"{
+            "theme": "grafana",
+            "title_text": "Waterfall Chart",
+            "x_axis_data": ["Initial","Revenue","Services","Purchases","Marketing","Profit"],
+            "data": [
+                [900, false],
+                [345, false],
+                [393, false],
+                [-108, false],
+                [-154, false],
+                [0, true]
+            ]
+        }"#,
+    )
+    .unwrap();
+    let buf = svg_to_png(&waterfall_chart.svg().unwrap()).unwrap();
+    common::save_asset("image/waterfall.png", &buf);
+
+    // calendar chart
+    let calendar_chart = CalendarChart::from_json(
+        r##"{
+            "theme": "grafana",
+            "start_date": "2024-01-01",
+            "end_date": "2024-12-31",
+            "title_text": "2024 Contributions",
+            "cell_size": 11,
+            "cell_gap": 2,
+            "data": [
+                ["2024-01-05", 2],
+                ["2024-02-14", 8],
+                ["2024-06-15", 9],
+                ["2024-09-01", 4],
+                ["2024-12-25", 10]
+            ]
+        }"##,
+    )
+    .unwrap();
+    let buf = svg_to_png(&calendar_chart.svg().unwrap()).unwrap();
+    common::save_asset("image/calendar.png", &buf);
+
+    // gauge chart
+    let gauge_chart = GaugeChart::from_json(
+        r##"{
+            "theme": "grafana",
+            "title_text": "Gauge",
+            "legend_show": false,
+            "min": 0,
+            "max": 200,
+            "series_list": [{"name": "Speed", "data": [120]}]
+        }"##,
+    )
+    .unwrap();
+    let buf = svg_to_png(&gauge_chart.svg().unwrap()).unwrap();
+    common::save_asset("image/gauge.png", &buf);
+
+    // sunburst chart
+    let sunburst_chart = SunburstChart::from_json(
+        r##"{
+            "theme": "grafana",
+            "title_text": "Sunburst",
+            "inner_radius": 20,
+            "series_data": [
+                {
+                    "name": "Grandpa",
+                    "children": [
+                        {"name": "Uncle Leo", "children": [
+                            {"name": "Cousin Jack", "value": 18},
+                            {"name": "Cousin Mary", "value": 12}
+                        ]},
+                        {"name": "Father", "children": [
+                            {"name": "Me", "value": 40},
+                            {"name": "Brother Peter", "value": 20}
+                        ]}
+                    ]
+                },
+                {
+                    "name": "Nancy",
+                    "children": [
+                        {"name": "Uncle Nike", "children": [
+                            {"name": "Cousin Betty", "value": 10},
+                            {"name": "Cousin Jenny", "value": 30}
+                        ]}
+                    ]
+                }
+            ]
+        }"##,
+    )
+    .unwrap();
+    let buf = svg_to_png(&sunburst_chart.svg().unwrap()).unwrap();
+    common::save_asset("image/sunburst.png", &buf);
+    // node charts
+    for (name, chart) in [
+        (
+            "sankey",
+            charts_rs::SankeyChart::from_json(include_str!(
+                "../asset/sankey_chart/integration.json"
+            ))
+            .unwrap()
+            .svg()
+            .unwrap(),
+        ),
+        (
+            "tree",
+            charts_rs::TreeChart::from_json(include_str!("../asset/tree_chart/integration.json"))
+                .unwrap()
+                .svg()
+                .unwrap(),
+        ),
+        (
+            "graph",
+            charts_rs::GraphChart::from_json(include_str!("../asset/graph_chart/integration.json"))
+                .unwrap()
+                .svg()
+                .unwrap(),
+        ),
+        (
+            "parallel",
+            charts_rs::ParallelChart::from_json(include_str!(
+                "../asset/parallel_chart/integration.json"
+            ))
+            .unwrap()
+            .svg()
+            .unwrap(),
+        ),
+        (
+            "theme-river",
+            charts_rs::ThemeRiverChart::from_json(include_str!(
+                "../asset/theme_river_chart/integration.json"
+            ))
+            .unwrap()
+            .svg()
+            .unwrap(),
+        ),
+        (
+            "histogram",
+            charts_rs::HistogramChart::from_json(include_str!(
+                "../asset/histogram_chart/basic.json"
+            ))
+            .unwrap()
+            .svg()
+            .unwrap(),
+        ),
+        (
+            "line-band",
+            charts_rs::LineChart::from_json(include_str!("../asset/line_chart/band.json"))
+                .unwrap()
+                .svg()
+                .unwrap(),
+        ),
+        (
+            "polar-bar",
+            charts_rs::PolarBarChart::from_json(include_str!(
+                "../asset/polar_bar_chart/stack.json"
+            ))
+            .unwrap()
+            .svg()
+            .unwrap(),
+        ),
+        (
+            "map",
+            charts_rs::MapChart::from_json(include_str!("../asset/map_chart/basic.json"))
+                .unwrap()
+                .svg()
+                .unwrap(),
+        ),
+        (
+            "gantt",
+            charts_rs::GanttChart::from_json(include_str!("../asset/gantt_chart/basic.json"))
+                .unwrap()
+                .svg()
+                .unwrap(),
+        ),
+        (
+            "chord",
+            charts_rs::ChordChart::from_json(include_str!("../asset/chord_chart/gradient.json"))
+                .unwrap()
+                .svg()
+                .unwrap(),
+        ),
+        (
+            "polar-bar-radial",
+            charts_rs::PolarBarChart::from_json(include_str!(
+                "../asset/polar_bar_chart/radial.json"
+            ))
+            .unwrap()
+            .svg()
+            .unwrap(),
+        ),
+        (
+            "texts",
+            BarChart::from_json(include_str!("../asset/bar_chart/texts.json"))
+                .unwrap()
+                .svg()
+                .unwrap(),
+        ),
+        // variants of the charts above
+        (
+            "pie-half",
+            PieChart::from_json(include_str!("../asset/pie_chart/half.json"))
+                .unwrap()
+                .svg()
+                .unwrap(),
+        ),
+        (
+            "pie-nested",
+            PieChart::from_json(include_str!("../asset/pie_chart/nested.json"))
+                .unwrap()
+                .svg()
+                .unwrap(),
+        ),
+        (
+            "line-step",
+            LineChart::from_json(include_str!("../asset/line_chart/step.json"))
+                .unwrap()
+                .svg()
+                .unwrap(),
+        ),
+        (
+            "line-bump",
+            LineChart::from_json(include_str!("../asset/line_chart/bump.json"))
+                .unwrap()
+                .svg()
+                .unwrap(),
+        ),
+        (
+            "bar-stack-percent",
+            BarChart::from_json(include_str!("../asset/bar_chart/stack_percent.json"))
+                .unwrap()
+                .svg()
+                .unwrap(),
+        ),
+        (
+            "bar-error-bar",
+            BarChart::from_json(include_str!("../asset/bar_chart/error_bar.json"))
+                .unwrap()
+                .svg()
+                .unwrap(),
+        ),
+        (
+            "scatter-regression",
+            ScatterChart::from_json(include_str!("../asset/scatter_chart/regression.json"))
+                .unwrap()
+                .svg()
+                .unwrap(),
+        ),
+        (
+            "scatter-marginal",
+            ScatterChart::from_json(include_str!("../asset/scatter_chart/marginal.json"))
+                .unwrap()
+                .svg()
+                .unwrap(),
+        ),
+        (
+            "scatter-contour",
+            ScatterChart::from_json(include_str!("../asset/scatter_chart/contour.json"))
+                .unwrap()
+                .svg()
+                .unwrap(),
+        ),
+        (
+            "heatmap-scale",
+            HeatmapChart::from_json(include_str!("../asset/heatmap_chart/scale.json"))
+                .unwrap()
+                .svg()
+                .unwrap(),
+        ),
+        (
+            "heatmap-punch-card",
+            HeatmapChart::from_json(include_str!("../asset/heatmap_chart/punch_card.json"))
+                .unwrap()
+                .svg()
+                .unwrap(),
+        ),
+        (
+            "gauge-rings",
+            GaugeChart::from_json(include_str!("../asset/gauge_chart/rings.json"))
+                .unwrap()
+                .svg()
+                .unwrap(),
+        ),
+        (
+            "gauge-segments",
+            GaugeChart::from_json(include_str!("../asset/gauge_chart/segments.json"))
+                .unwrap()
+                .svg()
+                .unwrap(),
+        ),
+        ("tree-radial", {
+            let mut chart =
+                charts_rs::TreeChart::from_json(include_str!("../asset/tree_chart/radial.json"))
+                    .unwrap();
+            // Room for the names of the branches between the rings.
+            chart.width = 700.0;
+            chart.height = 680.0;
+            chart.svg().unwrap()
+        }),
+        (
+            "lines",
+            charts_rs::LinesChart::from_json(include_str!("../asset/lines_chart/flows.json"))
+                .unwrap()
+                .svg()
+                .unwrap(),
+        ),
+        (
+            "bullet",
+            charts_rs::BulletChart::from_json(include_str!("../asset/bullet_chart/basic.json"))
+                .unwrap()
+                .svg()
+                .unwrap(),
+        ),
+        ("sankey-vertical", {
+            let mut chart = charts_rs::SankeyChart::from_json(include_str!(
+                "../asset/sankey_chart/integration.json"
+            ))
+            .unwrap();
+            chart.orient = Some("vertical".to_string());
+            chart.svg().unwrap()
+        }),
+    ] {
+        let buf = svg_to_png(&chart).unwrap();
+        common::save_asset(&format!("image/{name}.png"), &buf);
+    }
+}

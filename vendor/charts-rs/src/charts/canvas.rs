@@ -1,0 +1,1072 @@
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use super::component::{
+    Arrow, Axis, Bubble, Circle, Component, Grid, LEGEND_WIDTH, Legend, Line, Pie, Polygon,
+    Polyline, Rect, Ribbon, Sector, Shape, SmoothBand, SmoothLine, SmoothLineFill, StraightLine,
+    StraightLineFill, Text, write_svg_close, write_svg_open,
+};
+
+use super::common::TextConfig;
+use super::{measure_text_width_family, util::*};
+use std::cell::RefCell;
+use std::collections::HashSet;
+use std::rc::Rc;
+
+// The crate-level error/result types (defined in `error.rs`). Re-exported here
+// so the historical `canvas::Error` / `canvas::Result` paths keep working.
+pub use super::error::{Error, Result};
+
+#[derive(Clone)]
+/// A drawing surface: components are appended at absolute coordinates and
+/// rendered into one SVG document.
+pub struct Canvas {
+    /// Canvas width.
+    pub width: f32,
+    /// Canvas height.
+    pub height: f32,
+    /// X offset applied to appended components.
+    pub x: f32,
+    /// Y offset applied to appended components.
+    pub y: f32,
+    /// The appended components; shared with child canvases.
+    pub components: Rc<RefCell<Vec<Component>>>,
+    /// Margin applied on top of the offset.
+    pub margin: Box,
+    /// Emit compact SVG (see [`compact_svg`](crate::compact_svg)).
+    pub compact: bool,
+    // The texts written over the components when the canvas is turned into
+    // SVG: placed then, as a table is only as high as its rows by then.
+    texts: Rc<Vec<OverlayText>>,
+}
+
+/// A text written over the components of a canvas, and the font family it is
+/// written in.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct OverlayText {
+    pub(crate) config: TextConfig,
+    pub(crate) font_family: String,
+}
+
+impl OverlayText {
+    /// The text as a component on a canvas of the given size, or nothing
+    /// where it has no place of finite numbers.
+    pub(crate) fn text(&self, width: f32, height: f32) -> Option<Text> {
+        let config = &self.config;
+        let font_size = config.font.size;
+        let (x, anchor) = match (config.left, config.right) {
+            (Some(left), _) => (left, "start"),
+            (None, Some(right)) => (width - right, "end"),
+            (None, None) => (width / 2.0, "middle"),
+        };
+        // As high as its font size, and written about the middle of that.
+        let y = match (config.top, config.bottom) {
+            (Some(top), _) => top + font_size / 2.0,
+            (None, Some(bottom)) => height - bottom - font_size / 2.0,
+            (None, None) => height / 2.0,
+        };
+        if config.text.is_empty() || !x.is_finite() || !y.is_finite() || !font_size.is_finite() {
+            return None;
+        }
+        let turned = config.rotate.is_finite() && config.rotate != 0.0;
+        Some(Text {
+            text: config.text.clone(),
+            font_family: Some(self.font_family.clone()),
+            font_size: Some(font_size),
+            font_color: Some(config.font.color),
+            font_weight: config.font.weight.clone(),
+            x: Some(x),
+            y: Some(y),
+            text_anchor: Some(anchor.to_string()),
+            dominant_baseline: Some("central".to_string()),
+            transform: turned.then(|| {
+                format!(
+                    "rotate({} {} {})",
+                    format_float(config.rotate),
+                    format_float(x),
+                    format_float(y)
+                )
+            }),
+            ..Default::default()
+        })
+    }
+}
+
+impl Canvas {
+    /// Creates a specified size canvas.
+    pub fn new(width: f32, height: f32) -> Self {
+        Canvas::new_width_xy(width, height, 0.0, 0.0)
+    }
+    /// Creates  a specified size canvas and set the x and y value.
+    pub fn new_width_xy(width: f32, height: f32, x: f32, y: f32) -> Self {
+        Canvas {
+            width,
+            height,
+            x,
+            y,
+            components: Rc::new(RefCell::new(vec![])),
+            margin: Box::default(),
+            compact: false,
+            texts: Rc::new(vec![]),
+        }
+    }
+    /// Sets the texts that are written over the components.
+    pub(crate) fn set_texts(&mut self, texts: Vec<OverlayText>) {
+        self.texts = Rc::new(texts);
+    }
+    /// Gets the width of canvas.
+    pub fn width(&self) -> f32 {
+        self.width - self.margin.left - self.margin.right
+    }
+    /// Gets the height of canvas.
+    pub fn height(&self) -> f32 {
+        self.height - self.margin.top - self.margin.bottom
+    }
+    /// Creates a child canvas and sets the left top value.
+    pub fn child_left_top(&self, margin: Box) -> Self {
+        let mut m = margin;
+        m.left += self.margin.left;
+        m.top += self.margin.top;
+        Canvas {
+            width: self.width,
+            height: self.height,
+            components: Rc::clone(&self.components),
+            margin: m,
+            x: self.x,
+            y: self.y,
+            compact: self.compact,
+            texts: Rc::clone(&self.texts),
+        }
+    }
+    /// Creates a child canvas.
+    pub fn child(&self, margin: Box) -> Self {
+        let mut m = margin;
+        m.left += self.margin.left;
+        m.top += self.margin.top;
+        m.right += self.margin.right;
+        m.bottom += self.margin.bottom;
+        Canvas {
+            width: self.width,
+            height: self.height,
+            components: Rc::clone(&self.components),
+            margin: m,
+            x: self.x,
+            y: self.y,
+            compact: self.compact,
+            texts: Rc::clone(&self.texts),
+        }
+    }
+    /// Appends arrow widget to canvas.
+    pub fn arrow(&mut self, arrow: Arrow) -> Box {
+        let mut c = arrow;
+        c.x += self.margin.left;
+        c.y += self.margin.top;
+        self.append(Component::Arrow(c));
+        let mut b = self.margin;
+        b.right = b.left + 10.0;
+        b.bottom = b.top;
+        b
+    }
+    /// Appends line widget to canvas.
+    pub fn line(&mut self, line: Line) -> Box {
+        let mut c = line;
+        c.left += self.margin.left;
+        c.right += self.margin.left;
+        c.top += self.margin.top;
+        c.bottom += self.margin.top;
+        let b = Box {
+            left: c.left,
+            top: c.top,
+            right: c.right,
+            bottom: c.bottom,
+        };
+        self.append(Component::Line(c));
+        b
+    }
+    /// Appends rect widget to canvas.
+    pub fn rect(&mut self, rect: Rect) -> Box {
+        let mut c = rect;
+        c.left += self.margin.left;
+        c.top += self.margin.top;
+        let b = Box {
+            left: c.left,
+            top: c.top,
+            right: c.left + c.width,
+            bottom: c.top + c.height,
+        };
+        self.append(Component::Rect(c));
+        b
+    }
+    /// Appends polyline widget to canvas.
+    pub fn polyline(&mut self, polyline: Polyline) -> Box {
+        let mut c = polyline;
+        for p in c.points.iter_mut() {
+            p.x += self.margin.left;
+            p.y += self.margin.top;
+        }
+        let b = get_box_of_points(&c.points);
+
+        self.append(Component::Polyline(c));
+        b
+    }
+    /// Appends circle widget to canvas.
+    pub fn circle(&mut self, circle: Circle) -> Box {
+        let mut c = circle;
+        c.cx += self.margin.left;
+        c.cy += self.margin.top;
+        let b = Box {
+            left: c.cx - c.r,
+            top: c.cy - c.r,
+            right: c.cx + c.r,
+            bottom: c.cy + c.r,
+        };
+        self.append(Component::Circle(c));
+        b
+    }
+    /// Appends a filled band between two smooth curves.
+    pub fn smooth_band(&mut self, band: SmoothBand) -> Box {
+        let mut c = band;
+        for p in c.top.iter_mut().chain(c.bottom.iter_mut()) {
+            p.x += self.margin.left;
+            p.y += self.margin.top
+        }
+        let mut points = c.top.clone();
+        points.extend(c.bottom.iter().copied());
+        let b = get_box_of_points(&points);
+        self.append(Component::SmoothBand(c));
+        b
+    }
+    /// Appends polygon widget to canvas.
+    pub fn polygon(&mut self, polygon: Polygon) -> Box {
+        let mut c = polygon;
+        for p in c.points.iter_mut() {
+            p.x += self.margin.left;
+            p.y += self.margin.top
+        }
+        let b = get_box_of_points(&c.points);
+        self.append(Component::Polygon(c));
+        b
+    }
+    /// Appends shape widget to canvas.
+    pub fn shape(&mut self, shape: Shape) -> Box {
+        let mut c = shape;
+        for p in c.rings.iter_mut().flatten() {
+            p.x += self.margin.left;
+            p.y += self.margin.top
+        }
+        let points: Vec<Point> = c.rings.iter().flatten().copied().collect();
+        let b = get_box_of_points(&points);
+        self.append(Component::Shape(c));
+        b
+    }
+    fn offset_text(&self, text: &mut Text) {
+        if let Some(x) = text.x {
+            text.x = Some(x + self.margin.left);
+        } else {
+            text.x = Some(self.margin.left);
+        }
+        if let Some(y) = text.y {
+            text.y = Some(y + self.margin.top);
+        } else {
+            text.y = Some(self.margin.top);
+        }
+    }
+    /// Appends text widget to canvas.
+    pub fn text(&mut self, mut text: Text) -> Box {
+        let font_family = text.font_family.clone().unwrap_or_default();
+        let font_size = text.font_size.unwrap_or_default();
+        self.offset_text(&mut text);
+        let mut b = Box {
+            left: text.x.unwrap_or_default(),
+            top: text.y.unwrap_or_default(),
+            ..Default::default()
+        };
+        if !font_family.is_empty() && font_size > 0.0 {
+            if let Ok(result) = measure_text_width_family(&font_family, font_size, &text.text) {
+                b.right = b.left + result.width();
+                b.bottom = b.top + result.height();
+            }
+            let line_height = text.line_height.unwrap_or_default();
+            // 设置了行高
+            if line_height > font_size {
+                text.dy = Some(text.dy.unwrap_or_default() + line_height / 2.0);
+                text.dominant_baseline = Some("middle".to_string());
+                b.bottom = b.top + line_height;
+            }
+        }
+
+        self.append(Component::Text(text));
+        b
+    }
+    /// Appends text that is not part of layout (a hover tooltip, or a label
+    /// the caller already measured). Skips glyph measurement; `line_height`
+    /// is not applied.
+    pub(crate) fn text_unmeasured(&mut self, mut text: Text) {
+        self.offset_text(&mut text);
+        self.append(Component::Text(text));
+    }
+    /// Appends pie widget to canvas.
+    pub fn pie(&mut self, pie: Pie) -> Box {
+        let mut c = pie;
+        c.cx += self.margin.left;
+        c.cy += self.margin.top;
+        let b = Box {
+            left: self.margin.left,
+            top: self.margin.top,
+            right: self.margin.left + c.r * 2.0,
+            bottom: self.margin.top + c.r * 2.0,
+        };
+
+        self.append(Component::Pie(c));
+        b
+    }
+    /// Appends sector widget to canvas.
+    pub fn sector(&mut self, sector: Sector) -> Box {
+        let mut c = sector;
+        c.cx += self.margin.left;
+        c.cy += self.margin.top;
+        let b = Box {
+            left: c.cx - c.r,
+            top: c.cy - c.r,
+            right: c.cx + c.r,
+            bottom: c.cy + c.r,
+        };
+
+        self.append(Component::Sector(c));
+        b
+    }
+    /// Appends ribbon widget to canvas.
+    pub fn ribbon(&mut self, ribbon: Ribbon) -> Box {
+        let mut c = ribbon;
+        c.cx += self.margin.left;
+        c.cy += self.margin.top;
+        let b = Box {
+            left: c.cx - c.r,
+            top: c.cy - c.r,
+            right: c.cx + c.r,
+            bottom: c.cy + c.r,
+        };
+
+        self.append(Component::Ribbon(c));
+        b
+    }
+    /// Appends smooth line points widget to canvas.
+    pub fn smooth_line(&mut self, line: SmoothLine) -> Box {
+        let mut c = line;
+        for p in c.points.iter_mut() {
+            p.x += self.margin.left;
+            p.y += self.margin.top
+        }
+        let b = get_box_of_points(&c.points);
+        self.append(Component::SmoothLine(c));
+        b
+    }
+    /// Appends straight line points widget to canvas.
+    pub fn straight_line(&mut self, line: StraightLine) -> Box {
+        let mut c = line;
+        for p in c.points.iter_mut() {
+            p.x += self.margin.left;
+            p.y += self.margin.top
+        }
+        let b = get_box_of_points(&c.points);
+        self.append(Component::StraightLine(c));
+        b
+    }
+    /// Appends smooth line points with fill color widget to canvas.
+    pub fn smooth_line_fill(&mut self, fill: SmoothLineFill) -> Box {
+        let mut c = fill;
+        for p in c.points.iter_mut() {
+            p.x += self.margin.left;
+            p.y += self.margin.top
+        }
+        c.bottom += self.margin.top;
+        let mut b = get_box_of_points(&c.points);
+        b.bottom = c.bottom;
+        self.append(Component::SmoothLineFill(c));
+        b
+    }
+    /// Appends straight line points with fill color widget to canvas.
+    pub fn straight_line_fill(&mut self, fill: StraightLineFill) -> Box {
+        let mut c = fill;
+        for p in c.points.iter_mut() {
+            p.x += self.margin.left;
+            p.y += self.margin.top
+        }
+        c.bottom += self.margin.top;
+        let mut b = get_box_of_points(&c.points);
+        b.bottom = c.bottom;
+        self.append(Component::StraightLineFill(c));
+        b
+    }
+    // Appends grid widget to canvas.
+    /// Appends a grid, returning its bounding box.
+    pub fn grid(&mut self, grip: Grid) -> Box {
+        let mut c = grip;
+        c.left += self.margin.left;
+        c.right += self.margin.left;
+        c.top += self.margin.top;
+        c.bottom += self.margin.top;
+        let b = Box {
+            left: c.left,
+            top: c.top,
+            right: c.right,
+            bottom: c.bottom,
+        };
+        self.append(Component::Grid(c));
+        b
+    }
+    // Appends axis widget to canvas.
+    /// Appends an axis, returning its bounding box.
+    pub fn axis(&mut self, axis: Axis) -> Box {
+        let mut c = axis;
+        c.left += self.margin.left;
+        c.top += self.margin.top;
+        // The labels of the axis are kept on the canvas.
+        c.label_bounds.get_or_insert((0.0, self.width));
+        let b = Box {
+            left: c.left,
+            top: c.top,
+            right: c.left + c.width,
+            bottom: c.top + c.height,
+        };
+        self.append(Component::Axis(c));
+        b
+    }
+    /// Appends lenged widget to canvas.
+    pub fn legend(&mut self, legend: Legend) -> Box {
+        let mut c = legend;
+        c.left += self.margin.left;
+        c.top += self.margin.top;
+        let measurement =
+            measure_text_width_family(&c.font_family, c.font_size, &c.text).unwrap_or_default();
+        let b = Box {
+            left: c.left,
+            top: c.top,
+            right: c.left + measurement.width() + super::component::legend_marker_width(&c.category),
+            bottom: c.top + measurement.height(),
+        };
+        self.append(Component::Legend(c));
+        b
+    }
+    /// Appends bubble widget to canvas.
+    pub fn bubble(&mut self, bubble: Bubble) -> Box {
+        let mut c = bubble;
+        c.x += self.margin.left;
+        c.y += self.margin.top;
+        let b = Box {
+            left: c.x - c.r,
+            top: c.y - c.r,
+            right: c.x + c.r,
+            bottom: c.y + c.r,
+        };
+        self.append(Component::Bubble(c));
+        b
+    }
+    /// Appends a component to the canvas.
+    pub fn append(&mut self, component: Component) {
+        let mut components = self.components.borrow_mut();
+        components.push(component);
+    }
+    /// Generates the svg of canvas.
+    pub fn svg(&self) -> Result<String> {
+        self.svg_with_prefix("")
+    }
+    /// Writes the document once: the `<svg>` header, `prefix`, every
+    /// component, and the closing tag, without a final copy of the body.
+    fn svg_with_prefix(&self, prefix: &str) -> Result<String> {
+        let components = self.components.borrow();
+        let mut out = String::with_capacity(components.len() * 128 + prefix.len() + 160);
+        write_svg_open(&mut out, self.width, self.height, self.x, self.y);
+        out.push_str(prefix);
+        let mut grad_seen = HashSet::new();
+        for (i, c) in components.iter().enumerate() {
+            if i > 0 || !prefix.is_empty() {
+                out.push('\n');
+            }
+            write_component(c, &mut out, &mut grad_seen)?;
+        }
+        // The texts over the chart come last, on top of everything else.
+        let mut written = !components.is_empty() || !prefix.is_empty();
+        for text in self.texts.iter() {
+            if let Some(text) = text.text(self.width, self.height) {
+                if written {
+                    out.push('\n');
+                }
+                text.write_svg(&mut out);
+                written = true;
+            }
+        }
+        write_svg_close(&mut out);
+        if self.compact {
+            return Ok(super::compact::compact_svg(&out));
+        }
+        Ok(out)
+    }
+    /// Generates the svg of canvas with an embedded CSS style block prepended.
+    pub fn svg_with_style(&self, style: &str) -> Result<String> {
+        self.svg_with_prefix(&format!("<style>{style}</style>"))
+    }
+}
+
+/// Renders a single component into the shared output buffer. Shared by `svg`
+/// and `svg_with_style` so the per-variant dispatch lives in exactly one place;
+/// hot components stream directly (`write_svg`), the rest go through their
+/// `svg()` string.
+fn write_component(c: &Component, out: &mut String, grad_seen: &mut HashSet<String>) -> Result<()> {
+    match c {
+        Component::Line(c) => c.write_svg(out),
+        Component::Rect(c) => c.write_svg(out, Some(grad_seen)),
+        Component::Arrow(c) => out.push_str(&c.svg()),
+        Component::Bubble(c) => out.push_str(&c.svg()),
+        Component::Polyline(c) => c.write_svg(out),
+        Component::Circle(c) => c.write_svg(out),
+        Component::Polygon(c) => c.write_svg(out, Some(grad_seen)),
+        Component::Text(c) => c.write_svg(out),
+        Component::SmoothLine(c) => c.write_svg(out),
+        Component::StraightLine(c) => c.write_svg(out),
+        Component::SmoothLineFill(c) => c.write_svg(out, Some(grad_seen)),
+        Component::SmoothBand(c) => out.push_str(&c.svg()),
+        Component::StraightLineFill(c) => c.write_svg(out, Some(grad_seen)),
+        Component::Grid(c) => out.push_str(&c.svg()),
+        Component::Axis(c) => out.push_str(&c.svg()?),
+        Component::Legend(c) => out.push_str(&c.svg()),
+        Component::Pie(c) => out.push_str(&c.svg_with_grad_seen(Some(grad_seen))),
+        Component::Sector(c) => out.push_str(&c.svg_with_grad_seen(Some(grad_seen))),
+        Component::Ribbon(c) => out.push_str(&c.svg_with_grad_seen(Some(grad_seen))),
+        Component::Shape(c) => c.write_svg(out),
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Canvas;
+    use crate::{
+        Align, Axis, DEFAULT_FONT_FAMILY, Fill, Grid, Legend, LegendCategory, Line, Polyline, Rect,
+        SmoothLine, SmoothLineFill, StraightLine, StraightLineFill, Symbol, Text,
+        convert_to_points,
+    };
+    use pretty_assertions::assert_eq;
+    #[test]
+    fn canvas_width_height() {
+        let mut c = Canvas::new(400.0, 300.0);
+
+        assert_eq!("(0,0,0,0)", c.margin.to_string());
+        assert_eq!(400.0, c.width());
+        assert_eq!(300.0, c.height());
+        c = c.child((5.0, 10.0, 15.0, 20.0).into());
+        assert_eq!("(5,10,15,20)", c.margin.to_string());
+        assert_eq!(380.0, c.width());
+        assert_eq!(270.0, c.height());
+    }
+    #[test]
+    fn canvas_line() {
+        let mut c = Canvas::new(400.0, 300.0);
+        let b = c.line(Line {
+            color: Some((0, 0, 0).into()),
+            left: 5.0,
+            top: 5.0,
+            right: 50.0,
+            bottom: 20.0,
+            ..Default::default()
+        });
+        assert_eq!("(5,5,50,20)", b.to_string());
+        assert_eq!(
+            r###"<svg width="400" height="300" viewBox="0 0 400 300" xmlns="http://www.w3.org/2000/svg">
+<line stroke-width="1" x1="5" y1="5" x2="50" y2="20" stroke="#000000"/>
+</svg>"###,
+            c.svg().unwrap()
+        );
+    }
+    #[test]
+    fn canvas_rect() {
+        let mut c = Canvas::new(400.0, 300.0);
+        let b = c.rect(Rect {
+            color: Some((0, 0, 0).into()),
+            fill: Some(Fill::Solid((0, 255, 0).into())),
+            left: 10.0,
+            top: 10.0,
+            width: 100.0,
+            height: 30.0,
+            rx: Some(3.0),
+            ry: Some(5.0),
+            ..Default::default()
+        });
+        assert_eq!("(10,10,110,40)", b.to_string());
+        assert_eq!(
+            r###"<svg width="400" height="300" viewBox="0 0 400 300" xmlns="http://www.w3.org/2000/svg">
+<rect x="10" y="10" width="100" height="30" rx="3" ry="5" stroke="#000000" fill="#00FF00"/>
+</svg>"###,
+            c.svg().unwrap()
+        );
+    }
+    #[test]
+    fn canvas_polyline() {
+        let mut c = Canvas::new(400.0, 300.0);
+        let b = c.polyline(Polyline {
+            color: Some((0, 0, 0).into()),
+            stroke_width: 1.0,
+            points: convert_to_points(&[(1.0, 5.0), (30.0, 60.0), (50.0, 10.0), (70.0, 40.0)]),
+        });
+        assert_eq!("(1,5,70,60)", b.to_string());
+        assert_eq!(
+            r###"<svg width="400" height="300" viewBox="0 0 400 300" xmlns="http://www.w3.org/2000/svg">
+<polyline fill="none" stroke-width="1" points="1,5 30,60 50,10 70,40" stroke="#000000"/>
+</svg>"###,
+            c.svg().unwrap()
+        );
+    }
+    #[test]
+    fn canvas_text() {
+        let mut c = Canvas::new(400.0, 300.0);
+        let b = c.text(Text {
+            text: "Hello World!".to_string(),
+            font_family: Some(DEFAULT_FONT_FAMILY.to_string()),
+            font_size: Some(14.0),
+            font_color: Some((0, 0, 0).into()),
+            font_weight: Some("bold".to_string()),
+            line_height: Some(30.0),
+            ..Default::default()
+        });
+        assert_eq!("(0,0,79,30)", b.to_string());
+        assert_eq!(
+            r###"<svg width="400" height="300" viewBox="0 0 400 300" xmlns="http://www.w3.org/2000/svg">
+<text font-size="14" x="0" y="0" dy="15" font-weight="bold" dominant-baseline="middle" font-family="Roboto" fill="#000000">
+Hello World!
+</text>
+</svg>"###,
+            c.svg().unwrap()
+        );
+    }
+    #[test]
+    fn canvas_smooth_line() {
+        let mut c = Canvas::new(400.0, 300.0);
+        let b = c.smooth_line(SmoothLine {
+            color: Some((0, 0, 0).into()),
+            points: convert_to_points(&[
+                (10.0, 10.0),
+                (30.0, 50.0),
+                (50.0, 80.0),
+                (70.0, 20.0),
+                (90.0, 40.0),
+            ]),
+            stroke_width: 1.0,
+            symbol: Some(Symbol::Circle(3.0, Some((0, 255, 0).into()))),
+            ..Default::default()
+        });
+        assert_eq!("(10,10,90,80)", b.to_string());
+        assert_eq!(
+            r###"<svg width="400" height="300" viewBox="0 0 400 300" xmlns="http://www.w3.org/2000/svg">
+<g>
+<path d="M10,10 C15 20, 24.5 40.3, 30 50 C34.5 57.8, 46.4 82.7, 50 80 C56.4 75.2, 63.1 26.9, 70 20 C73.1 16.9, 85 35, 90 40" stroke-width="1" fill="none" stroke="#000000"/>
+<g stroke-width="1" stroke="#000000" fill="#00FF00">
+<circle cx="10" cy="10" r="3"/>
+<circle cx="30" cy="50" r="3"/>
+<circle cx="50" cy="80" r="3"/>
+<circle cx="70" cy="20" r="3"/>
+<circle cx="90" cy="40" r="3"/>
+</g>
+</g>
+</svg>"###,
+            c.svg().unwrap()
+        );
+    }
+    #[test]
+    fn canvas_straight_line() {
+        let mut c = Canvas::new(400.0, 300.0);
+        let b = c.straight_line(StraightLine {
+            color: Some((0, 0, 0).into()),
+            points: convert_to_points(&[
+                (10.0, 10.0),
+                (30.0, 50.0),
+                (50.0, 80.0),
+                (70.0, 20.0),
+                (90.0, 40.0),
+            ]),
+            stroke_width: 1.0,
+            symbol: Some(Symbol::Circle(3.0, Some((0, 255, 0).into()))),
+            ..Default::default()
+        });
+        assert_eq!("(10,10,90,80)", b.to_string());
+        assert_eq!(
+            r###"<svg width="400" height="300" viewBox="0 0 400 300" xmlns="http://www.w3.org/2000/svg">
+<g>
+<path d="M 10 10 L 30 50 L 50 80 L 70 20 L 90 40" stroke-width="1" fill="none" stroke="#000000"/>
+<g stroke-width="1" stroke="#000000" fill="#00FF00">
+<circle cx="10" cy="10" r="3"/>
+<circle cx="30" cy="50" r="3"/>
+<circle cx="50" cy="80" r="3"/>
+<circle cx="70" cy="20" r="3"/>
+<circle cx="90" cy="40" r="3"/>
+</g>
+</g>
+</svg>"###,
+            c.svg().unwrap()
+        );
+    }
+
+    #[test]
+    fn canvas_smooth_line_fill() {
+        let mut c = Canvas::new(400.0, 300.0);
+        let b = c.smooth_line_fill(SmoothLineFill {
+            fill: Fill::Solid((0, 0, 0).into()),
+            points: convert_to_points(&[
+                (10.0, 10.0),
+                (30.0, 50.0),
+                (50.0, 80.0),
+                (70.0, 20.0),
+                (90.0, 40.0),
+            ]),
+            bottom: 150.0,
+        });
+        assert_eq!("(10,10,90,150)", b.to_string());
+        assert_eq!(
+            r###"<svg width="400" height="300" viewBox="0 0 400 300" xmlns="http://www.w3.org/2000/svg">
+<path d="M10,10 C15 20, 24.5 40.3, 30 50 C34.5 57.8, 46.4 82.7, 50 80 C56.4 75.2, 63.1 26.9, 70 20 C73.1 16.9, 85 35, 90 40M 90 40 L 90 150 L 10 150 L 10 10" fill="#000000"/>
+</svg>"###,
+            c.svg().unwrap()
+        );
+    }
+    #[test]
+    fn canvas_straight_line_fill() {
+        let mut c = Canvas::new(400.0, 300.0);
+        let b = c.straight_line_fill(StraightLineFill {
+            fill: Fill::Solid((0, 0, 0).into()),
+            points: convert_to_points(&[
+                (10.0, 10.0),
+                (30.0, 50.0),
+                (50.0, 80.0),
+                (70.0, 20.0),
+                (90.0, 40.0),
+            ]),
+            bottom: 150.0,
+            ..Default::default()
+        });
+        assert_eq!("(10,10,90,150)", b.to_string());
+        assert_eq!(
+            r###"<svg width="400" height="300" viewBox="0 0 400 300" xmlns="http://www.w3.org/2000/svg">
+<path d="M 10 10 L 30 50 L 50 80 L 70 20 L 90 40 L 90 150 L 10 150 L 10 10" fill="#000000"/>
+</svg>"###,
+            c.svg().unwrap()
+        );
+    }
+    #[test]
+    fn canvas_grid() {
+        let mut c = Canvas::new(400.0, 300.0);
+        let b = c.grid(Grid {
+            left: 10.0,
+            top: 10.0,
+            right: 390.0,
+            bottom: 290.0,
+            color: Some((0, 0, 0).into()),
+            stroke_width: 1.0,
+            verticals: 5,
+            hidden_verticals: vec![0],
+            horizontals: 6,
+            hidden_horizontals: vec![6],
+            ..Default::default()
+        });
+        assert_eq!("(10,10,390,290)", b.to_string());
+        assert_eq!(
+            r###"<svg width="400" height="300" viewBox="0 0 400 300" xmlns="http://www.w3.org/2000/svg">
+<g stroke="#000000" stroke-width="1">
+<line x1="86" y1="10" x2="86" y2="290"/><line x1="162" y1="10" x2="162" y2="290"/><line x1="238" y1="10" x2="238" y2="290"/><line x1="314" y1="10" x2="314" y2="290"/><line x1="390" y1="10" x2="390" y2="290"/><line x1="10" y1="10" x2="390" y2="10"/><line x1="10" y1="56.7" x2="390" y2="56.7"/><line x1="10" y1="103.3" x2="390" y2="103.3"/><line x1="10" y1="150" x2="390" y2="150"/><line x1="10" y1="196.7" x2="390" y2="196.7"/><line x1="10" y1="243.3" x2="390" y2="243.3"/>
+</g>
+</svg>"###,
+            c.svg().unwrap()
+        );
+    }
+    #[test]
+    fn canvas_axis() {
+        let mut c = Canvas::new(400.0, 300.0);
+        let b = c.axis(Axis {
+            data: vec![
+                "Mon".to_string(),
+                "Tue".to_string(),
+                "Wed".to_string(),
+                "Thu".to_string(),
+                "Fri".to_string(),
+                "Sat".to_string(),
+                "Sun".to_string(),
+            ],
+            left: 5.0,
+            top: 5.0,
+            width: 390.0,
+            stroke_color: Some((0, 0, 0).into()),
+            ..Default::default()
+        });
+        assert_eq!("(5,5,395,5)", b.to_string());
+        assert_eq!(
+            r###"<svg width="400" height="300" viewBox="0 0 400 300" xmlns="http://www.w3.org/2000/svg">
+<g>
+<g stroke="#000000" stroke-width="1">
+<line x1="5" y1="5" x2="395" y2="5"/>
+<line x1="5" y1="5" x2="5" y2="10"/>
+<line x1="60.7" y1="5" x2="60.7" y2="10"/>
+<line x1="116.4" y1="5" x2="116.4" y2="10"/>
+<line x1="172.1" y1="5" x2="172.1" y2="10"/>
+<line x1="227.9" y1="5" x2="227.9" y2="10"/>
+<line x1="283.6" y1="5" x2="283.6" y2="10"/>
+<line x1="339.3" y1="5" x2="339.3" y2="10"/>
+<line x1="395" y1="5" x2="395" y2="10"/>
+</g>
+<text font-size="14" x="18.9" y="24" font-family="Roboto">
+Mon
+</text>
+<text font-size="14" x="76.6" y="24" font-family="Roboto">
+Tue
+</text>
+<text font-size="14" x="130.3" y="24" font-family="Roboto">
+Wed
+</text>
+<text font-size="14" x="188" y="24" font-family="Roboto">
+Thu
+</text>
+<text font-size="14" x="247.7" y="24" font-family="Roboto">
+Fri
+</text>
+<text font-size="14" x="300.4" y="24" font-family="Roboto">
+Sat
+</text>
+<text font-size="14" x="355.1" y="24" font-family="Roboto">
+Sun
+</text>
+</g>
+</svg>"###,
+            c.svg().unwrap()
+        );
+
+        // split number
+        let mut c = Canvas::new(400.0, 300.0);
+        let b = c.axis(Axis {
+            data: vec![
+                "Mon".to_string(),
+                "Tue".to_string(),
+                "Wed".to_string(),
+                "Thu".to_string(),
+                "Fri".to_string(),
+                "Sat".to_string(),
+            ],
+            left: 5.0,
+            top: 5.0,
+            width: 390.0,
+            split_number: 3,
+            stroke_color: Some((0, 0, 0).into()),
+            ..Default::default()
+        });
+        assert_eq!("(5,5,395,5)", b.to_string());
+        assert_eq!(
+            r###"<svg width="400" height="300" viewBox="0 0 400 300" xmlns="http://www.w3.org/2000/svg">
+<g>
+<g stroke="#000000" stroke-width="1">
+<line x1="5" y1="5" x2="395" y2="5"/>
+<line x1="5" y1="5" x2="5" y2="10"/>
+<line x1="135" y1="5" x2="135" y2="10"/>
+<line x1="265" y1="5" x2="265" y2="10"/>
+<line x1="395" y1="5" x2="395" y2="10"/>
+</g>
+<text font-size="14" x="23.5" y="24" font-family="Roboto">
+Mon
+</text>
+<text font-size="14" x="90.5" y="24" font-family="Roboto">
+Tue
+</text>
+<text font-size="14" x="153.5" y="24" font-family="Roboto">
+Wed
+</text>
+<text font-size="14" x="220.5" y="24" font-family="Roboto">
+Thu
+</text>
+<text font-size="14" x="289.5" y="24" font-family="Roboto">
+Fri
+</text>
+<text font-size="14" x="351.5" y="24" font-family="Roboto">
+Sat
+</text>
+</g>
+</svg>"###,
+            c.svg().unwrap()
+        );
+
+        // set tick interval
+        let mut c = Canvas::new(400.0, 300.0);
+        let b = c.axis(Axis {
+            data: vec![
+                "Mon".to_string(),
+                "Tue".to_string(),
+                "Wed".to_string(),
+                "Thu".to_string(),
+                "Fri".to_string(),
+                "Sat".to_string(),
+                "Sun".to_string(),
+            ],
+            left: 5.0,
+            top: 5.0,
+            width: 390.0,
+            tick_interval: 2,
+            stroke_color: Some((0, 0, 0).into()),
+            ..Default::default()
+        });
+        assert_eq!("(5,5,395,5)", b.to_string());
+        assert_eq!(
+            r###"<svg width="400" height="300" viewBox="0 0 400 300" xmlns="http://www.w3.org/2000/svg">
+<g>
+<g stroke="#000000" stroke-width="1">
+<line x1="5" y1="5" x2="395" y2="5"/>
+<line x1="5" y1="5" x2="5" y2="10"/>
+<line x1="116.4" y1="5" x2="116.4" y2="10"/>
+<line x1="227.9" y1="5" x2="227.9" y2="10"/>
+<line x1="339.3" y1="5" x2="339.3" y2="10"/>
+</g>
+<text font-size="14" x="18.9" y="24" font-family="Roboto">
+Mon
+</text>
+<text font-size="14" x="76.6" y="24" font-family="Roboto">
+Tue
+</text>
+<text font-size="14" x="130.3" y="24" font-family="Roboto">
+Wed
+</text>
+<text font-size="14" x="188" y="24" font-family="Roboto">
+Thu
+</text>
+<text font-size="14" x="247.7" y="24" font-family="Roboto">
+Fri
+</text>
+<text font-size="14" x="300.4" y="24" font-family="Roboto">
+Sat
+</text>
+<text font-size="14" x="355.1" y="24" font-family="Roboto">
+Sun
+</text>
+</g>
+</svg>"###,
+            c.svg().unwrap()
+        );
+
+        // name align left
+        let mut c = Canvas::new(400.0, 300.0);
+        let b = c.axis(Axis {
+            data: vec![
+                "Mon".to_string(),
+                "Tue".to_string(),
+                "Wed".to_string(),
+                "Thu".to_string(),
+                "Fri".to_string(),
+                "Sat".to_string(),
+                "Sun".to_string(),
+            ],
+            left: 20.0,
+            top: 5.0,
+            width: 360.0,
+            stroke_color: Some((0, 0, 0).into()),
+            name_align: Align::Left,
+            ..Default::default()
+        });
+        assert_eq!("(20,5,380,5)", b.to_string());
+        assert_eq!(
+            r###"<svg width="400" height="300" viewBox="0 0 400 300" xmlns="http://www.w3.org/2000/svg">
+<g>
+<g stroke="#000000" stroke-width="1">
+<line x1="20" y1="5" x2="380" y2="5"/>
+<line x1="20" y1="5" x2="20" y2="10"/>
+<line x1="71.4" y1="5" x2="71.4" y2="10"/>
+<line x1="122.9" y1="5" x2="122.9" y2="10"/>
+<line x1="174.3" y1="5" x2="174.3" y2="10"/>
+<line x1="225.7" y1="5" x2="225.7" y2="10"/>
+<line x1="277.1" y1="5" x2="277.1" y2="10"/>
+<line x1="328.6" y1="5" x2="328.6" y2="10"/>
+<line x1="380" y1="5" x2="380" y2="10"/>
+</g>
+<text font-size="14" x="6" y="24" font-family="Roboto">
+Mon
+</text>
+<text font-size="14" x="68" y="24" font-family="Roboto">
+Tue
+</text>
+<text font-size="14" x="126" y="24" font-family="Roboto">
+Wed
+</text>
+<text font-size="14" x="188" y="24" font-family="Roboto">
+Thu
+</text>
+<text font-size="14" x="252" y="24" font-family="Roboto">
+Fri
+</text>
+<text font-size="14" x="309" y="24" font-family="Roboto">
+Sat
+</text>
+<text font-size="14" x="368" y="24" font-family="Roboto">
+Sun
+</text>
+</g>
+</svg>"###,
+            c.svg().unwrap()
+        );
+    }
+
+    #[test]
+    fn canvas_legend() {
+        let mut c = Canvas::new(400.0, 300.0);
+        let b = c.legend(Legend {
+            text: "Email".to_string(),
+            font_size: 14.0,
+            font_family: DEFAULT_FONT_FAMILY.to_string(),
+            font_color: Some((0, 0, 0).into()),
+            stroke_color: Some((0, 0, 0).into()),
+            fill: Some((0, 0, 0).into()),
+            left: 10.0,
+            top: 10.0,
+            category: LegendCategory::Normal,
+            ..Default::default()
+        });
+        assert_eq!("(10,10,71,24)", b.to_string());
+        assert_eq!(
+            r###"<svg width="400" height="300" viewBox="0 0 400 300" xmlns="http://www.w3.org/2000/svg">
+<g>
+<line stroke-width="2" x1="10" y1="20" x2="35" y2="20" stroke="#000000"/>
+<circle cx="22.5" cy="20" r="5.5" stroke-width="2" stroke="#000000" fill="#000000"/>
+<text font-size="14" x="38" y="24" font-family="Roboto" fill="#000000">
+Email
+</text>
+</g>
+</svg>"###,
+            c.svg().unwrap()
+        );
+
+        let mut c = Canvas::new(400.0, 300.0);
+        let b = c.legend(Legend {
+            text: "Email".to_string(),
+            font_size: 14.0,
+            font_family: DEFAULT_FONT_FAMILY.to_string(),
+            font_color: Some((0, 0, 0).into()),
+            stroke_color: Some((0, 0, 0).into()),
+            fill: Some((0, 0, 0).into()),
+            left: 10.0,
+            top: 10.0,
+            category: LegendCategory::Rect,
+            ..Default::default()
+        });
+        assert_eq!("(10,10,71,24)", b.to_string());
+        assert_eq!(
+            r###"<svg width="400" height="300" viewBox="0 0 400 300" xmlns="http://www.w3.org/2000/svg">
+<g>
+<rect x="10" y="15" width="25" height="10" stroke="#000000" fill="#000000"/>
+<text font-size="14" x="38" y="24" font-family="Roboto" fill="#000000">
+Email
+</text>
+</g>
+</svg>"###,
+            c.svg().unwrap()
+        );
+    }
+}

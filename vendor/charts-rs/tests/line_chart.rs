@@ -1,0 +1,156 @@
+mod common;
+
+use charts_rs::LineChart;
+
+#[test]
+fn line_chart_animation() {
+    let line_chart = LineChart::from_json(
+        r###"{
+            "width": 630, "height": 410,
+            "title_text": "Line Chart with Animation",
+            "series_list": [
+                {"name": "Email",         "data": [120.0, 132.0, 101.0, 134.0,  90.0, 230.0, 210.0]},
+                {"name": "Union Ads",     "data": [220.0, 182.0, 191.0, 234.0, 290.0, 330.0, 310.0]},
+                {"name": "Direct",        "data": [150.0, 232.0, 201.0, 154.0, 190.0, 330.0, 410.0]},
+                {"name": "Search Engine", "data": [320.0, 332.0, 301.0, 334.0, 390.0, 330.0, 320.0]}
+            ],
+            "x_axis_data": ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"],
+            "animation": {"duration": 1000, "easing": "ease", "delay": 80}
+        }"###,
+    )
+    .unwrap();
+    common::assert_snapshot!("line_chart/animation_json.svg", line_chart.svg().unwrap());
+}
+
+#[test]
+fn line_chart_stacked_area() {
+    let line_chart = LineChart::from_json(
+        r###"{
+            "width": 630, "height": 410,
+            "title_text": "Stacked Area Chart",
+            "series_fill": true,
+            "series_list": [
+                {"name": "Email",         "data": [120.0, 132.0, 101.0, 134.0,  90.0, 230.0, 210.0], "stack": "total"},
+                {"name": "Union Ads",     "data": [220.0, 182.0, 191.0, 234.0, 290.0, 330.0, 310.0], "stack": "total"},
+                {"name": "Direct",        "data": [150.0, 232.0, 201.0, 154.0, 190.0, 330.0, 410.0], "stack": "total"},
+                {"name": "Search Engine", "data": [320.0, 332.0, 301.0, 334.0, 390.0, 330.0, 320.0], "stack": "total"}
+            ],
+            "x_axis_data": ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"]
+        }"###,
+    )
+    .unwrap();
+    common::assert_snapshot!(
+        "line_chart/stacked_area_json.svg",
+        line_chart.svg().unwrap()
+    );
+}
+
+#[test]
+fn line_chart() {
+    let line_chart = LineChart::from_json(
+        r###"{
+        "title_text": "Stacked Area Chart",
+        "sub_title_text": "Hello World",
+        "legend_margin": {
+            "top": 50,
+            "bottom": 10
+        },
+        "margin": {
+            "top": 10,
+            "right": 50,
+            "bottom": 10,
+            "left": 10
+        },
+        "series_list": [
+            {
+                "name": "Email",
+                "data": [120.0, 132.0, 101.0, 134.0, 90.0, 230.0, 210.0]
+            },
+            {
+                "name": "Union Ads",
+                "data": [220.0, 182.0, 191.0, 234.0, 290.0, 330.0, 310.0]
+            },
+            {
+                "name": "Direct",
+                "mark_points": [
+                    {
+                        "category": "max"
+                    },
+                    {
+                        "category": "min"
+                    }
+                ],
+                "data": [320.0, 332.0, 301.0, 334.0, 390.0, 330.0, 320.0]
+            },
+            {
+                "name": "Search Engine",
+                "label_show": true,
+                "mark_lines": [
+                    {
+                        "category": "average"
+                    }
+                ],
+                "data": [820.0, 932.0, 901.0, 934.0, 1290.0, 1330.0, 1320.0]
+            }
+        ],
+        "x_axis_name_gap": 0,
+        "x_axis_name_rotate": 0.785,
+        "x_axis_data": [
+            "Monday",
+            "Tue",
+            "Wed",
+            "Thu",
+            "Fri",
+            "Sat",
+            "Sun"
+        ]
+    }"###,
+    )
+    .unwrap();
+    common::assert_snapshot!("line_chart/basic_json.svg", line_chart.svg().unwrap());
+}
+
+#[test]
+fn line_chart_nil_value() {
+    let line_chart = LineChart::from_json(
+        r###"{
+        "title_text": "Stacked Area Chart",
+        "sub_title_text": "Hello World",
+        "legend_margin": {
+            "top": 50,
+            "bottom": 10
+        },
+        "series_list": [
+            {
+                "name": "Email",
+                "data": [120.0, null, 101.0, 134.0, 90.0, 230.0, 210.0]
+            },
+            {
+                "name": "Union Ads",
+                "data": [220.0, 182.0, null, 234.0, 290.0, 330.0, 310.0]
+            },
+            {
+                "name": "Direct",
+                "data": [320.0, 332.0, 301.0, 334.0, null, 330.0, 320.0]
+            },
+            {
+                "name": "Search Engine",
+                "label_show": true,
+                "data": [820.0, 932.0, null, 934.0, 1290.0, 1330.0, 1320.0]
+            }
+        ],
+        "x_axis_data": [
+            "Mon",
+            "Tue",
+            "Wed",
+            "Thu",
+            "Fri",
+            "Sat",
+            "Sun"
+        ]
+    }"###,
+    )
+    .unwrap();
+
+    common::assert_snapshot!("line_chart/nil_value_json.svg", line_chart.svg().unwrap());
+}

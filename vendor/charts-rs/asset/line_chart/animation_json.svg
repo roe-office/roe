@@ -1,0 +1,144 @@
+<svg width="630" height="410" viewBox="0 0 630 410" xmlns="http://www.w3.org/2000/svg">
+<style>@keyframes line-draw{from{stroke-dashoffset:1}to{stroke-dashoffset:0}} .line-anim-0{stroke-dasharray:1;stroke-dashoffset:1;animation:line-draw 1000ms ease 0ms forwards} .line-anim-1{stroke-dasharray:1;stroke-dashoffset:1;animation:line-draw 1000ms ease 80ms forwards} .line-anim-2{stroke-dasharray:1;stroke-dashoffset:1;animation:line-draw 1000ms ease 160ms forwards} .line-anim-3{stroke-dasharray:1;stroke-dashoffset:1;animation:line-draw 1000ms ease 240ms forwards}</style>
+<rect x="0" y="0" width="630" height="410" fill="#FFFFFF"/>
+<text font-size="18" x="208" y="5" dy="15" font-weight="bold" dominant-baseline="middle" font-family="Roboto" fill="#464646">
+Line Chart with Animation
+</text>
+<g>
+<line stroke-width="2" x1="129" y1="50" x2="154" y2="50" stroke="#5470C6"/>
+<circle cx="141.5" cy="50" r="5.5" stroke-width="2" stroke="#5470C6" fill="#FFFFFF"/>
+<text font-size="14" x="157" y="54" font-family="Roboto" fill="#464646">
+Email
+</text>
+</g>
+<g>
+<line stroke-width="2" x1="198" y1="50" x2="223" y2="50" stroke="#91CC75"/>
+<circle cx="210.5" cy="50" r="5.5" stroke-width="2" stroke="#91CC75" fill="#FFFFFF"/>
+<text font-size="14" x="226" y="54" font-family="Roboto" fill="#464646">
+Union Ads
+</text>
+</g>
+<g>
+<line stroke-width="2" x1="298" y1="50" x2="323" y2="50" stroke="#FAC858"/>
+<circle cx="310.5" cy="50" r="5.5" stroke-width="2" stroke="#FAC858" fill="#FFFFFF"/>
+<text font-size="14" x="326" y="54" font-family="Roboto" fill="#464646">
+Direct
+</text>
+</g>
+<g>
+<line stroke-width="2" x1="371" y1="50" x2="396" y2="50" stroke="#EE6666"/>
+<circle cx="383.5" cy="50" r="5.5" stroke-width="2" stroke="#EE6666" fill="#FFFFFF"/>
+<text font-size="14" x="399" y="54" font-family="Roboto" fill="#464646">
+Search Engine
+</text>
+</g>
+<g stroke="#E0E6F2" stroke-width="1">
+<line x1="34" y1="62" x2="625" y2="62"/><line x1="34" y1="114.2" x2="625" y2="114.2"/><line x1="34" y1="166.3" x2="625" y2="166.3"/><line x1="34" y1="218.5" x2="625" y2="218.5"/><line x1="34" y1="270.7" x2="625" y2="270.7"/><line x1="34" y1="322.8" x2="625" y2="322.8"/>
+</g>
+<g>
+
+<text font-size="14" x="2" y="67" font-family="Roboto" fill="#6E7079">
+420
+</text>
+<text font-size="14" x="2" y="119.2" font-family="Roboto" fill="#6E7079">
+350
+</text>
+<text font-size="14" x="2" y="171.3" font-family="Roboto" fill="#6E7079">
+280
+</text>
+<text font-size="14" x="2" y="223.5" font-family="Roboto" fill="#6E7079">
+210
+</text>
+<text font-size="14" x="2" y="275.7" font-family="Roboto" fill="#6E7079">
+140
+</text>
+<text font-size="14" x="10" y="327.8" font-family="Roboto" fill="#6E7079">
+70
+</text>
+<text font-size="14" x="18" y="380" font-family="Roboto" fill="#6E7079">
+0
+</text>
+</g>
+<g>
+<g stroke="#6E7079" stroke-width="1">
+<line x1="34" y1="375" x2="625" y2="375"/>
+<line x1="34" y1="375" x2="34" y2="380"/>
+<line x1="118.4" y1="375" x2="118.4" y2="380"/>
+<line x1="202.9" y1="375" x2="202.9" y2="380"/>
+<line x1="287.3" y1="375" x2="287.3" y2="380"/>
+<line x1="371.7" y1="375" x2="371.7" y2="380"/>
+<line x1="456.1" y1="375" x2="456.1" y2="380"/>
+<line x1="540.6" y1="375" x2="540.6" y2="380"/>
+<line x1="625" y1="375" x2="625" y2="380"/>
+</g>
+<text font-size="14" x="62.2" y="394" font-family="Roboto" fill="#6E7079">
+Mon
+</text>
+<text font-size="14" x="148.6" y="394" font-family="Roboto" fill="#6E7079">
+Tue
+</text>
+<text font-size="14" x="231.1" y="394" font-family="Roboto" fill="#6E7079">
+Wed
+</text>
+<text font-size="14" x="317.5" y="394" font-family="Roboto" fill="#6E7079">
+Thu
+</text>
+<text font-size="14" x="405.9" y="394" font-family="Roboto" fill="#6E7079">
+Fri
+</text>
+<text font-size="14" x="487.4" y="394" font-family="Roboto" fill="#6E7079">
+Sat
+</text>
+<text font-size="14" x="570.8" y="394" font-family="Roboto" fill="#6E7079">
+Sun
+</text>
+</g>
+<g>
+<path d="M 76.2 285.6 L 160.6 276.6 L 245.1 299.7 L 329.5 275.1 L 413.9 307.9 L 498.4 203.6 L 582.8 218.5" stroke-width="2" fill="none" stroke="#5470C6" pathLength="1" class="line-anim-0"/>
+<g stroke-width="2" stroke="#5470C6" fill="#FFFFFF">
+<circle cx="76.2" cy="285.6" r="2"/>
+<circle cx="160.6" cy="276.6" r="2"/>
+<circle cx="245.1" cy="299.7" r="2"/>
+<circle cx="329.5" cy="275.1" r="2"/>
+<circle cx="413.9" cy="307.9" r="2"/>
+<circle cx="498.4" cy="203.6" r="2"/>
+<circle cx="582.8" cy="218.5" r="2"/>
+</g>
+</g>
+<g>
+<path d="M 76.2 211 L 160.6 239.4 L 245.1 232.7 L 329.5 200.6 L 413.9 158.9 L 498.4 129.1 L 582.8 144" stroke-width="2" fill="none" stroke="#91CC75" pathLength="1" class="line-anim-1"/>
+<g stroke-width="2" stroke="#91CC75" fill="#FFFFFF">
+<circle cx="76.2" cy="211" r="2"/>
+<circle cx="160.6" cy="239.4" r="2"/>
+<circle cx="245.1" cy="232.7" r="2"/>
+<circle cx="329.5" cy="200.6" r="2"/>
+<circle cx="413.9" cy="158.9" r="2"/>
+<circle cx="498.4" cy="129.1" r="2"/>
+<circle cx="582.8" cy="144" r="2"/>
+</g>
+</g>
+<g>
+<path d="M 76.2 263.2 L 160.6 202.1 L 245.1 225.2 L 329.5 260.2 L 413.9 233.4 L 498.4 129.1 L 582.8 69.5" stroke-width="2" fill="none" stroke="#FAC858" pathLength="1" class="line-anim-2"/>
+<g stroke-width="2" stroke="#FAC858" fill="#FFFFFF">
+<circle cx="76.2" cy="263.2" r="2"/>
+<circle cx="160.6" cy="202.1" r="2"/>
+<circle cx="245.1" cy="225.2" r="2"/>
+<circle cx="329.5" cy="260.2" r="2"/>
+<circle cx="413.9" cy="233.4" r="2"/>
+<circle cx="498.4" cy="129.1" r="2"/>
+<circle cx="582.8" cy="69.5" r="2"/>
+</g>
+</g>
+<g>
+<path d="M 76.2 136.5 L 160.6 127.6 L 245.1 150.7 L 329.5 126.1 L 413.9 84.4 L 498.4 129.1 L 582.8 136.5" stroke-width="2" fill="none" stroke="#EE6666" pathLength="1" class="line-anim-3"/>
+<g stroke-width="2" stroke="#EE6666" fill="#FFFFFF">
+<circle cx="76.2" cy="136.5" r="2"/>
+<circle cx="160.6" cy="127.6" r="2"/>
+<circle cx="245.1" cy="150.7" r="2"/>
+<circle cx="329.5" cy="126.1" r="2"/>
+<circle cx="413.9" cy="84.4" r="2"/>
+<circle cx="498.4" cy="129.1" r="2"/>
+<circle cx="582.8" cy="136.5" r="2"/>
+</g>
+</g>
+</svg>
