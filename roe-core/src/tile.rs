@@ -2215,7 +2215,7 @@ mod tests {
             grouping: roe_model::impress::ChartGrouping::Standard,
             hole_size_pct: None,
             data_labels: Default::default(),
-            slice_border_color: None, legend_pos: None,
+            slice_border_color: None, legend_pos: None, source: None,
         });
         wb
     }
@@ -3043,7 +3043,7 @@ mod tests {
             grouping: roe_model::impress::ChartGrouping::Standard,
             hole_size_pct: None,
             data_labels: Default::default(),
-            slice_border_color: None, legend_pos: None,
+            slice_border_color: None, legend_pos: None, source: None,
         };
         let no_border = render_chart_model_to_rgba(&model, 200, 150)
             .expect("render_chart_model_to_rgba should succeed");
@@ -3087,7 +3087,7 @@ mod tests {
             grouping: roe_model::impress::ChartGrouping::Standard,
             hole_size_pct: None,
             data_labels: Default::default(),
-            slice_border_color: None, legend_pos: None,
+            slice_border_color: None, legend_pos: None, source: None,
         };
         let legend_on = render_chart_model_to_rgba(&model, 200, 150)
             .expect("render_chart_model_to_rgba should succeed");

@@ -282,6 +282,8 @@ pub extern "C" fn roe_render_sheet_viewport(
     // 两处算法必须保持一致，若未来任一处的换算逻辑变更，需同步修改。
     self::handle::with_entry(handle, |entry| {
         if let RoeDocument::Calc(workbook) = &mut entry.doc {
+            // 图表数据源:渲染前按 source 区域刷新(需在借出单个 sheet 之前)
+            roe_core::chart_source::refresh_chart_sources(workbook, sheet_idx as usize);
             if let Some(sheet) = workbook.sheets.get_mut(sheet_idx as usize) {
                 let cfg = CalcRenderConfig::default();
                 let scale = (zoom_pct.max(100) as f32) / 100.0;

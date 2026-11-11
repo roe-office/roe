@@ -7,5 +7,5 @@ edition = "2021"
 serde     = { workspace = true }
 slotmap   = { workspace = true }
 smallvec  = { workspace = true }
-ratex-types = { path = "../RaTeX/crates/ratex-types" }
+ratex-types = { workspace = true }
 base64   = { workspace = true }

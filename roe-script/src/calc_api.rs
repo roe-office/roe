@@ -4150,7 +4150,7 @@ fn define_and_register_apis(engine: &mut Engine, is_readonly_env: bool) {
                 grouping,
                 hole_size_pct,
                 data_labels,
-                slice_border_color: None, legend_pos: None,
+                slice_border_color: None, legend_pos: None, source: None,
             });
             Some(new_id)
         });

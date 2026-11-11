@@ -214,7 +214,7 @@ mod tests {
             x_axis_label: String::new(), y_axis_label: String::new(),
             border_color: Color { r: 0xcc, g: 0xcc, b: 0xcc, a: 255 }, border_width: 1.0,
             gap_width_pct: None, overlap_pct: None, grouping: ChartGrouping::Standard,
-            hole_size_pct: None, data_labels: DataLabels::default(), slice_border_color: None, legend_pos: None,
+            hole_size_pct: None, data_labels: DataLabels::default(), slice_border_color: None, legend_pos: None, source: None,
         }
     }
     fn j(s: &str) -> Value { serde_json::from_str(s).unwrap() }

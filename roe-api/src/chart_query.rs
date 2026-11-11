@@ -209,12 +209,15 @@ pub(crate) fn chart_config_json(chart: &roe_model::impress::ChartModel) -> Strin
     let x_label_json = serde_json::to_string(&chart.x_axis_label).unwrap_or_else(|_| "\"\"".to_string());
     let y_label_json = serde_json::to_string(&chart.y_axis_label).unwrap_or_else(|_| "\"\"".to_string());
     format!(
-        "{{\"id\":{},\"kind\":\"{}\",\"title\":{},\"x_pt\":{:.2},\"y_pt\":{:.2},\"width_pt\":{:.2},\"height_pt\":{:.2},\"show_legend\":{},\"show_grid\":{},\"x_axis_label\":{},\"y_axis_label\":{},\"border_color\":\"{}\",\"border_width\":{:.2},\"grouping\":\"{}\",\"show_val\":{},\"gap_width_pct\":{},\"overlap_pct\":{},\"hole_size_pct\":{},\"legend_pos\":{}}}",
+        "{{\"id\":{},\"kind\":\"{}\",\"title\":{},\"x_pt\":{:.2},\"y_pt\":{:.2},\"width_pt\":{:.2},\"height_pt\":{:.2},\"show_legend\":{},\"show_grid\":{},\"x_axis_label\":{},\"y_axis_label\":{},\"border_color\":\"{}\",\"border_width\":{:.2},\"grouping\":\"{}\",\"show_val\":{},\"gap_width_pct\":{},\"overlap_pct\":{},\"hole_size_pct\":{},\"default_gap_width_pct\":{},\"default_overlap_pct\":{},\"default_hole_size_pct\":{},\"legend_pos\":{}}}",
         chart.id, kind_str, title_json, chart.x_pt, chart.y_pt, chart.width_pt, chart.height_pt,
         chart.show_legend, chart.show_grid, x_label_json, y_label_json,
         color_to_hex(&chart.border_color), chart.border_width,
         grouping_str, chart.data_labels.show_val,
         opt_f32(chart.gap_width_pct), opt_f32(chart.overlap_pct), opt_f32(chart.hole_size_pct),
+        roe_model::impress::DEFAULT_GAP_WIDTH_PCT,
+        if matches!(chart.grouping, roe_model::impress::ChartGrouping::Standard) { roe_model::impress::DEFAULT_OVERLAP_PCT } else { roe_model::impress::DEFAULT_OVERLAP_STACKED_PCT },
+        roe_model::impress::DEFAULT_HOLE_SIZE_PCT,
         match chart.legend_pos {
             Some(roe_model::impress::LegendPos::Top) => "\"Top\"",
             Some(roe_model::impress::LegendPos::Bottom) => "\"Bottom\"",
@@ -661,7 +664,7 @@ mod tests {
             grouping: roe_model::impress::ChartGrouping::Standard,
             hole_size_pct: None,
             data_labels: Default::default(),
-            slice_border_color: None, legend_pos: None,
+            slice_border_color: None, legend_pos: None, source: None,
         };
         let chart_id = 1u64;
         let mut chart = chart;

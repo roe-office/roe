@@ -1338,7 +1338,7 @@ mod tests {
             grouping: roe_model::impress::ChartGrouping::Standard,
             hole_size_pct: None,
             data_labels: Default::default(),
-            slice_border_color: None, legend_pos: None,
+            slice_border_color: None, legend_pos: None, source: None,
         }
     }
 

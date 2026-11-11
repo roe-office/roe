@@ -8,6 +8,7 @@ pub mod tile_geometry;
 pub mod tile_render_helpers;
 pub mod chart_render;
 pub mod chart_style;
+pub mod chart_source;
 pub mod stat_chart_render;
 pub mod cond_format_render;
 pub mod icon_set_render;

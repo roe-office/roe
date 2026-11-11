@@ -555,6 +555,7 @@ pub(crate) fn parse_ooxml_chart_xml(
         slice_border_color,
         data_labels,
         legend_pos,
+        source: None,
     })
 }
 

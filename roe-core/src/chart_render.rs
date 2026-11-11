@@ -276,7 +276,7 @@ pub fn chart_model_to_svg(model: &ChartModel, width: u32, height: u32) -> Option
             // 组合图文档未写 gapWidth 时，Word 默认 150
             c.bar_margin_pct = model
                 .gap_width_pct
-                .or(Some(150.0))
+                .or(Some(roe_model::impress::DEFAULT_GAP_WIDTH_PCT))
                 .map(|g| g / (n + (n - 1.0) * s));
             // 组合图折线加粗（该字段只影响折线，柱形不用）
             if combo {
@@ -297,7 +297,7 @@ pub fn chart_model_to_svg(model: &ChartModel, width: u32, height: u32) -> Option
             apply_common!(c);
             // gapWidth 以单根柱宽为基准：类目高度 = n*柱高 + g*柱高（g = gapWidth/100）。
             // 留白占类目高度的比例 = g / (n + g)；堆积图等价于 n = 1。
-            if let Some(gw) = Some(model.gap_width_pct.unwrap_or(150.0)) {
+            if let Some(gw) = Some(model.gap_width_pct.unwrap_or(roe_model::impress::DEFAULT_GAP_WIDTH_PCT)) {
                 let g = gw / 100.0;
                 let n = if stacked { 1.0 } else { model.series.len().max(1) as f32 };
                 c.bar_margin_pct = Some(g / (n + g));
@@ -626,7 +626,7 @@ fn chart_model_pie_to_svg(
             let r = (rd / 2.0).min(150.0);
             c.radius = r;
             // Word 的 holeSize 是中心孔占外径的百分比；缺省沿用 60%
-            c.inner_radius = r * model.hole_size_pct.map(|h| h / 100.0).unwrap_or(0.6).clamp(0.0, 0.95);
+            c.inner_radius = r * model.hole_size_pct.map(|h| h / 100.0).unwrap_or(roe_model::impress::DEFAULT_HOLE_SIZE_PCT / 100.0).clamp(0.0, 0.95);
             c.svg().ok()?
         }
         _ => {

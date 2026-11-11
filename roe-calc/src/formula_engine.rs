@@ -1418,6 +1418,16 @@ pub fn eval_formula_with_deps_with_resolver_and_cell(
     current_cell: Option<(u32, u32)>,
 ) -> (CellValue, Vec<(String, u32, u32)>) {
     ensure_builtins_loaded();
+    // v321: 仅 SUBTOTAL 公式才取当前 sheet 的 row_hidden(避免普通公式白白复制)
+    let _row_hidden_guard = {
+        let prev = ROE_ROW_HIDDEN.with(|c| c.borrow_mut().take());
+        let up_f = formula.to_uppercase();
+        if up_f.contains("SUBTOTAL") || up_f.contains("AGGREGATE") {
+            let cur = resolver.find_sheet(None).map(|sh| sh.row_hidden.clone());
+            ROE_ROW_HIDDEN.with(|c| *c.borrow_mut() = cur);
+        }
+        RowHiddenGuard(prev)
+    };
     // formualizer 要求公式以 '=' 开头，否则整串被当成文本字面量。
     // roe-calc 内部约定公式字符串不含前导 '='（见 CellValue::Formula 注释），
     // 这里统一补上，调用方不需要关心这个细节。
@@ -1574,7 +1584,354 @@ fn ensure_roe_subtotal_registered() {
         formualizer_eval::function_registry::register_function(std::sync::Arc::new(
             RoeSubtotalFn,
         ));
+        formualizer_eval::function_registry::register_function(std::sync::Arc::new(
+            RoeAggregateFn,
+        ));
     });
+}
+
+// ===== v322: AGGREGATE(功能号 1~19,option 0~7),覆盖 formualizer 自带的不完整实现 =====
+fn roe_agg_scalar(h: &formualizer_eval::traits::ArgumentHandle<'_, '_>) -> Result<f64, ExcelError> {
+    match h.value()?.into_literal() {
+        LiteralValue::Empty => Ok(0.0), // Excel: 空单元格当 0(如 option 引用空格)
+        LiteralValue::Number(n) => Ok(n),
+        LiteralValue::Int(n) => Ok(n as f64),
+        LiteralValue::Error(e) => Err(e),
+        _ => Err(ExcelError::new(ExcelErrorKind::Value)),
+    }
+}
+
+fn roe_agg_percentile_inc(sorted: &[f64], p: f64) -> f64 {
+    let n = sorted.len();
+    let rank = p * (n as f64 - 1.0);
+    let lo = rank.floor() as usize;
+    let frac = rank - lo as f64;
+    if lo + 1 >= n {
+        sorted[n - 1]
+    } else {
+        sorted[lo] + frac * (sorted[lo + 1] - sorted[lo])
+    }
+}
+
+fn roe_agg_percentile_exc(sorted: &[f64], p: f64) -> Result<f64, ExcelErrorKind> {
+    let n = sorted.len();
+    let rank = p * (n as f64 + 1.0);
+    if rank < 1.0 || rank > n as f64 {
+        return Err(ExcelErrorKind::Num);
+    }
+    let lo = rank.floor() as usize;
+    let frac = rank - lo as f64;
+    if lo >= n {
+        Ok(sorted[n - 1])
+    } else {
+        Ok(sorted[lo - 1] + frac * (sorted[lo] - sorted[lo - 1]))
+    }
+}
+
+fn roe_agg_compute(
+    fnum: i64,
+    nums: &[f64],
+    counta: u64,
+    k: Option<f64>,
+) -> Result<f64, ExcelErrorKind> {
+    let n = nums.len();
+    let sum: f64 = nums.iter().sum();
+    let mean = if n > 0 { sum / n as f64 } else { 0.0 };
+    let ss: f64 = nums.iter().map(|x| (x - mean) * (x - mean)).sum();
+    let mut sorted = nums.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    match fnum {
+        1 => {
+            if n == 0 { Err(ExcelErrorKind::Div) } else { Ok(sum / n as f64) }
+        }
+        2 => Ok(n as f64),
+        3 => Ok(counta as f64),
+        4 => Ok(if n == 0 { 0.0 } else { nums.iter().cloned().fold(f64::NEG_INFINITY, f64::max) }),
+        5 => Ok(if n == 0 { 0.0 } else { nums.iter().cloned().fold(f64::INFINITY, f64::min) }),
+        6 => Ok(if n == 0 { 0.0 } else { nums.iter().product::<f64>() }),
+        7 => {
+            if n < 2 { Err(ExcelErrorKind::Div) } else { Ok((ss / ((n - 1) as f64)).sqrt()) }
+        }
+        8 => {
+            if n < 1 { Err(ExcelErrorKind::Div) } else { Ok((ss / (n as f64)).sqrt()) }
+        }
+        9 => Ok(sum),
+        10 => {
+            if n < 2 { Err(ExcelErrorKind::Div) } else { Ok(ss / ((n - 1) as f64)) }
+        }
+        11 => {
+            if n < 1 { Err(ExcelErrorKind::Div) } else { Ok(ss / (n as f64)) }
+        }
+        12 => {
+            if n == 0 {
+                Err(ExcelErrorKind::Num)
+            } else if n % 2 == 1 {
+                Ok(sorted[n / 2])
+            } else {
+                Ok((sorted[n / 2 - 1] + sorted[n / 2]) / 2.0)
+            }
+        }
+        13 => {
+            // Excel 口径:并列时取先出现的值;没有重复值返回 #N/A
+            let mut best: Option<(f64, usize)> = None;
+            for &x in nums {
+                let c = nums.iter().filter(|&&y| y == x).count();
+                let replace = match best {
+                    Some((_, bc)) => c > bc,
+                    None => true,
+                };
+                if replace {
+                    best = Some((x, c));
+                }
+            }
+            match best {
+                Some((x, c)) if c >= 2 => Ok(x),
+                _ => Err(ExcelErrorKind::Na),
+            }
+        }
+        14 | 15 => {
+            // 非整数 k 的取整口径未经样本验证,这里向上取整
+            let kk = k.ok_or(ExcelErrorKind::Value)?.ceil();
+            if n == 0 || kk < 1.0 || kk > n as f64 {
+                return Err(ExcelErrorKind::Num);
+            }
+            let idx = kk as usize - 1;
+            Ok(if fnum == 14 { sorted[n - 1 - idx] } else { sorted[idx] })
+        }
+        16 => {
+            let p = k.ok_or(ExcelErrorKind::Value)?;
+            if n == 0 || !(0.0..=1.0).contains(&p) {
+                Err(ExcelErrorKind::Num)
+            } else {
+                Ok(roe_agg_percentile_inc(&sorted, p))
+            }
+        }
+        17 => {
+            let q = k.ok_or(ExcelErrorKind::Value)?.trunc();
+            if n == 0 || !(0.0..=4.0).contains(&q) {
+                Err(ExcelErrorKind::Num)
+            } else {
+                Ok(roe_agg_percentile_inc(&sorted, q / 4.0))
+            }
+        }
+        18 => {
+            let p = k.ok_or(ExcelErrorKind::Value)?;
+            if n == 0 || p <= 0.0 || p >= 1.0 {
+                Err(ExcelErrorKind::Num)
+            } else {
+                roe_agg_percentile_exc(&sorted, p)
+            }
+        }
+        19 => {
+            let q = k.ok_or(ExcelErrorKind::Value)?.trunc();
+            if n == 0 || !(1.0..=3.0).contains(&q) {
+                Err(ExcelErrorKind::Num)
+            } else {
+                roe_agg_percentile_exc(&sorted, q / 4.0)
+            }
+        }
+        _ => Err(ExcelErrorKind::Value),
+    }
+}
+
+#[derive(Debug)]
+struct RoeAggregateFn;
+
+impl Function for RoeAggregateFn {
+    fn name(&self) -> &'static str {
+        "AGGREGATE"
+    }
+
+    fn min_args(&self) -> usize {
+        3
+    }
+
+    fn variadic(&self) -> bool {
+        true
+    }
+
+    fn arg_schema(&self) -> &'static [formualizer_eval::args::ArgSchema] {
+        static SCHEMA: std::sync::LazyLock<Vec<formualizer_eval::args::ArgSchema>> =
+            std::sync::LazyLock::new(|| {
+                vec![
+                    formualizer_eval::args::ArgSchema::number_lenient_scalar(),
+                    formualizer_eval::args::ArgSchema::number_lenient_scalar(),
+                    {
+                        let mut s = formualizer_eval::args::ArgSchema::any();
+                        s.shape = formualizer_eval::args::ShapeKind::Range;
+                        s.repeating = Some(1);
+                        s
+                    },
+                ]
+            });
+        &SCHEMA
+    }
+
+    fn eval<'a, 'b, 'c>(
+        &self,
+        args: &'c [formualizer_eval::traits::ArgumentHandle<'a, 'b>],
+        ctx: &dyn formualizer_eval::traits::FunctionContext<'b>,
+    ) -> Result<formualizer_eval::traits::CalcValue<'b>, ExcelError> {
+        use formualizer_eval::traits::CalcValue;
+        let fail = |kind: ExcelErrorKind| -> Result<CalcValue<'b>, ExcelError> {
+            Ok(CalcValue::Scalar(LiteralValue::Error(ExcelError::new(kind))))
+        };
+        let pass = |e: ExcelError| -> Result<CalcValue<'b>, ExcelError> {
+            Ok(CalcValue::Scalar(LiteralValue::Error(e)))
+        };
+
+        if args.len() < 3 {
+            return fail(ExcelErrorKind::Value);
+        }
+        let fnum = match roe_agg_scalar(&args[0]) {
+            Ok(v) => v as i64,
+            Err(e) => return pass(e),
+        };
+        let option = match roe_agg_scalar(&args[1]) {
+            Ok(v) => v as i64,
+            Err(e) => return pass(e),
+        };
+        if !(1..=19).contains(&fnum) || !(0..=7).contains(&option) {
+            return fail(ExcelErrorKind::Value);
+        }
+        let needs_k = fnum >= 14;
+        let k = if needs_k {
+            if args.len() < 4 {
+                return fail(ExcelErrorKind::Value);
+            }
+            match roe_agg_scalar(&args[3]) {
+                Ok(v) => Some(v),
+                Err(e) => return pass(e),
+            }
+        } else {
+            None
+        };
+
+        // Excel 规则:0~3 忽略嵌套 SUBTOTAL/AGGREGATE;1/3/5/7 忽略隐藏行;2/3/6/7 忽略错误值
+        let skip_nested = option <= 3;
+        let skip_hidden = matches!(option, 1 | 3 | 5 | 7);
+        let ignore_err = matches!(option, 2 | 3 | 6 | 7);
+        let hidden_rows: Option<Vec<bool>> = if skip_hidden {
+            ROE_ROW_HIDDEN.with(|c| c.borrow().clone())
+        } else {
+            None
+        };
+        let data_args = if needs_k { &args[2..3] } else { &args[2..] };
+
+        let mut nums: Vec<f64> = Vec::new();
+        let mut counta: u64 = 0;
+
+        for arg in data_args {
+            let view = match arg.range_view() {
+                Ok(v) => v,
+                Err(_) => {
+                    match arg.value()?.into_literal() {
+                        LiteralValue::Number(n) => {
+                            nums.push(n);
+                            counta += 1;
+                        }
+                        LiteralValue::Int(n) => {
+                            nums.push(n as f64);
+                            counta += 1;
+                        }
+                        LiteralValue::Error(e) => {
+                            if !(ignore_err || fnum == 2) {
+                                if fnum == 3 {
+                                    counta += 1;
+                                } else {
+                                    return pass(e);
+                                }
+                            }
+                        }
+                        LiteralValue::Empty => {}
+                        _ => {
+                            counta += 1;
+                        }
+                    }
+                    continue;
+                }
+            };
+
+            use formualizer_parse::parser::ReferenceType as RT;
+            let (abs_start_row1, abs_start_col1): (u32, u32) = match arg.as_reference_or_eval() {
+                Ok(RT::Range { start_row, start_col, .. }) => {
+                    (start_row.unwrap_or(1), start_col.unwrap_or(1))
+                }
+                Ok(RT::Cell { row, col, .. }) => (row, col),
+                _ => (1, 1),
+            };
+
+            let (view_rows, view_cols) = view.dims();
+            for r in 0..view_rows {
+                for c in 0..view_cols {
+                    if skip_nested {
+                        let cell_ref = formualizer_eval::reference::CellRef::new_absolute(
+                            0,
+                            abs_start_row1 + r as u32,
+                            abs_start_col1 + c as u32,
+                        );
+                        if let Ok(Some(ft)) = ctx.formula_text_at_cell(cell_ref) {
+                            let up = ft.to_uppercase().replace(' ', "");
+                            if up.contains("SUBTOTAL(") || up.contains("AGGREGATE(") {
+                                continue;
+                            }
+                        }
+                    }
+                    if let Some(h) = &hidden_rows {
+                        let row0 = (abs_start_row1 as usize + r).saturating_sub(1);
+                        if h.get(row0).copied().unwrap_or(false) {
+                            continue;
+                        }
+                    }
+                    match view.get_cell(r, c) {
+                        LiteralValue::Number(n) => {
+                            nums.push(n);
+                            counta += 1;
+                        }
+                        LiteralValue::Int(n) => {
+                            nums.push(n as f64);
+                            counta += 1;
+                        }
+                        LiteralValue::Error(e) => {
+                            if ignore_err || fnum == 2 {
+                                continue;
+                            }
+                            if fnum == 3 {
+                                counta += 1;
+                                continue;
+                            }
+                            return pass(e);
+                        }
+                        LiteralValue::Empty => {}
+                        _ => {
+                            counta += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        match roe_agg_compute(fnum, &nums, counta, k) {
+            Ok(v) => Ok(CalcValue::Scalar(LiteralValue::Number(v))),
+            Err(kind) => fail(kind),
+        }
+    }
+}
+
+thread_local! {
+    /// v321: 当前求值公式所在 sheet 的 row_hidden(仅公式含 SUBTOTAL 时设置),
+    /// 供 RoeSubtotalFn 在 101~111 时跳过手动隐藏行。
+    static ROE_ROW_HIDDEN: std::cell::RefCell<Option<Vec<bool>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// 离开作用域时恢复进入前的值,保证递归求值(hook)互不覆盖。
+struct RowHiddenGuard(Option<Vec<bool>>);
+impl Drop for RowHiddenGuard {
+    fn drop(&mut self) {
+        let prev = self.0.take();
+        ROE_ROW_HIDDEN.with(|c| *c.borrow_mut() = prev);
+    }
 }
 
 #[derive(Debug)]
@@ -1644,7 +2001,13 @@ impl Function for RoeSubtotalFn {
         };
 
         // v318: 101~111 与 1~11 同义(对齐 LOK ScSubTotal);隐藏/筛选行暂不处理
-        let function_num = if (101..=111).contains(&function_num) { function_num - 100 } else { function_num };
+        let skip_hidden = (101..=111).contains(&function_num);
+        let function_num = if skip_hidden { function_num - 100 } else { function_num };
+        let hidden_rows: Option<Vec<bool>> = if skip_hidden {
+            ROE_ROW_HIDDEN.with(|c| c.borrow().clone())
+        } else {
+            None
+        };
         if !(1..=11).contains(&function_num) {
             // 未支持的 function_num：明确返回 #VALUE!，不要静默当成 SUM，
             // 避免调用方以为聚合口径是对的但实际算错。
@@ -1740,7 +2103,24 @@ impl Function for RoeSubtotalFn {
                         }
                     }
 
+                    if let Some(h) = &hidden_rows {
+                        let row0 = (abs_start_row1 as usize + r).saturating_sub(1);
+                        if h.get(row0).copied().unwrap_or(false) {
+                            continue;
+                        }
+                    }
                     let v = view.get_cell(r, c);
+                    // v321: Excel 口径 —— COUNTA(3) 把错误值计入个数,COUNT(2) 忽略错误值,
+                    // 其余功能号遇错误值照旧向外返回错误。
+                    if let LiteralValue::Error(_) = &v {
+                        if function_num == 3 {
+                            counta += 1;
+                            continue;
+                        }
+                        if function_num == 2 {
+                            continue;
+                        }
+                    }
                     match v {
                         LiteralValue::Number(n) => {
                             sum += n;
@@ -1894,6 +2274,131 @@ mod tests {
         match v318_eval(f) {
             CellValue::Number(n) => n,
             other => panic!("{f}: 期望数值,得到 {other:?}"),
+        }
+    }
+
+    /// v321: 区域含错误值时,COUNTA 计入、COUNT 忽略、SUM 仍返回错误(对齐 Excel)
+    fn v321_eval_with_error(f: &str) -> CellValue {
+        let sheet1 = sheet_with_column_a(
+            "Sheet1",
+            vec![
+                CellValue::Number(10.0),
+                CellValue::Error(CellError::Div0),
+                CellValue::Number(30.0),
+            ],
+        );
+        let workbook = Workbook {
+            sheets: vec![sheet1],
+            named_ranges: Default::default(),
+            named_formulas: Default::default(),
+            styles: Default::default(),
+            formula_dialect_source: Default::default(),
+        };
+        eval_formula(&workbook, "Sheet1", f)
+    }
+
+    /// v321: 手动隐藏行 —— 101~111 排除,1~11 包含(Excel 规则)
+    fn v321_eval_with_hidden_row(f: &str) -> CellValue {
+        let mut sheet1 = sheet_with_column_a(
+            "Sheet1",
+            vec![
+                CellValue::Number(10.0),
+                CellValue::Number(20.0),
+                CellValue::Number(30.0),
+            ],
+        );
+        sheet1.row_hidden = vec![false, true, false];
+        let workbook = Workbook {
+            sheets: vec![sheet1],
+            named_ranges: Default::default(),
+            named_formulas: Default::default(),
+            styles: Default::default(),
+            formula_dialect_source: Default::default(),
+        };
+        eval_formula(&workbook, "Sheet1", f)
+    }
+
+    #[test]
+    fn v321_subtotal_hidden_rows() {
+        let num = |f: &str| match v321_eval_with_hidden_row(f) {
+            CellValue::Number(n) => n,
+            other => panic!("{f}: 期望数值,得到 {other:?}"),
+        };
+        assert_eq!(num("SUBTOTAL(109,A1:A3)"), 40.0, "109 应排除隐藏行");
+        assert_eq!(num("SUBTOTAL(9,A1:A3)"), 60.0, "9 应包含手动隐藏行");
+        assert_eq!(num("SUBTOTAL(101,A1:A3)"), 20.0, "101 平均值排除隐藏行 (10+30)/2");
+        assert_eq!(num("SUBTOTAL(1,A1:A3)"), 20.0, "1 平均值包含隐藏行 (10+20+30)/3");
+        assert_eq!(num("SUBTOTAL(102,A1:A3)"), 2.0, "102 计数排除隐藏行");
+        assert_eq!(num("SUBTOTAL(2,A1:A3)"), 3.0, "2 计数包含隐藏行");
+    }
+
+    /// v322: AGGREGATE —— A1..A6 = 10, 20(隐藏), #DIV/0!, 40, 50, 嵌套 SUBTOTAL 行(缓存 30)
+    fn v322_agg(f: &str) -> CellValue {
+        let mut sheet1 = sheet_with_column_a(
+            "Sheet1",
+            vec![
+                CellValue::Number(10.0),
+                CellValue::Number(20.0),
+                CellValue::Error(CellError::Div0),
+                CellValue::Number(40.0),
+                CellValue::Number(50.0),
+                CellValue::Formula {
+                    source: "SUBTOTAL(9,A1:A2)".to_string(),
+                    cached: Box::new(CellValue::Number(30.0)),
+                },
+            ],
+        );
+        sheet1.row_hidden = vec![false, true, false, false, false, false];
+        let workbook = Workbook {
+            sheets: vec![sheet1],
+            named_ranges: Default::default(),
+            named_formulas: Default::default(),
+            styles: Default::default(),
+            formula_dialect_source: Default::default(),
+        };
+        eval_formula(&workbook, "Sheet1", f)
+    }
+
+    #[test]
+    fn v322_aggregate_options_and_functions() {
+        let num = |f: &str| match v322_agg(f) {
+            CellValue::Number(n) => n,
+            other => panic!("{f}: 期望数值,得到 {other:?}"),
+        };
+        let is_err = |f: &str| matches!(v322_agg(f), CellValue::Error(_));
+        // 选项:4/5 遇错误值返回错误
+        assert!(is_err("AGGREGATE(9,4,A1:A6)"), "option 4 不忽略错误");
+        assert!(is_err("AGGREGATE(9,5,A1:A6)"), "option 5 只忽略隐藏行,错误仍返回");
+        assert_eq!(num("AGGREGATE(9,6,A1:A6)"), 150.0, "6: 忽略错误,含隐藏与嵌套");
+        assert_eq!(num("AGGREGATE(9,7,A1:A6)"), 130.0, "7: 忽略隐藏+错误,含嵌套");
+        assert_eq!(num("AGGREGATE(9,3,A1:A6)"), 100.0, "3: 隐藏/错误/嵌套全忽略");
+        assert_eq!(num("AGGREGATE(9,2,A1:A6)"), 120.0, "2: 忽略错误+嵌套,含隐藏");
+        assert_eq!(num("AGGREGATE(2,4,A1:A6)"), 5.0, "COUNT 忽略错误值,含嵌套");
+        assert_eq!(num("AGGREGATE(3,4,A1:A6)"), 6.0, "COUNTA 计入错误值");
+        // 功能号 12~19(数据为 10/40/50)
+        assert_eq!(num("AGGREGATE(12,3,A1:A6)"), 40.0);
+        assert!(is_err("AGGREGATE(13,3,A1:A6)"), "无重复值 MODE 返回 #N/A");
+        assert_eq!(num("AGGREGATE(14,3,A1:A6,2)"), 40.0);
+        assert_eq!(num("AGGREGATE(15,3,A1:A6,1)"), 10.0);
+        assert_eq!(num("AGGREGATE(16,3,A1:A6,0.5)"), 40.0);
+        assert!((num("AGGREGATE(17,3,A1:A6,1)") - 25.0).abs() < 1e-9);
+        assert_eq!(num("AGGREGATE(18,3,A1:A6,0.5)"), 40.0);
+        assert_eq!(num("AGGREGATE(19,3,A1:A6,1)"), 10.0);
+    }
+
+    #[test]
+    fn v321_subtotal_error_values_counting() {
+        match v321_eval_with_error("SUBTOTAL(3,A1:A3)") {
+            CellValue::Number(n) => assert_eq!(n, 3.0, "COUNTA 应把错误值计入"),
+            other => panic!("SUBTOTAL(3): 期望数值 3,得到 {other:?}"),
+        }
+        match v321_eval_with_error("SUBTOTAL(2,A1:A3)") {
+            CellValue::Number(n) => assert_eq!(n, 2.0, "COUNT 应忽略错误值"),
+            other => panic!("SUBTOTAL(2): 期望数值 2,得到 {other:?}"),
+        }
+        match v321_eval_with_error("SUBTOTAL(9,A1:A3)") {
+            CellValue::Error(_) => {}
+            other => panic!("SUBTOTAL(9): 期望返回错误,得到 {other:?}"),
         }
     }
 

@@ -379,6 +379,22 @@ pub enum LegendPos {
     Right,
 }
 
+/// 图表数据源:绑定到单元格区域(0-based,含端点),渲染前据此刷新数据。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChartSource {
+    pub sheet: u32,
+    pub r1: u32,
+    pub c1: u32,
+    pub r2: u32,
+    pub c2: u32,
+    /// 区域首行是否为表头(系列名)
+    #[serde(default)]
+    pub header_row: bool,
+    /// 区域首列是否为分类(股票图为日期)
+    #[serde(default = "default_true")]
+    pub cat_col: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChartModel {
     /// 图表稳定标识，自增，同一 sheet 内唯一。0 保留为"无效/未分配"哨兵值，
@@ -444,6 +460,9 @@ pub struct ChartModel {
     /// 图例位置;None=未指定(渲染走 charts-rs 默认顶部,存盘按图型默认)。
     #[serde(default)]
     pub legend_pos: Option<LegendPos>,
+    /// 数据源区域;None=数据为字面量快照(不随单元格变化)。
+    #[serde(default)]
+    pub source: Option<ChartSource>,
 }
 
 fn default_chart_size() -> f32 { 300.0 }
@@ -452,6 +471,11 @@ pub const DEFAULT_CHART_TITLE: &str = "我的图表";
 /// 坐标轴标题占位时的默认文字。
 pub const DEFAULT_X_AXIS_TITLE: &str = "X轴";
 pub const DEFAULT_Y_AXIS_TITLE: &str = "Y轴";
+/// 图表样式缺省值(渲染层、OOXML 存盘层、配置查询共用,只在此定义一次)
+pub const DEFAULT_GAP_WIDTH_PCT: f32 = 150.0;
+pub const DEFAULT_OVERLAP_PCT: f32 = 0.0;
+pub const DEFAULT_OVERLAP_STACKED_PCT: f32 = 100.0;
+pub const DEFAULT_HOLE_SIZE_PCT: f32 = 60.0;
 
 fn default_true() -> bool { true }
 fn default_chart_border_color() -> crate::common::Color {

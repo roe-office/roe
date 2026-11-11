@@ -139,7 +139,7 @@ pub extern "C" fn roe_render_chart_to_png(
             if req.show_val { d.show_val = true; }
             d
         },
-        slice_border_color: None, legend_pos: None,
+        slice_border_color: None, legend_pos: None, source: None,
     };
 
     let png = roe_impress::chart::render_chart_to_png(&model, req.width, req.height);

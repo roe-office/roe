@@ -65,15 +65,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "alloca"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e5a7d05ea6aea7e9e64d25b9156ba2fee3fdd659e34e41063cd2fc7cd020d7f4"
-dependencies = [
- "cc",
-]
-
-[[package]]
 name = "allocator-api2"
 version = "0.2.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -845,10 +836,6 @@ name = "charts-rs"
 version = "2.3.0"
 dependencies = [
  "arc-swap",
- "criterion 0.8.2",
- "image",
- "pretty_assertions",
- "resvg 0.48.1",
  "serde",
  "serde_json",
  "ttf-parser",
@@ -1061,7 +1048,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "be17b688510d934ce13f48a2beba700e11583e281e0fda99c22bb256a14eda73"
 dependencies = [
  "bitflags",
- "fontdb 0.23.0",
+ "fontdb",
  "harfrust 0.5.2",
  "linebender_resource_handle",
  "log",
@@ -1115,7 +1102,7 @@ dependencies = [
  "cast",
  "ciborium",
  "clap",
- "criterion-plot 0.5.0",
+ "criterion-plot",
  "is-terminal",
  "itertools 0.10.5",
  "num-traits",
@@ -1132,31 +1119,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "criterion"
-version = "0.8.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "950046b2aa2492f9a536f5f4f9a3de7b9e2476e575e05bd6c333371add4d98f3"
-dependencies = [
- "alloca",
- "anes",
- "cast",
- "ciborium",
- "clap",
- "criterion-plot 0.8.2",
- "itertools 0.13.0",
- "num-traits",
- "oorandom",
- "page_size",
- "plotters",
- "rayon",
- "regex",
- "serde",
- "serde_json",
- "tinytemplate",
- "walkdir",
-]
-
-[[package]]
 name = "criterion-plot"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1164,16 +1126,6 @@ checksum = "6b50826342786a51a89e2da3a28f1c32b06e387201bc2d19791f622c673706b1"
 dependencies = [
  "cast",
  "itertools 0.10.5",
-]
-
-[[package]]
-name = "criterion-plot"
-version = "0.8.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d8d80a2f4f5b554395e47b5d8305bc3d27813bacb73493eb1001e8f76dae29ea"
-dependencies = [
- "cast",
- "itertools 0.13.0",
 ]
 
 [[package]]
@@ -1336,12 +1288,6 @@ dependencies = [
  "quote",
  "syn 2.0.119",
 ]
-
-[[package]]
-name = "diff"
-version = "0.1.13"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "56254986775e3233ffa9c4d7d3faaf6d36a2c09d30b20687e9f88bc8bafc16c8"
 
 [[package]]
 name = "digest"
@@ -1694,20 +1640,9 @@ dependencies = [
 ]
 
 [[package]]
-name = "fontdb"
-version = "0.24.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2660c5e9157bf76d2db1294e4a9feba604ef610819a3b591088d0d8392a3290f"
-dependencies = [
- "fontconfig-parser",
- "log",
- "slotmap",
- "tinyvec",
-]
-
-[[package]]
 name = "fontique"
 version = "0.11.0"
+source = "git+https://github.com/linebender/parley.git?rev=78de830e4ef1ab6d3558f92d815ca40f2ab98eaf#78de830e4ef1ab6d3558f92d815ca40f2ab98eaf"
 dependencies = [
  "hashbrown 0.17.1",
  "linebender_resource_handle",
@@ -1718,11 +1653,11 @@ dependencies = [
  "objc2-foundation",
  "parlance",
  "read-fonts 0.41.0",
- "roe-fontconfig-sys",
  "roxmltree 0.21.1",
  "smallvec",
  "windows",
  "windows-core",
+ "yeslogic-fontconfig-sys",
 ]
 
 [[package]]
@@ -2499,12 +2434,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "09e54e57b4c48b40f7aec75635392b12b3421fa26fe8b4332e63138ed278459c"
 
 [[package]]
-name = "imagesize"
-version = "0.15.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "65b27460c2c92b037f3f94c538ed9a3342f3fdf923606781629ccb35f82d042a"
-
-[[package]]
 name = "imgref"
 version = "1.12.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2577,15 +2506,6 @@ name = "itertools"
 version = "0.10.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b0fd2260e829bddf4cb6ea802289de2f86d6a7a690192fbe91b3f46e0f2c8473"
-dependencies = [
- "either",
-]
-
-[[package]]
-name = "itertools"
-version = "0.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "413ee7dfc52ee1a4949ceeb7dbc8a33f2d6c088194d9f922fb8318faf1f01186"
 dependencies = [
  "either",
 ]
@@ -3265,16 +3185,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "page_size"
-version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "30d5b2194ed13191c1999ae0704b7839fb18384fa22e49b57eeaa97d79ce40da"
-dependencies = [
- "libc",
- "winapi",
-]
-
-[[package]]
 name = "parking"
 version = "2.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3306,10 +3216,12 @@ dependencies = [
 [[package]]
 name = "parlance"
 version = "0.1.0"
+source = "git+https://github.com/linebender/parley.git?rev=78de830e4ef1ab6d3558f92d815ca40f2ab98eaf#78de830e4ef1ab6d3558f92d815ca40f2ab98eaf"
 
 [[package]]
 name = "parley"
 version = "0.11.0"
+source = "git+https://github.com/linebender/parley.git?rev=78de830e4ef1ab6d3558f92d815ca40f2ab98eaf#78de830e4ef1ab6d3558f92d815ca40f2ab98eaf"
 dependencies = [
  "fontique",
  "hashbrown 0.17.1",
@@ -3322,6 +3234,7 @@ dependencies = [
 [[package]]
 name = "parley_data"
 version = "0.11.0"
+source = "git+https://github.com/linebender/parley.git?rev=78de830e4ef1ab6d3558f92d815ca40f2ab98eaf#78de830e4ef1ab6d3558f92d815ca40f2ab98eaf"
 dependencies = [
  "icu_properties",
 ]
@@ -3329,6 +3242,7 @@ dependencies = [
 [[package]]
 name = "parley_engine"
 version = "0.11.0"
+source = "git+https://github.com/linebender/parley.git?rev=78de830e4ef1ab6d3558f92d815ca40f2ab98eaf#78de830e4ef1ab6d3558f92d815ca40f2ab98eaf"
 dependencies = [
  "fontique",
  "harfrust 0.12.0",
@@ -4219,16 +4133,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "pretty_assertions"
-version = "1.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3ae130e2f271fbc2ac3a40fb1d07180839cdbbe443c7a27e1e3c13c5cac0116d"
-dependencies = [
- "diff",
- "yansi",
-]
-
-[[package]]
 name = "prettyplease"
 version = "0.2.37"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4474,7 +4378,8 @@ checksum = "973443cf09a9c8656b574a866ab68dfa19f0867d0340648c7d2f6a71b8a8ea68"
 
 [[package]]
 name = "ratex-font"
-version = "0.1.0"
+version = "0.1.13"
+source = "git+https://github.com/erweixin/RaTeX.git?rev=ac9be232eee08f062eecbb656cee95fb94bed1d4#ac9be232eee08f062eecbb656cee95fb94bed1d4"
 dependencies = [
  "phf 0.11.3",
  "ratex-types",
@@ -4482,7 +4387,8 @@ dependencies = [
 
 [[package]]
 name = "ratex-layout"
-version = "0.1.0"
+version = "0.1.13"
+source = "git+https://github.com/erweixin/RaTeX.git?rev=ac9be232eee08f062eecbb656cee95fb94bed1d4#ac9be232eee08f062eecbb656cee95fb94bed1d4"
 dependencies = [
  "ratex-font",
  "ratex-parser",
@@ -4492,7 +4398,8 @@ dependencies = [
 
 [[package]]
 name = "ratex-lexer"
-version = "0.1.0"
+version = "0.1.13"
+source = "git+https://github.com/erweixin/RaTeX.git?rev=ac9be232eee08f062eecbb656cee95fb94bed1d4#ac9be232eee08f062eecbb656cee95fb94bed1d4"
 dependencies = [
  "ratex-types",
  "serde",
@@ -4501,7 +4408,8 @@ dependencies = [
 
 [[package]]
 name = "ratex-parser"
-version = "0.1.0"
+version = "0.1.13"
+source = "git+https://github.com/erweixin/RaTeX.git?rev=ac9be232eee08f062eecbb656cee95fb94bed1d4#ac9be232eee08f062eecbb656cee95fb94bed1d4"
 dependencies = [
  "fancy-regex",
  "ratex-font",
@@ -4517,10 +4425,10 @@ dependencies = [
 
 [[package]]
 name = "ratex-types"
-version = "0.1.0"
+version = "0.1.13"
+source = "git+https://github.com/erweixin/RaTeX.git?rev=ac9be232eee08f062eecbb656cee95fb94bed1d4#ac9be232eee08f062eecbb656cee95fb94bed1d4"
 dependencies = [
  "serde",
- "serde_json",
 ]
 
 [[package]]
@@ -4802,22 +4710,7 @@ dependencies = [
  "rgb",
  "svgtypes",
  "tiny-skia",
- "usvg 0.47.0",
-]
-
-[[package]]
-name = "resvg"
-version = "0.48.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "67e3803f97b999e80cbf7c6ecdd07a8102204d92e1633cf48783720c521196bd"
-dependencies = [
- "bytemuck",
- "log",
- "pico-args",
- "rgb",
- "svgtypes",
- "tiny-skia",
- "usvg 0.48.1",
+ "usvg",
 ]
 
 [[package]]
@@ -4972,7 +4865,7 @@ dependencies = [
 
 [[package]]
 name = "roe-agent"
-version = "0.1.0"
+version = "0.2.1"
 dependencies = [
  "cap-std",
  "chrono",
@@ -5049,7 +4942,7 @@ dependencies = [
  "charts-rs",
  "image",
  "parley",
- "resvg 0.47.0",
+ "resvg",
  "roe-model",
  "roe-parser",
  "roe-polars-bridge",
@@ -5082,15 +4975,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "roe-fontconfig-sys"
-version = "6.0.1"
-dependencies = [
- "dlib",
- "once_cell",
- "pkg-config",
-]
-
-[[package]]
 name = "roe-formula"
 version = "0.1.0"
 dependencies = [
@@ -5112,7 +4996,7 @@ dependencies = [
  "image",
  "keyframe",
  "parley",
- "resvg 0.47.0",
+ "resvg",
  "roe-core",
  "roe-model",
  "rstar",
@@ -5204,13 +5088,13 @@ version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "cosmic-text",
- "criterion 0.5.1",
+ "criterion",
  "hypher",
  "image",
  "parley",
  "ratex-types",
  "regex",
- "resvg 0.47.0",
+ "resvg",
  "roe-core",
  "roe-formula",
  "roe-impress",
@@ -6483,8 +6367,8 @@ dependencies = [
  "base64 0.22.1",
  "data-url",
  "flate2",
- "fontdb 0.23.0",
- "imagesize 0.14.0",
+ "fontdb",
+ "imagesize",
  "kurbo",
  "log",
  "pico-args",
@@ -6496,33 +6380,6 @@ dependencies = [
  "svgtypes",
  "tiny-skia-path",
  "ttf-parser",
- "unicode-bidi",
- "unicode-script",
- "unicode-vo",
- "xmlwriter",
-]
-
-[[package]]
-name = "usvg"
-version = "0.48.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "977d0a4abdef933f424a99fe09f95576e089b90aebc6f016a3bc813762493e91"
-dependencies = [
- "base64 0.23.1",
- "data-url",
- "fontdb 0.24.0",
- "harfrust 0.12.0",
- "imagesize 0.15.0",
- "kurbo",
- "log",
- "pico-args",
- "roxmltree 0.21.1",
- "simplecss",
- "siphasher",
- "skrifa 0.44.0",
- "strict-num",
- "svgtypes",
- "tiny-skia-path",
  "unicode-bidi",
  "unicode-script",
  "unicode-vo",
@@ -7228,16 +7085,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7a5a4b21e1a62b67a2970e6831bc091d7b87e119e7f9791aef9702e3bef04448"
 
 [[package]]
-name = "yansi"
-version = "1.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cfe53a6657fd280eaa890a3bc59152892ffa3e30101319d168b781ed6529b049"
-
-[[package]]
 name = "yazi"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e01738255b5a16e78bbb83e7fbba0a1e7dd506905cfc53f4622d89015a03fbb5"
+
+[[package]]
+name = "yeslogic-fontconfig-sys"
+version = "6.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1d8b8abf912b9a29ff112e1671c97c33636903d13a69712037190e6805af4f76"
+dependencies = [
+ "dlib",
+ "once_cell",
+ "pkg-config",
+]
 
 [[package]]
 name = "yoke"

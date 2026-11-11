@@ -270,8 +270,8 @@ fn chart_to_xml_impl(m: &ChartModel, r: Refs) -> String {
             } else {
                 all.iter().copied().partition(|&(_, s)| s.as_line)
             };
-            let gap = m.gap_width_pct.unwrap_or(150.0).round() as i32;
-            let overlap = if stacked { 100 } else { m.overlap_pct.unwrap_or(0.0).round() as i32 };
+            let gap = m.gap_width_pct.unwrap_or(roe_model::impress::DEFAULT_GAP_WIDTH_PCT).round() as i32;
+            let overlap = if stacked { roe_model::impress::DEFAULT_OVERLAP_STACKED_PCT.round() as i32 } else { m.overlap_pct.unwrap_or(roe_model::impress::DEFAULT_OVERLAP_PCT).round() as i32 };
             plot.push_str(&format!(
                 "<c:barChart><c:barDir val=\"{}\"/><c:grouping val=\"{g_bar}\"/><c:varyColors val=\"0\"/>{}{dl}<c:gapWidth val=\"{gap}\"/><c:overlap val=\"{overlap}\"/>{ids}</c:barChart>",
                 if hbar { "bar" } else { "col" },
@@ -316,7 +316,7 @@ fn chart_to_xml_impl(m: &ChartModel, r: Refs) -> String {
         }
         ChartKind::Doughnut => {
             let first: Vec<_> = all.clone(); // 环形图支持多环,写出全部系列
-            let hole = m.hole_size_pct.unwrap_or(50.0).round().clamp(10.0, 90.0) as i32;
+            let hole = m.hole_size_pct.unwrap_or(roe_model::impress::DEFAULT_HOLE_SIZE_PCT).round().clamp(10.0, 90.0) as i32;
             plot.push_str(&format!(
                 "<c:doughnutChart><c:varyColors val=\"1\"/>{}{dl}<c:firstSliceAng val=\"0\"/><c:holeSize val=\"{hole}\"/></c:doughnutChart>",
                 sers("pie", &first, &labs, r)
